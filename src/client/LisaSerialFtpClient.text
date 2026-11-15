@@ -1,0 +1,4130 @@
+PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
+
+{**************************************************************************}
+{ LisaSerialFtpClient -- file transfer client for the Apple Lisa RS-232    }
+{ driver.                                                                  }
+{                                                                          }
+{ Runs on the Lisa.  MOUNTs the built-in serial device (RS232A or RS232B   }
+{ -- see the Alias procedure in LISA_OS/OS/source-fsui1, which maps them   }
+{ to #10#1 / #10#2), configures it with DEVICE_CONTROL under its PnP name  }
+{ '-RS232B', opens it as '-RS232B-XYZ', and speaks the LISA-SERIAL-FTP    }
+{ protocol with LisaSerialFtpServer.py on the other end of the line, so    }
+{ files can be listed, read and written across the link.                   }
+{                                                                          }
+{ Commands (typed at the console prompt):                                  }
+{   list [dir]         list files on the server                            }
+{   get [-c] <remote> [local]   download a file: as text (CRLF/LF -> CR)   }
+{                          if the local or the remote name ends in .TEXT   }
+{                          (any case), else byte-exact (no changes)        }
+{   put [-c] <local> [remote]   upload a file: a name ending in .TEXT (any }
+{                          case) is sent as text (decoded; CR -> LF), any  }
+{                          other file byte-exact (no changes)              }
+{                      -c: first compare size, CRC-16 and byte sum with    }
+{                      the other side's copy; skip it if they all match    }
+{   !list [name]       list all files on the Lisa's default volume         }
+{   baud [rate]        show or change the serial baud rate (server must    }
+{                      match)                                              }
+{   hello              (re-)send HELLO, wait for the server's banner       }
+{   timeout-factor [<n> | auto]  show or set the timeout-factor;           }
+{                      auto = send HELLO and measure it again              }
+{   debug [on | off]   show or switch debug output, here AND on the server }
+{                      (off: progress marks; on: a line per protocol line  }
+{                      and per chunk, with what happened to it)            }
+{   repeat / r         run the last command again                          }
+{   help / h / ?       show the command list                               }
+{   quit / q           exit                                                }
+{                                                                          }
+{ Notes:                                                                   }
+{   * The server must already be running at the same baud rate             }
+{     (default 57600, 8N1).                                                }
+{   * Remote names use ':' as the path separator (Lisa style); the         }
+{     server maps it to '/' under its root directory.                      }
+{   * get as text writes a proper Lisa text file (CRLF/LF line-endings     }
+{     become Lisa text lines): the server sends the finished text pages    }
+{     (GET <name> T), and the client puts them after the header page it    }
+{     makes itself; get as binary writes a byte-exact copy.  Both store    }
+{     the bytes as they come, verified by the DONE byte/CRC check.         }
+{   * get receives into a temp file beside the target                      }
+{     (LisaSerialFtpClientTemp.TEXT / .BIN) and rename it to the           }
+{     target only when the transfer is whole; an existing target is        }
+{     replaced, a failed get leaves it untouched.                          }
+{   * Files are streamed in CHUNK-byte chunks, so a file does not need     }
+{     to fit in memory.  The type-ahead buffer is enlarged to 1024 bytes   }
+{     (the driver's maximum), so a whole chunk frame (1023 bytes) can be   }
+{     buffered while the client is busy -- the ACK-based protocol then     }
+{     provides flow control.  get sends its ACK only after any disk write  }
+{     the chunk causes, so the next frame never arrives during one.        }
+{   * Loss recovery: the transfer is stop-and-wait, so while the sender    }
+{     waits for a reply the line is quiet.  A byte lost in a chunk leaves  }
+{     the receiver short of bytes and its read times out (~1 s mid-chunk,  }
+{     ~15 s for a chunk start); the receiver discards the partial block,   }
+{     waits for the line to go quiet, and NAKs, and the sender retransmits }
+{     the same chunk.  A lost reply makes the sender time out (~10 s) and  }
+{     retransmit anyway; the receiver recognises the repeated sequence     }
+{     number and re-ACKs it.  Replies carry the chunk number ('A <seq>',   }
+{     'N <seq>'), so a stale one (about an earlier chunk) is skipped and   }
+{     the replies never fall out of step.  A garbled reply is retried, and }
+{     'N <seq+1>' (a NAK for the next chunk: the receiver's ACK was lost   }
+{     and its own wait ran out first) counts as an ACK.  After ~10 failed  }
+{     tries on one chunk either side gives up and aborts (FAIL/OK).        }
+{     Sequence numbers wrap from 65535 to 0: no limit on the file size.    }
+{   * Timeout-factor: the OS timeouts (DEVICE_CONTROL 14) count EMULATED   }
+{     time, so in LisaEm at a high throttle a "15 s" timeout is over in a  }
+{     fraction of a real second.  'timeout-factor auto' sends CAL; the     }
+{     server answers exactly 2 real seconds later, and the client counts   }
+{     how many 1-second timeouts expire meanwhile.  That gives the         }
+{     timeout-factor (1 on a real Lisa, ~100 at 512 MHz); every timeout    }
+{     is multiplied by it.  It is never measured by itself: it starts at   }
+{     1 (right for a real Lisa); in an emulator set it with                }
+{     'timeout-factor auto' (or 'timeout-factor <n>').                     }
+{   * The server may be missing: the program never exits for that.  It     }
+{     says so and returns to the prompt; start the server, type hello.     }
+{   * Apple-period stops any wait (HELLO, CAL, a reply, a transfer) and    }
+{     returns to the prompt.                                               }
+{****************************************************************************}
+
+USES
+    {$U syscall}  syscall,
+    {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
+
+CONST
+  BUILD = '2026-11-16 v1.0: baud on both sides';  { printed at startup, so it is easy
+                                 to see which build runs; change it with each change }
+  BAUD     = 57600;           { the maximum; Port B only (Port A: 9600 or lower) }
+  VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.
+                                The server's banner names its own, after PROTONAM
+                                ('LISA-SERIAL-FTP/v1.0'); if its major version
+                                differs, HELLO connects but warns.  Before v1.0
+                                the protocol was LISA-FTP/2..5 }
+  PROTONAM = 'LISA-SERIAL-FTP/';  { the protocol name in the banner, before the version }
+  CHUNK    = 1016;            { equals CHUNK in LisaSerialFtpServer.py; also
+                                MAXFRAME and RXQLEN below.  A whole frame (1023
+                                bytes) must fit the type-ahead buffer (1024, the
+                                most): at 57600 baud a real Lisa copies a frame
+                                to the waiting READ_DATA more slowly than it
+                                arrives, so most of it piles up there; a byte past
+                                1024 is lost and fails the read (1024-byte chunks
+                                worked at 19200 but never at 57600) }
+  MAXRETRY = 10;              { give up a chunk after this many failed tries;
+                                equals MAX_RETRIES in LisaSerialFtpServer.py }
+  MAXLINE  = 255;             { Lisa Pascal's max string length }
+  { Loss-recovery timeouts, in REAL seconds.  DEVICE_CONTROL code 14 takes
+    the timeout in (emulated) SECONDS (the RS232 driver multiplies it by
+    1000 for its ms alarm -- see source-rs232, dcontrol 14); every timeout
+    here is multiplied by the timeout-factor (tfactor) before it is passed to the
+    driver (see Calibrate).  The protocol is stop-and-wait: while the sender waits for a
+    reply the line is quiet, so a byte lost in a chunk leaves the receiver
+    short of bytes and its read times out.  The receiver then discards the
+    partial block, waits for the line to go quiet, and NAKs; the sender
+    retransmits the same chunk.  A lost reply makes the sender time out and
+    retransmit anyway; the receiver recognises the repeated sequence number
+    and re-ACKs it.  T_FRAME must exceed T_REPLY so a retransmit of a fully
+    lost chunk is still caught. }
+  T_FRAME  = 15;              { first byte of a chunk (receiver), seconds }
+  T_BLOCK  = 1;               { mid-chunk bytes (receiver), seconds }
+  T_QUIET  = 1;               { discard-until-quiet (receiver), seconds }
+  T_REPLY  = 10;              { wait for A/N reply (sender), seconds }
+  T_CMD    = 30;              { wait for the reply to a command (LIST/GET/PUT/DONE) }
+  T_LINE   = 5;               { rest of a line, once its first byte arrived }
+  T_HELLO  = 5;               { wait for the banner, per line (10 lines max) }
+  CALSECS  = 2;               { the server answers CAL after this many real seconds }
+  CALMAX   = 400;             { give up CAL after this many 1-s timeouts (factor 200) }
+  MAXTFACT = 1000;            { upper limit for 'timeout-factor <n>' }
+  MAXFRAME = 1023;            { a whole chunk frame: 5 + CHUNK + 2 bytes (keep = CHUNK + 7) }
+  { WaitChar / WaitLine results }
+  W_OK     = 0;               { got it }
+  W_TMO    = 1;               { timed out (no server, or the link is dead) }
+  W_ABORT  = 2;               { the user pressed Apple-period }
+  { Paging of list / !list }
+  PAGELEN  = 30;              { lines per page before 'Type SPACE to continue' }
+  LISTBUF  = 8192;            { bytes of a remote listing kept for paging }
+  CLEARCH  = 27;              { the CLEAR key (numeric keypad) gives CHR(27) }
+  PROGLINE = 60;              { progress marks per screen line; + ' (100% complete)'
+                                = 76 columns, under the 80 of the screen }
+  TPAGE    = 1024;            { a Lisa .TEXT file is 1024-byte pages (the first is a header) }
+  TBUF     = 4096;            { bytes per READ_DATA when reading a file: each call
+                                costs a disk access (~100 ms), whatever its size }
+  WBLOCK   = 4096;            { bytes per WRITE_DATA when writing a file (a binary
+                                block, or 4 text pages) }
+  DECMAX   = 2048;            { DECODEP's output buffer (dbuf) }
+  RXQLEN   = 1040;            { the read-ahead queue: a whole chunk frame (CHUNK + 6) }
+
+TYPE
+  string255 = string[255];
+  { Raw bytes must NOT be kept in an unpacked ARRAY OF CHAR: on the Lisa
+    each such element is a 16-bit word.  A -128..127 subrange is one byte
+    (the same as FnByte in fnbus.pas and Byte in the OS Reference Manual). }
+  ByteT     = -128..127;
+  bytebuf   = ARRAY [1..CHUNK] OF ByteT;
+  byteptr   = ^ByteT;          { Lisa Pascal: named type required in param lists }
+  bufptr    = ^bytebuf;        { pointer to the whole chunk buffer }
+
+VAR
+  devname  : pathname;
+  dcpath   : pathname;
+  ecode    : integer;
+  refnum   : integer;
+  cparm    : dctype;
+  finfo    : fs_info;
+  actual   : longint;
+  size     : longint;
+  total    : longint;
+  crc      : integer;
+  seq      : longint;          { chunk sequence number, 0..65535 (wraps) }
+  len      : integer;
+  linkdead : boolean;
+  ok       : boolean;
+  curbaud  : longint;         { current serial baud rate (up to 57600: needs longint) }
+  atend    : boolean;          { binary put: the last (empty) chunk was read }
+  i        : integer;
+  cmdline  : string255;
+  lastcmd  : string255;        { the last command line, for 'repeat' ('' = none) }
+  cmdknown : boolean;          { the command just run was a known one (for lastcmd) }
+  cmd      : string255;
+  arga     : string255;
+  argb     : string255;
+  local    : pathname;
+  remote   : string255;
+  l        : string255;
+  tname    : string255;
+  sname    : string255;          { suggested target name for the get error }
+  buf      : bytebuf;
+  txb      : ARRAY [0..1] OF ByteT;   { one-byte buffer for PutChar }
+  txline   : ARRAY [1..257] OF ByteT; { SendRaw: a line + CR LF, sent with one
+                                 WRITE_DATA; GLOBAL, as txframe, so it stays
+                                 put while the driver sends it }
+  rxq      : ARRAY [1..RXQLEN] OF ByteT;  { read-ahead queue: bytes already
+                                 read from the port (ReplyLine, RecvChunk),
+                                 not yet used }
+  rxqn     : integer;          { bytes in rxq }
+  rxqp     : integer;          { the next byte to take from rxq }
+  benchoh  : longint;          { bench: the cost of a measurement, in ms }
+  benchms  : longint;          { bench: the last measurement, in ms }
+  rxb      : ARRAY [0..1] OF ByteT;   { one-byte buffer for GetChar }
+  tfactor  : longint;          { timeout-factor: emulated seconds per real second (1 = real Lisa) }
+  curtmo   : longint;          { input timeout now set in the driver (DCp 14), -1 = unknown }
+  connected: boolean;          { TRUE after a banner; FALSE after a failed HELLO or a reply timeout }
+  aborted  : boolean;          { Apple-period seen during this command (sticky until the prompt) }
+  dirty    : boolean;          { a wait was cut short: stale bytes may be on the line }
+  kbd      : TEXT;             { '-KEYBOARD': reads keys without echo (paging) }
+  pglines  : integer;          { lines printed since the last page prompt }
+  lbused   : integer;          { bytes used in lbuf }
+  pcol     : integer;          { progress marks on the current screen line }
+  pdone    : longint;          { progress: bytes of the file transferred so far }
+  txframe  : ARRAY [1..MAXFRAME] OF ByteT;  { SendChunk's frame: GLOBAL, so it
+                                 stays put while the driver sends it }
+  ptotal   : longint;          { progress: the file size (for the percentage) }
+  debugon  : boolean;          { 'debug on': a line per protocol line and chunk,
+                                 instead of the progress marks }
+  dbsync   : boolean;          { the server took our last DEBUG ON/OFF }
+  xferfail : boolean;          { the last get/put failed (quit then waits for SPACE) }
+  qch      : char;             { quit: the key read for 'Press SPACE to quit' }
+  eofdone  : boolean;          { put: the server's DONE came in place of the
+                                 end-of-file chunk's ACK (held in donel) }
+  donel    : string255;
+  logrx    : boolean;          { debug: show received reply lines (FALSE while a
+                                 listing streams in: no time to print) }
+  { The big buffers share 8 KB (a variant record): the global data of the
+    program and its units must stay under 32 KB (A5-relative, 16-bit
+    offsets; the 1 KB-chunk build without this crashed at launch with an
+    OOB exception), and
+    a listing (lbuf) is never shown during a transfer (pgbuf, obuf). }
+  big      : RECORD CASE integer OF
+               0: (lbuf  : ARRAY [1..LISTBUF] OF ByteT);  { a remote listing:
+                                 length byte + text per line (DoList only) }
+               1: (pgbuf : ARRAY [1..TBUF] OF ByteT;    { file reads: TBUF
+                                 bytes (4 text pages) }
+                   obuf  : ARRAY [1..WBLOCK] OF ByteT)  { file writes: a
+                                 binary block, or text pages, the last one
+                                 being built }
+             END;
+  holdack  : boolean;          { get: RecvChunk keeps the ACK of a good chunk
+                                 (ackdue) for DoGet to send after its disk write }
+  ackdue   : boolean;          { an ACK is held: chunk ackno }
+  ackno    : longint;
+  opos     : integer;          { bytes used in obuf }
+  pbase    : integer;          { text: where the page being built starts in obuf }
+  dbuf     : ARRAY [1..DECMAX] OF ByteT;     { DECODEP's output }
+  txst     : ARRAY [0..7] OF INTEGER;      { TXTPUT's state, between chunks }
+  tline    : ARRAY [0..255] OF ByteT;      { TXTPUT's line so far }
+  ooff     : longint;          { file offset where obuf goes }
+  operr    : integer;          { the first file write error (0 = none) }
+  tmode    : integer;          { what TextPass does with a decoded text byte:
+                                 0 = count it, 1 = send it, 2 = add it to the
+                                 -c check (crc, total, bsum) }
+  tlines   : longint;          { text: lines decoded by TextPass }
+  bsum     : longint;          { -c check: sum of the bytes MOD 65536 }
+  cflag    : boolean;          { get/put -c: skip it if unchanged }
+  bflag    : boolean;          { get/put -b: binary (byte-exact), whatever the names }
+  tflag    : boolean;          { get/put -t: text, whatever the names }
+  { CRC-16 lookup tables, built once by CrcInit (see CRC16).  ~1.25 KB. }
+  crchi    : ARRAY [0..255] OF INTEGER;    { high byte of the CRC of byte i }
+  crclo    : ARRAY [0..255] OF INTEGER;    { low byte of the CRC of byte i }
+  nibhi    : ARRAY [0..255] OF ByteT;      { i DIV 16 }
+  niblo    : ARRAY [0..255] OF ByteT;      { i MOD 16 }
+  nibxor   : ARRAY [0..15, 0..15] OF ByteT; { a XOR b, for 4-bit a and b }
+  crctab   : ARRAY [0..255] OF INTEGER;    { crchi/crclo as words, for CRC16A }
+  asmok    : boolean;          { the assembly routines passed AsmSelfTest: CRC16,
+                                 Sum16 and MoveBytes use them }
+
+{--- byte <-> integer conversions -------------------------------------------}
+
+FUNCTION ByteVal (b: ByteT): INTEGER;       { -128..127 -> 0..255 }
+BEGIN
+  IF b < 0 THEN
+    ByteVal := b + 256
+  ELSE
+    ByteVal := b;
+END;
+
+FUNCTION ToByte (v: LONGINT): INTEGER;      { 0..255 -> -128..127 }
+BEGIN
+  IF v > 127 THEN
+    ToByte := v - 256
+  ELSE
+    ToByte := v;
+END;
+
+{--- serial port primitives ------------------------------------------------}
+{ The serial device is just a file: READ_DATA / WRITE_DATA move raw bytes. }
+
+{ One DEVICE_CONTROL call on the serial port.  Every call is checked, so a
+  rejected code does not fail silently.  Defined here (not in the setup
+  section below) because the transfer procedures set the input timeout
+  (code 14) on the fly for loss recovery. }
+PROCEDURE DCp (code: integer; d0, d1, d2: longint);
+VAR e: integer;
+BEGIN
+  cparm.dcversion := 2;
+  cparm.dccode := code;
+  cparm.dcdata[0] := d0;
+  cparm.dcdata[1] := d1;
+  cparm.dcdata[2] := d2;
+  e := 0;
+  DEVICE_CONTROL(e, dcpath, cparm);
+  IF e <> 0 THEN
+  BEGIN
+    WRITELN('device_control ', code, ' error: ', e);
+    WRITELN('port not configured -- checking MOUNT result above');
+    HALT;
+  END;
+END;
+
+{ Set the driver's input timeout (DEVICE_CONTROL 14) to T EMULATED
+  seconds (0 = none).  Remembers the value, so the per-byte reads below do
+  not repeat the same DEVICE_CONTROL call for every byte.  All code 14
+  calls go through here (a direct DCp(14, ...) would make curtmo wrong). }
+PROCEDURE SetTmo (T: longint);
+BEGIN
+  IF T <> curtmo THEN
+  BEGIN
+    DCp(14, T, 0, 0);
+    curtmo := T;
+  END;
+END;
+
+{ TRUE once the user has pressed Apple-period during this command.
+  PAbortFlag (PasLibCall) checks the keyboard without waiting and clears
+  its own flag, so the result is kept in the sticky 'aborted', which the
+  main loop clears at every prompt. }
+{ Transfer progress: one mark per chunk, '.' = accepted, 'x' = a failed
+  try (NAK, or no reply) that will be retried.  PROGLINE marks per line,
+  each line ending with how much of the file is done, e.g.
+  '(23% complete)'.  ProgStart sets the file size first.
+  With 'debug on' there are no marks: SendChunk/RecvChunk print a line
+  per chunk instead.
+  ProgEnd ends an unfinished line of marks; call it before printing a
+  message during or after a transfer. }
+PROCEDURE ProgStart (total: longint);
+BEGIN
+  pcol := 0;
+  pdone := 0;
+  ptotal := total;
+END;
+
+{ end the current line of marks with ' (23% complete)' }
+PROCEDURE ProgPct;
+VAR pct: longint;
+BEGIN
+  IF ptotal <= 0 THEN
+    pct := 100
+  ELSE IF ptotal > 1000000 THEN
+    pct := pdone DIV (ptotal DIV 100)    { pdone * 100 could overflow }
+  ELSE
+    pct := (pdone * 100) DIV ptotal;
+  IF pct > 100 THEN pct := 100;
+  WRITELN(' (', pct:1, '% complete)');
+  pcol := 0;
+END;
+
+{ one mark: C = '.' (a chunk of N file bytes got through) or 'x' (N = 0) }
+PROCEDURE ProgMark (C: CHAR; N: INTEGER);
+BEGIN
+  pdone := pdone + N;
+  IF debugon THEN EXIT(ProgMark);    { debug: a full line per chunk instead }
+  WRITE(C);
+  pcol := pcol + 1;
+  IF pcol >= PROGLINE THEN ProgPct;
+END;
+
+PROCEDURE ProgEnd;
+BEGIN
+  IF pcol > 0 THEN ProgPct;
+END;
+
+FUNCTION UserAbort: BOOLEAN;
+BEGIN
+  IF NOT aborted THEN
+    IF PAbortFlag THEN
+    BEGIN
+      aborted := TRUE;
+      WRITELN;
+      pcol := 0;                      { the WRITELN ended any progress line }
+      WRITELN('*** Apple-period: stopping ***');
+    END;
+  UserAbort := aborted;
+END;
+
+{ The assembly byte copy (LisaSerialFtpClientAsm.text), and the copy used
+  everywhere: MOVEB if the assembly routines passed AsmSelfTest, else a
+  Pascal loop. }
+PROCEDURE MOVEB (SRC, DST: byteptr; N: INTEGER); EXTERNAL;
+
+{ Copy N bytes from SRC to DST (not overlapping). }
+PROCEDURE MoveBytes (SRC, DST: byteptr; N: INTEGER);
+VAR j: INTEGER;
+BEGIN
+  IF asmok THEN
+    MOVEB(SRC, DST, N)
+  ELSE
+    FOR j := 1 TO N DO
+    BEGIN
+      DST^ := SRC^;
+      SRC := POINTER(ORD4(SRC) + 1);
+      DST := POINTER(ORD4(DST) + 1);
+    END;
+END;
+
+PROCEDURE PutChar (C: CHAR);
+VAR e: integer; n: longint; v: integer;
+BEGIN
+  e := 0;
+  { Send from a signed-byte array, exactly like fnbus.pas does, instead of
+    from a CHAR.  ORD4, not ORD: ORD returns a 16-bit INTEGER. }
+  v := ORD(C);
+  IF v > 127 THEN v := v - 256;
+  txb[0] := v;
+  WRITE_DATA (e, refnum, ORD4(@txb), 1, n, sequential, 0);
+  IF e > 0 THEN
+  BEGIN
+    WRITELN('serial write error: ', e);
+    HALT;
+  END;
+END;
+
+PROCEDURE PutBlock (DATA: byteptr; L: INTEGER);
+VAR e: integer;
+BEGIN
+  e := 0;
+  WRITE_DATA (e, refnum, ORD4(DATA), L, actual, sequential, 0);
+  IF (e > 0) OR (actual <> L) THEN
+  BEGIN
+    WRITELN('serial write error: ', e);
+    HALT;
+  END;
+END;
+
+PROCEDURE GetBlock (DATA: byteptr; L: INTEGER);
+VAR e: integer;
+BEGIN
+  e := 0;
+  READ_DATA (e, refnum, ORD4(DATA), L, actual, sequential, 0);
+  IF (e > 0) OR (actual <> L) THEN
+  BEGIN
+    WRITELN('serial read error: ', e);
+    HALT;
+  END;
+END;
+
+{ Read one byte with an input timeout of tmo REAL seconds (scaled by tfactor
+  for DEVICE_CONTROL 14).  It does NOT HALT on a timeout: it returns FALSE
+  and the caller decides how to recover (NAK + retransmit).  Returns TRUE
+  with C set when a byte arrived.  One OS wait, so Apple-period is not
+  seen during it: use it only for short waits (use WaitChar for long). }
+FUNCTION TryGetChar (VAR C: CHAR; tmo: longint): BOOLEAN;
+VAR e: integer; v: integer;
+BEGIN
+  IF rxqp <= rxqn THEN           { a byte already read ahead (ReplyLine) }
+  BEGIN
+    C := CHR(ByteVal(rxq[rxqp]));
+    rxqp := rxqp + 1;
+    TryGetChar := TRUE;
+    EXIT(TryGetChar);
+  END;
+  e := 0;
+  actual := 0;
+  SetTmo(tmo * tfactor);
+  READ_DATA (e, refnum, ORD4(@rxb), 1, actual, sequential, 0);
+  IF (e > 0) OR (actual <> 1) THEN
+  BEGIN
+    TryGetChar := FALSE;
+    EXIT(TryGetChar);
+  END;
+  v := rxb[0];
+  IF v < 0 THEN v := v + 256;
+  C := CHR(v);
+  TryGetChar := TRUE;
+END;
+
+{ Read up to L bytes with an input timeout (tmo REAL seconds, scaled by
+  tfactor like TryGetChar).  Returns the number
+  of bytes actually read (0..L): fewer than L means the chunk was short
+  (a byte was lost on the wire) and the caller must discard + NAK.  A
+  hard error counts as 0 bytes. }
+FUNCTION TryGetBlock (DATA: byteptr; L: INTEGER; tmo: longint): INTEGER;
+VAR e: integer; q: integer;
+BEGIN
+  q := rxqn - rxqp + 1;          { bytes already read ahead first }
+  IF q > L THEN q := L;
+  IF q > 0 THEN
+  BEGIN
+    MoveBytes(@rxq[rxqp], DATA, q);
+    rxqp := rxqp + q;
+    DATA := POINTER(ORD4(DATA) + q);
+  END
+  ELSE
+    q := 0;
+  e := 0;
+  actual := 0;
+  IF L - q <= 0 THEN
+  BEGIN
+    TryGetBlock := q;
+    EXIT(TryGetBlock);
+  END;
+  SetTmo(tmo * tfactor);
+  READ_DATA (e, refnum, ORD4(DATA), L - q, actual, sequential, 0);
+  IF e > 0 THEN actual := 0;
+  TryGetBlock := q + actual;
+END;
+
+{ Wait up to SECS real seconds for one byte, in slices of ONE emulated
+  second (DEVICE_CONTROL 14 = 1), checking for Apple-period between the
+  slices when ABORTABLE.  SECS real seconds = SECS * tfactor slices.  The
+  slice is the same 1-second timeout Calibrate counts, so the speed
+  factor and the waits use the same measure.  Returns W_OK (C set),
+  W_TMO or W_ABORT.  Stopping takes at most one slice: ~1 s on a real
+  Lisa, a few ms in a fast emulator. }
+FUNCTION WaitChar (VAR C: CHAR; secs: longint; abortable: boolean): INTEGER;
+VAR e: integer; v: integer; n: longint; slices: longint;
+BEGIN
+  WaitChar := W_TMO;
+  IF rxqp <= rxqn THEN           { a byte already read ahead (ReplyLine) }
+  BEGIN
+    v := rxq[rxqp];
+    IF v < 0 THEN v := v + 256;
+    C := CHR(v);
+    rxqp := rxqp + 1;
+    WaitChar := W_OK;
+    EXIT(WaitChar);
+  END;
+  slices := secs * tfactor;
+  IF slices < 1 THEN slices := 1;
+  SetTmo(1);
+  n := 0;
+  WHILE n < slices DO
+  BEGIN
+    IF abortable THEN
+      IF UserAbort THEN
+      BEGIN
+        WaitChar := W_ABORT;
+        EXIT(WaitChar);
+      END;
+    e := 0;
+    actual := 0;
+    READ_DATA (e, refnum, ORD4(@rxb), 1, actual, sequential, 0);
+    IF (e <= 0) AND (actual = 1) THEN
+    BEGIN
+      v := rxb[0];
+      IF v < 0 THEN v := v + 256;
+      C := CHR(v);
+      WaitChar := W_OK;
+      EXIT(WaitChar);
+    END;
+    n := n + 1;
+  END;
+END;
+
+{ Read one CRLF/LF-terminated line (CR and LF are dropped; at most MAXLINE
+  chars are kept).  The first byte may take up to SECS real seconds; once
+  it is in, each further byte gets T_LINE seconds.  Returns W_OK, W_TMO
+  (S holds whatever arrived, possibly a partial line) or W_ABORT. }
+{ The same, for a line whose length the caller can predict: WANT bytes,
+  CR LF included (e.g. the ACK 'A <n>' that put waits for).  Once the
+  first byte is in, the rest of the WANT bytes is read with ONE READ_DATA
+  into the read-ahead queue rxq (a call per byte costs ~6 ms on a real
+  Lisa), and the line is then taken from there as usual -- so a different
+  line (shorter, longer, a NAK, FAIL) is still read correctly: whatever
+  of it was read ahead, or of the line after it, stays in rxq for the
+  next read.  WANT <= 1: no read-ahead (WaitLine). }
+FUNCTION ReplyLine (VAR S: string255; secs: longint; abortable: boolean;
+                    want: integer): INTEGER;
+VAR c: CHAR; n: integer; w: integer; t: longint; first: boolean;
+BEGIN
+  n := 0;
+  S := '';
+  t := secs;
+  first := TRUE;
+  {$R-}          { S[n] is written past the current length (as the old ReadLine did) }
+  REPEAT
+    w := WaitChar(c, t, abortable);
+    IF w <> W_OK THEN
+    BEGIN
+      S[0] := CHR(n);
+      ReplyLine := w;
+      EXIT(ReplyLine);
+    END;
+    IF first THEN
+    BEGIN
+      first := FALSE;
+      IF (want > 1) AND (rxqp > rxqn) THEN
+      BEGIN
+        { the rest of the expected line: within T_QUIET of its first
+          byte, or it is not the expected line -- then fewer arrive }
+        rxqp := 1;
+        rxqn := 0;
+        IF want - 1 > RXQLEN THEN want := RXQLEN + 1;
+        rxqn := TryGetBlock(@rxq[1], want - 1, T_QUIET);
+      END;
+    END;
+    t := T_LINE;
+    IF (c <> CHR(10)) AND (c <> CHR(13)) AND (n < MAXLINE) THEN
+    BEGIN
+      n := n + 1;
+      S[n] := c;
+    END;
+  UNTIL c = CHR(10);
+  S[0] := CHR(n);
+  {$R+}
+  ReplyLine := W_OK;
+END;
+
+FUNCTION WaitLine (VAR S: string255; secs: longint; abortable: boolean): INTEGER;
+BEGIN
+  WaitLine := ReplyLine(S, secs, abortable, 0);
+END;
+
+{ After a bad/partial chunk, throw away any stray bytes still on the line
+  (e.g. the tail of a corrupted frame) until a read times out, i.e. until
+  the line is quiet.  The sender is quiet here (stop-and-wait), so this
+  either discards nothing or only the stray bytes of the bad frame.  A
+  cap keeps it from running away on a noisy line. }
+{ Flush the driver's type-ahead buffer (DEVICE_CONTROL 9 with a negative
+  size: "flush", no new buffer; -2 keeps the handshake thresholds).  The
+  driver then sets its byte count to 0 and its read pointer to its write
+  pointer.  Called once the line is quiet, so nothing is lost: it only
+  resets the driver's bookkeeping.  In LisaEm that bookkeeping was seen to
+  go wrong: every frame arrived intact, yet the program was handed stale
+  bytes (an earlier chunk's text) at the same offset on every retry, so a
+  transfer never recovered.  Errors are ignored (a recovery step must not
+  stop the program, as DCp would). }
+PROCEDURE FlushTypeahead;
+VAR e: integer;
+BEGIN
+  rxqn := 0;                           { and what was read ahead }
+  rxqp := 1;
+  cparm.dcversion := 2;
+  cparm.dccode := 9;
+  cparm.dcdata[0] := -1;               { no new buffer: just flush }
+  cparm.dcdata[1] := -2;               { -2: keep the thresholds }
+  cparm.dcdata[2] := -2;
+  e := 0;
+  DEVICE_CONTROL(e, dcpath, cparm);
+  IF debugon THEN
+    IF e <> 0 THEN
+      WRITELN('    (flushing the type-ahead buffer failed: ', e, ')')
+    ELSE
+      WRITELN('    (type-ahead buffer flushed)');
+END;
+
+PROCEDURE DiscardUntilQuiet;
+VAR ch: CHAR; n: integer;
+BEGIN
+  n := 0;
+  WHILE (n < 2 * (CHUNK + 7)) AND TryGetChar(ch, T_QUIET) DO
+    n := n + 1;
+  FlushTypeahead;                      { the line is quiet: reset the driver's count }
+END;
+
+{ Send one protocol line.  SendRaw does not log it: it is used for the
+  per-chunk A/N replies, which the chunk code reports itself. }
+PROCEDURE SendRaw (S: string255);
+VAR j, n, v: integer;
+BEGIN
+  { the line and its CR LF with ONE WRITE_DATA: a call per character
+    costs ~6 ms on a real Lisa (an ACK took ~40 ms) }
+  n := LENGTH(S);
+  FOR j := 1 TO n DO
+  BEGIN
+    v := ORD(S[j]);
+    IF v > 127 THEN v := v - 256;
+    txline[j] := v;
+  END;
+  txline[n + 1] := 13;
+  txline[n + 2] := 10;
+  PutBlock(@txline[1], n + 2);
+END;
+
+PROCEDURE SendLine (S: string255);
+BEGIN
+  IF debugon THEN
+  BEGIN
+    ProgEnd;
+    WRITELN('    sent: ', S);
+  END;
+  SendRaw(S);
+END;
+
+{ debug: show a received protocol line }
+PROCEDURE ShowRx (S: string255);
+BEGIN
+  IF debugon AND logrx THEN
+  BEGIN
+    ProgEnd;
+    WRITELN('    received: ', S);
+  END;
+END;
+
+{ The server did not answer (or the user stopped the wait): say so and
+  mark the session as not connected, so the next server command first
+  sends HELLO again.  Never HALTs: the program goes back to the prompt,
+  where the user can start the server and type hello, or quit. }
+PROCEDURE NoServer (w: integer);
+BEGIN
+  dirty := TRUE;
+  IF w = W_ABORT THEN
+    WRITELN('stopped -- back to the prompt')   { the server is fine: still connected }
+  ELSE
+  BEGIN
+    connected := FALSE;
+    WRITELN('no reply from the server.');
+    WRITELN('start LisaSerialFtpServer.py (same baud rate), then type hello');
+  END;
+END;
+
+{ If an earlier wait was cut short (timeout or Apple-period), the rest of
+  that reply may still be in the type-ahead buffer: throw it away before
+  the next command, so it is not taken for that command's reply. }
+PROCEDURE DrainInput;
+BEGIN
+  IF dirty THEN
+  BEGIN
+    DiscardUntilQuiet;
+    dirty := FALSE;
+  END;
+END;
+
+{ Read one line of a command reply (first byte within T_CMD seconds).
+  TRUE on a whole line; on a timeout or Apple-period it reports it (see
+  NoServer) and returns FALSE. }
+FUNCTION GetLine (VAR S: string255): BOOLEAN;
+VAR w: integer;
+BEGIN
+  w := WaitLine(S, T_CMD, TRUE);
+  IF w <> W_OK THEN
+  BEGIN
+    NoServer(w);
+    GetLine := FALSE;
+  END
+  ELSE
+  BEGIN
+    ShowRx(S);
+    GetLine := TRUE;
+  END;
+END;
+
+{ Read the first line of a command's response.  If the server was
+  restarted while we sat at the prompt, its startup banner is still in
+  the type-ahead buffer and arrives before the real reply.  The server
+  only ever sends a banner at startup or in reply to HELLO -- never as
+  a reply to a command -- so any banner line here is stale and is
+  skipped.  This is a protocol check, not a timing one: it works at any
+  baud rate, on hardware or in the emulator, no matter how fast (or in
+  what bursts) the bytes arrive.  FALSE if the server did not answer. }
+FUNCTION GetResponse (VAR S: string255): BOOLEAN;
+VAR nb: integer; banner: boolean;
+BEGIN
+  nb := 0;
+  GetResponse := FALSE;
+  REPEAT
+    IF NOT GetLine(S) THEN EXIT(GetResponse);
+    banner := (LENGTH(S) > 0) AND (S[1] = 'H');
+    IF banner THEN nb := nb + 1;
+  UNTIL NOT banner;
+  IF nb > 0 THEN
+    WRITELN('note: skipped ', nb, ' stale banner line(s) -- server restarted?');
+  GetResponse := TRUE;
+END;
+
+{--- small string helpers ---------------------------------------------------}
+
+PROCEDURE IntToStr (N: LONGINT; VAR S: string255);
+VAR m: LONGINT; d: integer; t: string255;
+BEGIN
+  IF N < 0 THEN
+  BEGIN
+    m := -N;
+    S := '-';
+  END
+  ELSE
+  BEGIN
+    m := N;
+    S := '';
+  END;
+  IF m = 0 THEN
+    S := concat(S, '0')
+  ELSE
+  BEGIN
+    { digits are produced last-first, so each goes in front of the others;
+      they are built in t so the sign stays in front of them all }
+    t := '';
+    WHILE m > 0 DO
+    BEGIN
+      d := m MOD 10;
+      t := concat(COPY('0123456789', d + 1, 1), t);
+      m := m DIV 10;
+    END;
+    S := concat(S, t);
+  END;
+END;
+
+{ sum the digits of S (skips non-digits) }
+FUNCTION StrToInt (S: string255): LONGINT;
+VAR n: LONGINT; j: integer;
+BEGIN
+  n := 0;
+  FOR j := 1 TO LENGTH(S) DO
+    IF (S[j] >= '0') AND (S[j] <= '9') THEN
+      n := n * 10 + ORD(S[j]) - ORD('0');
+  StrToInt := n;
+END;
+
+PROCEDURE IntToHex (N: INTEGER; VAR S: string255);
+CONST hexd = '0123456789ABCDEF';
+VAR m: LONGINT; dv: LONGINT; j: integer; d: integer;
+BEGIN
+  m := N;
+  IF m < 0 THEN m := m + 65536;   { signed -> unsigned 16-bit }
+  S := '';
+  dv := 4096;
+  FOR j := 3 DOWNTO 0 DO
+  BEGIN
+    d := (m DIV dv) MOD 16;
+    S := concat(S, COPY(hexd, d + 1, 1));   { most significant digit first }
+    dv := dv DIV 16;
+  END;
+END;
+
+PROCEDURE UpperStr (VAR S: string255);
+VAR j: integer;
+BEGIN
+  FOR j := 1 TO LENGTH(S) DO
+    IF (S[j] >= 'a') AND (S[j] <= 'z') THEN
+      S[j] := CHR(ORD(S[j]) - 32);
+END;
+
+{ split LINE into CMD, A and B (B = rest of line, may contain spaces) }
+PROCEDURE ParseCmd (LINE: string255; VAR CMD, A, B: string255);
+VAR j: integer; n: integer;
+BEGIN
+  CMD := ''; A := ''; B := '';
+  j := 1;
+  WHILE (j <= LENGTH(LINE)) AND (LINE[j] = ' ') DO j := j + 1;
+  WHILE (j <= LENGTH(LINE)) AND (LINE[j] <> ' ') DO
+  BEGIN
+    CMD := concat(CMD, COPY(LINE, j, 1));
+    j := j + 1;
+  END;
+  UpperStr(CMD);
+  WHILE (j <= LENGTH(LINE)) AND (LINE[j] = ' ') DO j := j + 1;
+  WHILE (j <= LENGTH(LINE)) AND (LINE[j] <> ' ') DO
+  BEGIN
+    A := concat(A, COPY(LINE, j, 1));
+    j := j + 1;
+  END;
+  WHILE (j <= LENGTH(LINE)) AND (LINE[j] = ' ') DO j := j + 1;
+  n := LENGTH(LINE);
+  WHILE (n >= j) AND (LINE[n] = ' ') DO n := n - 1;
+  B := COPY(LINE, j, n - j + 1);
+END;
+
+{ get/put: take the flags -c, -b and -t (any case, any order) off the
+  front of the arguments: A is the first argument, B the rest of the line;
+  on return they are the first name and the rest.  Only these exact
+  two-character words are flags, so a Lisa path starting with '-' (e.g.
+  -LISA-NOTES.TEXT) is still a name.  FALSE if both -b and -t are given. }
+FUNCTION TakeFlags (VAR A, B: string255): BOOLEAN;
+VAR u, x: string255; more: boolean;
+BEGIN
+  cflag := FALSE;
+  bflag := FALSE;
+  tflag := FALSE;
+  more := TRUE;
+  WHILE more DO
+  BEGIN
+    u := A;
+    UpperStr(u);
+    more := (u = '-C') OR (u = '-B') OR (u = '-T');
+    IF more THEN
+    BEGIN
+      IF u = '-C' THEN cflag := TRUE
+      ELSE IF u = '-B' THEN bflag := TRUE
+      ELSE tflag := TRUE;
+      ParseCmd(concat('X ', B), x, A, B);   { the next word and the rest }
+    END;
+  END;
+  TakeFlags := NOT (bflag AND tflag);
+END;
+
+PROCEDURE BaseName (SRC: string255; VAR DST: string255);
+VAR j: integer;
+BEGIN
+  j := LENGTH(SRC);
+  WHILE (j > 0) AND (SRC[j] <> ':') DO j := j - 1;
+  IF j = 0 THEN
+    DST := SRC
+  ELSE
+    DST := COPY(SRC, j + 1, LENGTH(SRC) - j);
+END;
+
+{ GET temp file: a fixed name in the SAME FOLDER as TARGET (a .TEXT for
+  text gets, a .BIN for binary).  RENAME_ENTRY can only rename within one
+  folder (its destination is a leaf name), so the temp file must sit
+  beside the target.  A bare name (no '-') means the current folder. }
+PROCEDURE TmpNameOf (TARGET: pathname; binary: boolean; VAR TMP: pathname);
+VAR j: integer;
+BEGIN
+  IF binary THEN
+    TMP := 'LisaSerialFtpClientTemp.BIN'      { names fit the 32-char limit }
+  ELSE
+    TMP := 'LisaSerialFtpClientTemp.TEXT';
+  j := LENGTH(TARGET);
+  WHILE (j > 1) AND (TARGET[j] <> '-') DO j := j - 1;
+  IF (j > 1) AND (TARGET[j] = '-') THEN
+    TMP := concat(COPY(TARGET, 1, j), TMP);   { COPY includes the '-' }
+END;
+
+{ Leaf name of a local pathname (everything after the last '-'), for
+  RENAME_ENTRY, whose destination is a leaf name, not a path. }
+PROCEDURE LeafNameOf (SRC: pathname; VAR LEAF: e_name);
+VAR j: integer; n: integer;
+BEGIN
+  n := LENGTH(SRC);
+  j := n;
+  WHILE (j > 1) AND (SRC[j] <> '-') DO j := j - 1;
+  IF (j >= 1) AND (SRC[j] = '-') AND (j < n) THEN
+  BEGIN
+    IF n - j > 31 THEN
+      LEAF := COPY(SRC, j + 1, 31)
+    ELSE
+      LEAF := COPY(SRC, j + 1, n - j);
+  END
+  ELSE
+  BEGIN
+    IF n > 31 THEN
+      LEAF := COPY(SRC, 1, 31)
+    ELSE
+      LEAF := SRC;
+  END;
+END;
+
+{ TRUE if NAME ends with '.TEXT' in any case ('.text', '.Text', ...) }
+FUNCTION IsTextName (NAME: string255): BOOLEAN;
+VAR n: integer; ext: string255;
+BEGIN
+  n := LENGTH(NAME);
+  IF n < 5 THEN
+    IsTextName := FALSE
+  ELSE
+  BEGIN
+    ext := COPY(NAME, n - 4, 5);
+    UpperStr(ext);
+    IsTextName := ext = '.TEXT';
+  END;
+END;
+
+{ StripExt('README.md', DST) sets DST to 'README' (SRC if it has no dot) }
+PROCEDURE StripExt (SRC: string255; VAR DST: string255);
+VAR j: integer;
+BEGIN
+  j := LENGTH(SRC);
+  WHILE (j > 0) AND (SRC[j] <> '.') DO j := j - 1;
+  IF j <= 1 THEN
+    DST := SRC
+  ELSE
+    DST := COPY(SRC, 1, j - 1);
+END;
+
+{ Build the CRC-16 tables.  Lisa Pascal has no bitwise XOR or shift, so
+  doing the CRC bit by bit costs ~80 slow loop steps (with LONGINT
+  divisions) per byte.  Instead the bit-by-bit work is done here, once,
+  for all 256 byte values; CRC16 then needs two 8-bit XORs and a table
+  lookup per byte.  An 8-bit XOR is two 4-bit XORs from nibxor, with the
+  nibbles of a byte looked up in nibhi/niblo (no division per byte).
+
+  The table is linear: CRC(i XOR j) = CRC(i) XOR CRC(j).  So only the
+  eight one-bit bytes 1, 2, 4 .. 128 need a real CRC (fixed values,
+  below), and every other entry is the XOR of two smaller ones:
+    table[i] = table[i - top] XOR table[top]   (top = highest bit of i)
+  which is a few nibxor lookups per entry instead of ~130 LONGINT loop
+  steps: no visible pause at startup.  CrcSelfTest checks the result. }
+PROCEDURE CrcInit;
+VAR i, a, b, k, r, bit, x, y, top: INTEGER;
+
+  PROCEDURE One (n, h, lo: INTEGER);       { table[n] := h * 256 + lo }
+  BEGIN
+    crchi[n] := h;
+    crclo[n] := lo;
+  END;
+
+  FUNCTION X8 (p, q: INTEGER): INTEGER;    { p XOR q, both 0..255 }
+  BEGIN
+    X8 := nibxor[nibhi[p], nibhi[q]] * 16 + nibxor[niblo[p], niblo[q]];
+  END;
+
+BEGIN
+  FOR i := 0 TO 255 DO
+  BEGIN
+    nibhi[i] := i DIV 16;
+    niblo[i] := i MOD 16;
+  END;
+  FOR a := 0 TO 15 DO
+    FOR b := 0 TO 15 DO
+    BEGIN
+      r := 0;
+      bit := 1;
+      x := a;
+      y := b;
+      FOR k := 1 TO 4 DO
+      BEGIN
+        IF ODD(x) <> ODD(y) THEN r := r + bit;
+        x := x DIV 2;
+        y := y DIV 2;
+        bit := bit * 2;
+      END;
+      nibxor[a, b] := r;
+    END;
+  { the CRC (polynomial $1021, MSB first) of the byte i from a zero CRC:
+    the one-bit bytes are fixed, the rest is built from them }
+  One(0, 0, 0);
+  One(1, $10, $21);                        { $1021 }
+  One(2, $20, $42);                        { $2042 }
+  One(4, $40, $84);                        { $4084 }
+  One(8, $81, $08);                        { $8108 }
+  One(16, $12, $31);                       { $1231 }
+  One(32, $24, $62);                       { $2462 }
+  One(64, $48, $C4);                       { $48C4 }
+  One(128, $91, $88);                      { $9188 }
+  top := 1;
+  FOR i := 2 TO 255 DO
+    IF i = top * 2 THEN
+      top := i                             { a one-bit byte: already set }
+    ELSE
+    BEGIN
+      crchi[i] := X8(crchi[i - top], crchi[top]);
+      crclo[i] := X8(crclo[i - top], crclo[top]);
+    END;
+  { the same table as 16-bit words (signed INTEGER), for CRC16A }
+  FOR i := 0 TO 255 DO
+    IF crchi[i] >= 128 THEN
+      crctab[i] := (crchi[i] - 256) * 256 + crclo[i]
+    ELSE
+      crctab[i] := crchi[i] * 256 + crclo[i];
+END;
+
+{ CRC-16/CCITT-FALSE (poly $1021, init $FFFF, as the server) of L bytes at
+  DATA, continuing from C (a signed INTEGER holding the 16-bit CRC).
+  Byte-wise with the CrcInit tables, the CRC kept as two bytes hi/lo:
+    x  := hi XOR byte
+    hi := lo XOR crchi[x]
+    lo := crclo[x]
+  which is the usual (C SHL 8) XOR table[(C SHR 8) XOR byte]. }
+PROCEDURE CRC16N (DATA: byteptr; L: INTEGER; VAR C: INTEGER);
+VAR
+  j, hi, lo, v, x, t: INTEGER;
+  u: LONGINT;              { unsigned 0..65535 (does not fit INTEGER) }
+BEGIN
+  u := C;
+  IF u < 0 THEN u := u + 65536;            { signed -> unsigned }
+  hi := u DIV 256;
+  lo := u MOD 256;
+  FOR j := 1 TO L DO
+  BEGIN
+    v := DATA^;
+    IF v < 0 THEN v := v + 256;            { -128..127 -> 0..255 }
+    DATA := POINTER(ORD4(DATA) + 1);       { INC(DATA) }
+    x := nibxor[nibhi[hi], nibhi[v]] * 16 + nibxor[niblo[hi], niblo[v]];
+    t := crchi[x];
+    hi := nibxor[nibhi[lo], nibhi[t]] * 16 + nibxor[niblo[lo], niblo[t]];
+    lo := crclo[x];
+  END;
+  u := hi;
+  u := u * 256 + lo;                       { LONGINT: hi * 256 overflows INTEGER }
+  IF u >= 32768 THEN                       { unsigned -> signed INTEGER }
+    C := u - 65536
+  ELSE
+    C := u;
+END;
+
+{ The assembly routines (LisaSerialFtpClientAsm.text): the same work as
+  CRC16N, Sum16P and a byte loop, ~15 times faster.  Used through CRC16,
+  Sum16 and MoveBytes, and only if AsmSelfTest passed. }
+PROCEDURE CRC16A (DATA: byteptr; L: INTEGER; VAR C: INTEGER; TAB: LONGINT); EXTERNAL;
+PROCEDURE SUM16A (DATA: byteptr; L: INTEGER; VAR S: LONGINT); EXTERNAL;
+PROCEDURE DECODEP (SRC: byteptr; N: INTEGER; VAR P: INTEGER;
+                   VAR ATSTART: INTEGER; DST: byteptr; DMAX: INTEGER;
+                   VAR DLEN: INTEGER; VAR LINES: LONGINT); EXTERNAL;
+PROCEDURE TXTPUT (SRC: byteptr; N: INTEGER; ST: byteptr; LINE: byteptr;
+                  OB: byteptr; VAR CHARS: LONGINT); EXTERNAL;
+
+{ The CRC-16 used everywhere: CRC16A if it passed AsmSelfTest, else CRC16N. }
+PROCEDURE CRC16 (DATA: byteptr; L: INTEGER; VAR C: INTEGER);
+BEGIN
+  IF asmok THEN
+    CRC16A(DATA, L, C, ORD4(@crctab))
+  ELSE
+    CRC16N(DATA, L, C);
+END;
+
+{ Add L bytes at DATA to S (the -c byte sum), kept MOD 65536. }
+PROCEDURE Sum16P (DATA: byteptr; L: INTEGER; VAR S: LONGINT);
+VAR j, v: INTEGER;
+BEGIN
+  FOR j := 1 TO L DO
+  BEGIN
+    v := DATA^;
+    IF v < 0 THEN v := v + 256;            { -128..127 -> 0..255 }
+    S := S + v;
+    DATA := POINTER(ORD4(DATA) + 1);
+  END;
+  S := S MOD 65536;
+END;
+
+PROCEDURE Sum16 (DATA: byteptr; L: INTEGER; VAR S: LONGINT);
+BEGIN
+  IF asmok THEN
+    SUM16A(DATA, L, S)
+  ELSE
+    Sum16P(DATA, L, S);
+END;
+
+
+{ TRUE if the assembly routines give the same results as the Pascal ones
+  (CRC of a chunk, of one byte and of no bytes, the byte sum, a copy). }
+FUNCTION AsmSelfTest: BOOLEAN;
+VAR j, c1, c2, p, at, dl: INTEGER; s1, s2, ln: LONGINT; same: BOOLEAN;
+
+  { set pgbuf[k] := v }
+  PROCEDURE Pg (k, v: INTEGER);
+  BEGIN
+    big.pgbuf[k] := v;
+  END;
+
+BEGIN
+  FOR j := 1 TO CHUNK DO
+    buf[j] := ToByte(((j MOD 256) * 73 + 11) MOD 256);   { j * 73 overflows an INTEGER for j > 448 }
+  c1 := $FFFF;
+  CRC16N(@buf[1], CHUNK, c1);
+  c2 := $FFFF;
+  CRC16A(@buf[1], CHUNK, c2, ORD4(@crctab));
+  same := (c1 = c2);
+  c1 := $1234;
+  CRC16N(@buf[7], 1, c1);
+  c2 := $1234;
+  CRC16A(@buf[7], 1, c2, ORD4(@crctab));
+  same := same AND (c1 = c2);
+  c2 := $4321;
+  CRC16A(@buf[1], 0, c2, ORD4(@crctab));
+  same := same AND (c2 = $4321);
+  s1 := 100;
+  Sum16P(@buf[1], CHUNK, s1);
+  s2 := 100;
+  SUM16A(@buf[1], CHUNK, s2);
+  same := same AND (s1 = s2);
+  MOVEB(@buf[1], @big.obuf[1], 100);
+  FOR j := 1 TO 100 DO
+    IF big.obuf[j] <> buf[j] THEN same := FALSE;
+  { DECODEP on a page 'ab' CR, DLE + CHR(35) 'x' CR, then NULs: must give
+    'ab' LF '   x' LF, 2 lines, the whole page used }
+  FOR j := 1 TO 32 DO
+    Pg(j, 0);
+  Pg(1, 97); Pg(2, 98); Pg(3, 13); Pg(4, 16); Pg(5, 35); Pg(6, 120); Pg(7, 13);
+  p := 0;
+  at := 1;
+  dl := 0;
+  ln := 0;
+  DECODEP(@big.pgbuf[1], 32, p, at, @dbuf[1], DECMAX, dl, ln);
+  same := same AND (p = 32) AND (dl = 8) AND (ln = 2);
+  IF dl = 8 THEN
+    same := same AND (dbuf[1] = 97) AND (dbuf[2] = 98) AND (dbuf[3] = 10)
+            AND (dbuf[4] = 32) AND (dbuf[5] = 32) AND (dbuf[6] = 32)
+            AND (dbuf[7] = 120) AND (dbuf[8] = 10);
+  { and 'A' NUL 'B' CR (a NUL inside a line is kept), NULs after it }
+  Pg(1, 65); Pg(2, 0); Pg(3, 66); Pg(4, 13); Pg(5, 0); Pg(6, 0); Pg(7, 0);
+  p := 0;
+  at := 1;
+  dl := 0;
+  ln := 0;
+  DECODEP(@big.pgbuf[1], 8, p, at, @dbuf[1], DECMAX, dl, ln);
+  same := same AND (p = 8) AND (dl = 4) AND (ln = 1);
+  IF dl = 4 THEN
+    same := same AND (dbuf[1] = 65) AND (dbuf[2] = 0) AND (dbuf[3] = 66)
+            AND (dbuf[4] = 10);
+  { TXTPUT on 'ab' CR LF '   x' CR 'y' (a CRLF line, leading spaces, a
+    lone CR, a last line without an ending): must give the page bytes
+    'ab' CR, DLE CHR(35) 'x' CR, 'y' CR -- 7 chars of lines }
+  Pg(1, 97); Pg(2, 98); Pg(3, 13); Pg(4, 10); Pg(5, 32); Pg(6, 32);
+  Pg(7, 32); Pg(8, 120); Pg(9, 13); Pg(10, 121);
+  FOR j := 0 TO 7 DO
+    txst[j] := 0;
+  ln := 0;
+  TXTPUT(@big.pgbuf[1], 10, @txst[0], @tline[0], @big.obuf[1], ln);
+  same := same AND (txst[0] = 10) AND (txst[1] = 1) AND (txst[4] = 7)
+          AND (txst[6] = 0) AND (ln = 6);
+  txst[0] := 0;
+  txst[3] := 1;                  { the end of the data: place the last line }
+  TXTPUT(@big.pgbuf[1], 0, @txst[0], @tline[0], @big.obuf[1], ln);
+  same := same AND (txst[4] = 9) AND (ln = 7) AND (txst[3] = 0);
+  IF txst[4] = 9 THEN
+    same := same AND (big.obuf[1] = 97) AND (big.obuf[2] = 98) AND (big.obuf[3] = 13)
+            AND (big.obuf[4] = 16) AND (big.obuf[5] = 35) AND (big.obuf[6] = 120)
+            AND (big.obuf[7] = 13) AND (big.obuf[8] = 121) AND (big.obuf[9] = 13);
+  AsmSelfTest := same;
+END;
+
+{ CRC of '123456789' with the method now in use: must be $29B1 (the
+  standard check value of CRC-16/CCITT-FALSE). }
+FUNCTION CrcCheck: BOOLEAN;
+VAR j, c: INTEGER;
+BEGIN
+  FOR j := 1 TO 9 DO
+    buf[j] := 48 + j;                      { '1'..'9' }
+  c := $FFFF;
+  CRC16(@buf[1], 9, c);
+  CrcCheck := (c = $29B1);
+END;
+
+{ Build the tables, check the assembly routines and the CRC.  Without
+  working assembly routines the (slower) Pascal ones are used.  FALSE only
+  if even the Pascal CRC is wrong. }
+FUNCTION CrcSelfTest: BOOLEAN;
+BEGIN
+  CrcInit;
+  asmok := AsmSelfTest;
+  IF asmok THEN
+    IF NOT CrcCheck THEN asmok := FALSE;
+  IF NOT asmok THEN
+  BEGIN
+    WRITELN('note: the assembly routines failed their self-test, so the slower');
+    WRITELN('Pascal ones are used (see LisaSerialFtpClientAsm.text)');
+    IF NOT CrcCheck THEN
+    BEGIN
+      WRITELN('internal error: CRC self-test failed (expected 29B1)');
+      CrcSelfTest := FALSE;
+      EXIT(CrcSelfTest);
+    END;
+  END;
+  CrcSelfTest := TRUE;
+END;
+
+{--- chunk framing ----------------------------------------------------------}
+{ frame = 'T' + seq(2B BE) + len(2B BE) + payload + crc16(2B BE)            }
+{ crc16 covers seq..payload.  Receiver answers 'A <seq>' or 'N <expected>'. }
+
+{ Sequence numbers are 16 bits on the wire and wrap from 65535 to 0, so a
+  file of any size works.  They are kept unsigned in a LONGINT (an
+  INTEGER would overflow at 32767). }
+PROCEDURE NextSeq (VAR S: LONGINT);
+BEGIN
+  S := S + 1;
+  IF S > 65535 THEN S := 0;
+END;
+
+{ TRUE if R is an EARLIER sequence number than S (1..32767 behind,
+  counting across the wrap): a duplicate, or a reply to an earlier chunk. }
+FUNCTION SeqBehind (R, S: LONGINT): BOOLEAN;
+VAR d: LONGINT;
+BEGIN
+  d := S - R;
+  IF d < 0 THEN d := d + 65536;
+  SeqBehind := (d >= 1) AND (d <= 32767);
+END;
+
+{ Split a reply line 'A <n>' or 'N <n>' into its letter and number.
+  FALSE if the line has any other form (garbled, FAIL, ...). }
+FUNCTION ParseReply (R: string255; VAR K: CHAR; VAR N: LONGINT): BOOLEAN;
+VAR j: integer;
+BEGIN
+  ParseReply := FALSE;
+  IF LENGTH(R) < 3 THEN EXIT(ParseReply);
+  IF ((R[1] <> 'A') AND (R[1] <> 'N')) OR (R[2] <> ' ') THEN EXIT(ParseReply);
+  IF LENGTH(R) > 7 THEN EXIT(ParseReply);        { at most 5 digits }
+  FOR j := 3 TO LENGTH(R) DO
+    IF (R[j] < '0') OR (R[j] > '9') THEN EXIT(ParseReply);
+  K := R[1];
+  N := StrToInt(COPY(R, 3, LENGTH(R) - 2));
+  ParseReply := (N <= 65535);
+END;
+
+{ send one chunk (client is the sender, PUT); returns FALSE on failure.
+  Replies carry a sequence number: 'A <n>' (chunk n is in), 'N <n>' (send
+  chunk n).  A reply about an EARLIER chunk is stale -- e.g. the server's
+  re-ACK of a duplicate we sent when its first ACK was lost -- and is
+  skipped (we keep waiting), so the replies can never fall out of step
+  with the chunks. }
+FUNCTION SendChunk (S: LONGINT; DATA: bufptr; L: INTEGER): BOOLEAN;
+VAR c: integer;
+    cu: LONGINT;            { unsigned 16-bit CRC: 0..65535 does not fit INTEGER }
+    sn: LONGINT;            { S + 1, wrapped }
+    attempt: integer;
+    r: string255;
+    j: integer;
+    w: integer;             { WaitLine result for the A/N reply }
+    k: CHAR;                { reply letter: A or N }
+    n: LONGINT;             { reply sequence number }
+    valid: boolean;         { r is 'A <n>' or 'N <n>' }
+    stale: boolean;         { r is about an earlier chunk: skip it }
+    nstale: integer;        { stale replies skipped on this try }
+    got: boolean;           { the server has this chunk }
+    want: integer;          { length of the expected reply 'A <S>' + CR LF }
+BEGIN
+  r := '';
+  sn := S;
+  NextSeq(sn);
+  IntToStr(S, r);
+  want := LENGTH(r) + 4;
+  r := '';
+  FOR attempt := 1 TO MAXRETRY DO
+  BEGIN
+    txframe[1] := 84;                      { 'T' }
+    txframe[2] := ToByte(S DIV 256);       { S is 0..65535 }
+    txframe[3] := ToByte(S MOD 256);
+    txframe[4] := ToByte(L DIV 256);       { L is 0..CHUNK }
+    txframe[5] := ToByte(L MOD 256);
+    IF L > 0 THEN
+      MoveBytes(@DATA^[1], @txframe[6], L);
+    c := $FFFF;
+    CRC16(@txframe[2], 4 + L, c);
+    { CRC16 returns a SIGNED integer.  Convert to unsigned in a LONGINT:
+      c + 65536 does not fit an INTEGER, and DIV 256 of a negative INTEGER
+      rounds toward zero, giving a wrong high byte for half of all CRCs. }
+    cu := c;
+    IF cu < 0 THEN cu := cu + 65536;
+    txframe[5 + L + 1] := ToByte(cu DIV 256);
+    txframe[5 + L + 2] := ToByte(cu MOD 256);
+    { Transmit the whole frame (CHUNK + 7 bytes at most) with ONE
+      WRITE_DATA.  Every WRITE_DATA goes through the file system and the
+      driver, so sending byte by byte made 'put' several times slower
+      than 'get'.  The frame is a GLOBAL (txframe), not a local on the
+      stack: the driver keeps reading from it while it sends (~68 ms at
+      38400 baud), and a stack buffer that is moved or swapped meanwhile
+      was the suspected cause of garbage sent by an earlier whole-frame
+      write.  A frame corrupted anyway is rejected by the server's CRC
+      check and sent again. }
+    PutBlock(@txframe[1], 7 + L);
+    { Wait for the A/N reply with a timeout: if it (or the whole chunk)
+      was lost, no reply arrives and we retransmit the same chunk.  The
+      receiver re-ACKs a duplicate, so a retransmit is always safe.
+      Stale replies (about an earlier chunk) are skipped, a few at most. }
+    nstale := 0;
+    REPEAT
+      w := ReplyLine(r, T_REPLY, TRUE, want);
+      IF w = W_ABORT THEN
+      BEGIN
+        SendChunk := FALSE;    { Apple-period: DoPut sends FAIL (AbortTransfer) }
+        EXIT(SendChunk);
+      END;
+      stale := FALSE;
+      valid := FALSE;
+      IF w = W_OK THEN
+      BEGIN
+        valid := ParseReply(r, k, n);
+        IF valid THEN
+          stale := SeqBehind(n, S);
+      END;
+      IF stale THEN
+      BEGIN
+        nstale := nstale + 1;
+        IF debugon THEN
+          WRITELN('    chunk ', S:1, ': stale reply [', r, '] (about an earlier chunk) skipped');
+      END;
+    UNTIL (NOT stale) OR (nstale >= 4);
+    { 'A <S>': accepted.  'N <S+1>': the server asks for the NEXT chunk,
+      so it has this one (its ACK was lost and its wait for the next
+      chunk ran out first): also accepted.  Anything else -- 'N <S>',
+      garbage, a stale reply, no reply -- means send the same chunk
+      again (the server re-ACKs a chunk it already has). }
+    got := valid AND (NOT stale) AND
+           (((k = 'A') AND (n = S)) OR ((k = 'N') AND (n = sn)));
+    { The end-of-file chunk: the server sends its ACK and its DONE back
+      to back.  If the ACK was lost but the DONE came, the server has the
+      chunk: accepted, and the DONE is kept for DoPut (eofdone/donel). }
+    IF (NOT got) AND (L = 0) AND (w = W_OK) AND (LENGTH(r) >= 4) THEN
+      IF COPY(r, 1, 4) = 'DONE' THEN
+      BEGIN
+        got := TRUE;
+        eofdone := TRUE;
+        donel := r;
+      END;
+    IF debugon THEN            { 'chunk 3: 256 bytes sent (try 2) -> ' + outcome }
+    BEGIN
+      IF L > 0 THEN
+        WRITE('    chunk ', S:1, ': ', L:1, ' bytes sent')
+      ELSE
+        WRITE('    chunk ', S:1, ': end-of-file chunk sent');
+      IF attempt > 1 THEN WRITE(' (try ', attempt:1, ')');
+      WRITE(' -> ');
+      IF w <> W_OK THEN
+        WRITELN('no reply within ', T_REPLY:1, ' s, resending')
+      ELSE IF eofdone THEN
+        WRITELN('DONE instead of the ACK: the server has it -> accepted')
+      ELSE IF got AND (k = 'A') THEN
+        WRITELN('accepted (ACK)')
+      ELSE IF got THEN
+        WRITELN('NAK for the next chunk: the server already has this one -> accepted')
+      ELSE IF stale THEN
+        WRITELN('only stale replies, resending')
+      ELSE IF valid AND (k = 'N') AND (n = S) THEN
+        WRITELN('rejected by the server (NAK), resending')
+      ELSE IF (LENGTH(r) > 0) AND (r[1] = 'F') THEN
+        WRITELN('the server gave up')
+      ELSE
+        WRITELN('unexpected reply [', r, '], resending');
+    END;
+    IF got THEN
+    BEGIN
+      ProgMark('.', L);
+      SendChunk := TRUE;
+      EXIT(SendChunk);
+    END;
+    IF (w = W_OK) AND (LENGTH(r) > 0) AND (r[1] = 'F') THEN
+    BEGIN
+      { the server aborted; show why, acknowledge its FAIL, and give up }
+      ProgEnd;
+      WRITELN('server: ', r);
+      SendLine('OK');
+      linkdead := TRUE;
+      SendChunk := FALSE;
+      EXIT(SendChunk);
+    END;
+    ProgMark('x', 0);          { NAK, garbage, stale or no reply: retransmit }
+  END;
+  ProgEnd;
+  { Diagnostics: show what the server last said so a failure is not a
+    mystery.  NAK (N ...) = server got the frame but rejected it;
+    empty = the server got nothing (link problem). }
+  IF (LENGTH(r) > 0) THEN
+    WRITELN('last server reply: [', r, ']')
+  ELSE
+    WRITELN('no reply from server (link dead?)');
+  SendChunk := FALSE;
+END;
+
+{ Send a NAK carrying the chunk sequence number we are still waiting for.
+  The sender retransmits that chunk.  (Defined here, after IntToStr and
+  SendLine, because Lisa Pascal resolves names in order.) }
+PROCEDURE SendNAK (S: LONGINT);
+VAR t: string255;
+BEGIN
+  IntToStr(S, t);
+  SendRaw(concat('N ', t));
+END;
+
+{ ACK chunk S: 'A <S>'.  The number lets the sender tell this reply from
+  a stale one (a re-ACK of a duplicate), so the replies cannot get out
+  of step with the chunks. }
+PROCEDURE SendACK (S: LONGINT);
+VAR t: string255;
+BEGIN
+  IntToStr(S, t);
+  SendRaw(concat('A ', t));
+END;
+
+{ get: send the ACK RecvChunk held back (holdack), if any }
+PROCEDURE AckNow;
+BEGIN
+  IF ackdue THEN
+  BEGIN
+    ackdue := FALSE;
+    SendACK(ackno);
+  END;
+END;
+
+{ The timeout (real seconds) for reading N bytes of a frame that has
+  started: T_BLOCK, plus twice the time N bytes take on the wire (10 bits
+  each), so slow baud rates work with 1 KB chunks too. }
+FUNCTION FrameTmo (n: integer): longint;
+BEGIN
+  IF curbaud > 0 THEN
+    FrameTmo := T_BLOCK + (ORD4(n) * 20) DIV curbaud
+  ELSE
+    FrameTmo := T_BLOCK;
+END;
+
+{ receive one chunk (client is the receiver, GET).
+  SEQ on entry = expected sequence number; on exit = next expected.
+  Returns FALSE on failure; sets linkdead if the server sent FAIL.
+
+  Loss recovery (stop-and-wait): the sender is quiet while it waits for
+  our reply, so a byte lost in a chunk leaves us short of bytes and the
+  read times out.  On any short/partial read we discard the stray bytes
+  until the line is quiet and NAK; the sender retransmits the same chunk.
+  A repeated sequence number (our ACK was lost) is re-ACKed and discarded.
+  After MAXRETRY attempts that do not advance SEQ we give up. }
+FUNCTION RecvChunk (VAR S: LONGINT; VAR L: INTEGER; DATA: byteptr;
+                    want: INTEGER): BOOLEAN;
+VAR hdr: ARRAY [1..5] OF ByteT;
+    c, rlen: integer;
+    rseq: LONGINT;             { 0..65535: does not fit an INTEGER }
+    cu, ccrc: LONGINT;         { unsigned 16-bit CRCs (LONGINT: no overflow) }
+    ch: CHAR;
+    r: string255;
+    t1: string[1];
+    got: integer;
+    attempt: integer;
+    eol: boolean;
+    nak: boolean;              { TRUE -> discard stray bytes + NAK this attempt }
+    w: integer;                { WaitChar result for the chunk's first byte }
+    ok: boolean;               { chunk accepted; a Lisa Pascal function name used as
+                                  a value is a zero-arg CALL, so the loop condition
+                                  cannot read RecvChunk itself (shadows global ok) }
+    why: string255;            { debug: why the chunk was rejected }
+    n1, n2: string255;
+    ci: integer;               { debug: the received CRC as a signed INTEGER }
+BEGIN
+  attempt := 0;
+  ok := FALSE;
+  WHILE (ok = FALSE) AND (attempt < MAXRETRY) DO
+  BEGIN
+    attempt := attempt + 1;
+    nak := FALSE;
+    why := '';
+    { 1. First byte of the chunk.  Long timeout: if the whole chunk was lost
+      the sender retransmits it after ~10 s, so wait longer than that to
+      catch the retransmit.  Sliced (WaitChar), so Apple-period stops it. }
+    w := WaitChar(ch, T_FRAME, TRUE);
+    IF w = W_ABORT THEN
+    BEGIN
+      SetTmo(0);
+      RecvChunk := FALSE;      { DoGet sends FAIL (AbortTransfer) }
+      EXIT(RecvChunk);
+    END;
+    IF w <> W_OK THEN
+    BEGIN
+      nak := TRUE;
+      IF debugon THEN
+      BEGIN
+        IntToStr(T_FRAME, n1);
+        why := concat('nothing arrived within ', n1, ' s');
+      END;
+    END
+    ELSE IF ch <> 'T' THEN
+    BEGIN
+      { not a chunk header: consume the rest of the line and inspect it.
+        A "FAIL ..." line means the peer aborted; anything else is a
+        desync (a corrupted or partial frame). }
+      r := '';
+      t1 := ' ';
+      t1[1] := ch;
+      r := concat(r, t1);
+      eol := FALSE;
+      WHILE NOT eol DO
+      BEGIN
+        IF NOT TryGetChar(ch, T_BLOCK) THEN
+          eol := TRUE
+        ELSE IF ch = CHR(10) THEN
+          eol := TRUE
+        ELSE IF (ch <> CHR(13)) AND (LENGTH(r) < MAXLINE) THEN
+        BEGIN
+          t1 := ' ';
+          t1[1] := ch;
+          r := concat(r, t1);
+        END;
+      END;
+      IF (LENGTH(r) > 0) AND (r[1] = 'F') THEN
+      BEGIN
+        ProgEnd;
+        WRITELN('server: ', r);
+        SendLine('OK');        { acknowledge the peer's FAIL }
+        linkdead := TRUE;
+        SetTmo(0);             { EXIT skips the reset at the end; do it here }
+        EXIT(RecvChunk);
+      END;
+      nak := TRUE;             { desync: discard + NAK below }
+      IF debugon THEN
+        why := concat('a line instead of a chunk: [', r, ']');
+    END
+    ELSE
+    BEGIN
+      { 2. The rest of the frame we expect (WANT data bytes: DoGet knows
+        them from the file size) with ONE READ_DATA into the read-ahead
+        queue: a call costs ~6 ms on a real Lisa, and the header, data and
+        CRC reads below then take it from there.  A different frame (a
+        repeat of the chunk before, a short one: bytes lost) is still read
+        correctly: what is not in the queue comes from the port, and what
+        is left in the queue is read next. }
+      IF (want >= 0) AND (rxqp > rxqn) THEN
+      BEGIN
+        rxqp := 1;
+        rxqn := 0;
+        rxqn := TryGetBlock(@rxq[1], want + 6, FrameTmo(want + 6));
+      END;
+      { the rest of the header (4 bytes), short timeout }
+      got := TryGetBlock(@hdr[2], 4, T_BLOCK);
+      IF got < 4 THEN
+      BEGIN
+        nak := TRUE;
+        IF debugon THEN
+        BEGIN
+          IntToStr(got, n1);
+          why := concat('incomplete: ', n1, ' of 4 header bytes');
+        END;
+      END
+      ELSE
+      BEGIN
+        hdr[1] := 84;          { 'T', already read as ch }
+        rseq := ByteVal(hdr[2]);
+        rseq := rseq * 256 + ByteVal(hdr[3]);
+        rlen := ByteVal(hdr[4]) * 256 + ByteVal(hdr[5]);
+        IF rlen > CHUNK THEN
+        BEGIN
+          nak := TRUE;         { implausible length: a false sync }
+          IF debugon THEN
+          BEGIN
+            IntToStr(rlen, n1);
+            why := concat('impossible length ', n1, ' (out of step)');
+          END;
+        END
+        ELSE
+        BEGIN
+          { 3. Payload, short timeout }
+          IF rlen > 0 THEN
+          BEGIN
+            got := TryGetBlock(DATA, rlen, FrameTmo(rlen));
+            IF got < rlen THEN
+            BEGIN
+              nak := TRUE;
+              IF debugon THEN
+              BEGIN
+                IntToStr(got, n1);
+                IntToStr(rlen, n2);
+                why := concat('incomplete: ', n1, ' of ', n2, ' bytes (bytes lost)');
+              END;
+            END;
+          END;
+          IF NOT nak THEN
+          BEGIN
+            { 4. CRC (2 bytes), short timeout }
+            got := TryGetBlock(@rxb, 2, T_BLOCK);
+            IF got < 2 THEN
+            BEGIN
+              nak := TRUE;
+              IF debugon THEN why := 'incomplete: the CRC is missing';
+            END
+            ELSE
+            BEGIN
+              { LONGINT arithmetic: ByteVal(..) * 256 is INTEGER and
+                overflows (goes negative) when the high byte is >= $80 }
+              ccrc := ByteVal(rxb[0]);
+              ccrc := ccrc * 256 + ByteVal(rxb[1]);
+              { the header (hdr) and the payload (DATA) are separate buffers,
+                so the CRC is chained: first seq+len from hdr, then payload }
+              c := $FFFF;
+              CRC16(@hdr[2], 4, c);
+              IF rlen > 0 THEN
+                CRC16(DATA, rlen, c);
+              cu := c;
+              IF cu < 0 THEN cu := cu + 65536;
+              IF SeqBehind(rseq, S) THEN
+              BEGIN
+                { duplicate: this chunk was already accepted (our ACK was
+                  lost, so the sender retransmitted it).  Re-ACK it and
+                  discard the payload; wait for the real next chunk.  No
+                  NAK: the sender is waiting for our A to move on. }
+                IF debugon THEN
+                  WRITELN('    chunk ', rseq:1, ': received again (our ACK was lost) -> ACK again');
+                SendACK(rseq);
+              END
+              ELSE IF (rseq = S) AND (cu = ccrc) THEN
+              BEGIN
+                IF debugon THEN
+                  IF rlen > 0 THEN
+                    WRITELN('    chunk ', S:1, ': ', rlen:1, ' bytes received, CRC ok -> ACK')
+                  ELSE
+                    WRITELN('    chunk ', S:1, ': end-of-file chunk received -> ACK');
+                IF holdack THEN
+                BEGIN
+                  ackdue := TRUE;   { DoGet sends it (AckNow) after its disk write }
+                  ackno := S;
+                END
+                ELSE
+                  SendACK(S);
+                ProgMark('.', rlen);
+                NextSeq(S);
+                L := rlen;
+                ok := TRUE;
+              END
+              ELSE
+              BEGIN
+                nak := TRUE;   { bad CRC or a gap (rseq ahead of S) }
+                IF debugon THEN
+                  IF rseq <> S THEN
+                  BEGIN
+                    IntToStr(rseq, n1);
+                    IntToStr(S, n2);
+                    why := concat('chunk ', n1, ' arrived, expected ', n2);
+                  END
+                  ELSE
+                  BEGIN
+                    IF ccrc > 32767 THEN       { IntToHex takes an INTEGER }
+                      ci := ccrc - 65536
+                    ELSE
+                      ci := ccrc;
+                    IntToHex(ci, n1);
+                    IntToHex(c, n2);
+                    why := concat('bad CRC (received ', n1, ', computed ', n2, ')');
+                  END;
+              END;
+            END;
+          END;
+        END;
+      END;
+    END;
+    IF nak THEN
+    BEGIN
+      IF debugon THEN
+        WRITELN('    chunk ', S:1, ': rejected, ', why, ' -> NAK');
+      ProgMark('x', 0);
+      DiscardUntilQuiet;
+      SendNAK(S);
+    END;
+  END;
+  SetTmo(0);                   { back to no timeout for the command phase }
+  RecvChunk := ok;
+END;
+
+{ If we gave up (or the user pressed Apple-period), tell the peer and
+  resync to the command state.  The server answers our FAIL with its own
+  FAIL (it was sending: GET), which we acknowledge with OK, or with a
+  bare OK (it was receiving: PUT).  Bytes still in flight -- the rest of
+  a chunk, an A/N reply -- may arrive first and are skipped.  Not
+  abortable (Apple-period is already set when we get here); each wait is
+  bounded, and if no FAIL/OK arrives the session is marked not connected. }
+PROCEDURE AbortTransfer (what: string255);
+VAR j: integer; w: integer; done: boolean;
+BEGIN
+  IF NOT linkdead THEN
+  BEGIN
+    SendLine(concat('FAIL ', what));
+    done := FALSE;
+    j := 0;
+    WHILE (NOT done) AND (j < 20) DO
+    BEGIN
+      j := j + 1;
+      w := WaitLine(l, T_REPLY, FALSE);
+      IF w = W_OK THEN ShowRx(l);
+      IF w <> W_OK THEN
+        j := 20                          { nothing more: give up waiting }
+      ELSE IF (LENGTH(l) >= 4) AND (COPY(l, 1, 4) = 'FAIL') THEN
+      BEGIN
+        SendLine('OK');                  { acknowledge the peer's FAIL }
+        done := TRUE;
+      END
+      ELSE IF l = 'OK' THEN
+        done := TRUE;                    { the peer acknowledged ours }
+    END;
+    IF NOT done THEN
+      NoServer(W_TMO);
+  END;
+  dirty := TRUE;                         { stray bytes may still follow }
+END;
+
+{ Code segments.  A Lisa Pascal code segment holds at most 32 KB ("Code
+  size too big" from the linker), so the program is split, as Apple's own
+  programs are (e.g. nwshell):
+    blank segment : everything above -- the serial port, CRC and chunk
+                    protocol, used all the time -- and the main program;
+    CmdSeg        : listings, help, baud, port setup, hello and the other
+                    commands;
+    XferSeg       : the get and put transfers (DoGet, DoPut).
+  A segment is loaded when one of its routines is called; calls between
+  segments need nothing special.  Segment names: at most 8 characters. }
+{$S CmdSeg  }
+
+{--- paging (list, !list) ----------------------------------------------------}
+
+{ Start a new paged listing. }
+PROCEDURE PageStart;
+BEGIN
+  pglines := 0;
+END;
+
+{ Call before printing each line of a paged listing.  After every PAGELEN
+  lines it asks the user and waits for a key (read from kbd, no echo):
+  SPACE continues (TRUE), CLEAR stops the listing (FALSE).  Other keys
+  are ignored.  Return also continues: a text file reads it as a space. }
+FUNCTION PageMore: BOOLEAN;
+VAR ch: CHAR;
+BEGIN
+  PageMore := TRUE;
+  IF pglines >= PAGELEN THEN
+  BEGIN
+    pglines := 0;
+    WRITE('Type SPACE to continue, CLEAR to exit.');
+    REPEAT
+      READ(kbd, ch);
+    UNTIL (ch = ' ') OR (ch = CHR(CLEARCH));
+    WRITELN;
+    IF ch = CHR(CLEARCH) THEN
+      PageMore := FALSE;
+  END;
+  pglines := pglines + 1;
+END;
+
+{--- commands ----------------------------------------------------------------}
+
+{ The serial input has no flow control: the driver keeps at most 512
+  unread bytes (the type-ahead buffer) and drops the rest.  So the server
+  sends a listing in pages of at most 384 bytes; each page but the last
+  ends with MORE, and only when we answer NEXT (having read the page) does
+  the next one come.  Waiting for a key in the middle would keep the
+  server waiting too long, so the whole listing is first read into lbuf
+  and then shown screen by screen. }
+PROCEDURE DoList (dir: string255);
+VAR j, k, n, nl, np: integer; full: boolean;
+BEGIN
+  IF dir = '' THEN
+    SendLine('LIST')
+  ELSE
+    SendLine(concat('LIST ', dir));
+  IF NOT GetResponse(l) THEN EXIT(DoList);
+  IF (LENGTH(l) = 0) OR (l[1] <> 'O') THEN
+  BEGIN
+    WRITELN(l);
+    EXIT(DoList);
+  END;
+  lbused := 0;
+  nl := 0;
+  np := 1;
+  full := FALSE;
+  logrx := FALSE;                { no time to print while it streams in }
+  REPEAT
+    IF NOT GetLine(l) THEN
+    BEGIN
+      logrx := TRUE;
+      EXIT(DoList);
+    END;
+    IF l = 'MORE' THEN
+    BEGIN
+      SendRaw('NEXT');           { this page is read: send the next one }
+      np := np + 1;
+    END
+    ELSE IF l <> 'DONE' THEN
+      IF lbused + LENGTH(l) + 1 <= LISTBUF THEN
+      BEGIN
+        nl := nl + 1;
+        lbused := lbused + 1;
+        big.lbuf[lbused] := ToByte(LENGTH(l));
+        FOR j := 1 TO LENGTH(l) DO
+        BEGIN
+          lbused := lbused + 1;
+          big.lbuf[lbused] := ToByte(ORD(l[j]));
+        END;
+      END
+      ELSE
+        full := TRUE;
+  UNTIL l = 'DONE';
+  logrx := TRUE;
+  IF debugon THEN
+    WRITELN('    received: ', nl:1, ' entries in ', np:1, ' page(s), then DONE');
+  PageStart;
+  k := 0;
+  WHILE k < lbused DO
+  BEGIN
+    k := k + 1;
+    n := ByteVal(big.lbuf[k]);
+    {$R-}        { l[j] is written past the current length }
+    FOR j := 1 TO n DO
+      l[j] := CHR(ByteVal(big.lbuf[k + j]));
+    l[0] := CHR(n);
+    {$R+}
+    k := k + n;
+    IF NOT PageMore THEN EXIT(DoList);
+    WRITELN(l);
+  END;
+  IF full THEN
+    IF PageMore THEN
+      WRITELN('(listing too long: only the first ', nl, ' entries are shown)');
+END;
+
+{ The '!list' command (local volume listing: EntryKind, Pad2, DateStr,
+  DoListVol) lives in a separate file, textually included here at this point with
+  the I directive (file inclusion), as in Apple's own sources.  Note:
+  the E directive is for the Lisa Pascal editor, not the compiler. }
+{$I LisaSerialFtpClientInclude.text}
+
+PROCEDURE ShowHelp;
+BEGIN
+  WRITELN('commands:');
+  WRITELN('  list [dir]            list files on the server');
+  WRITELN('  get [-c] [-b|-t] <remote> [local]  download: as text (CRLF/LF -> CR)');
+  WRITELN('                        if the local or remote name ends in .TEXT,');
+  WRITELN('                        else byte-exact');
+  WRITELN('      -c: skip it if the local copy is the same as the server''s');
+  WRITELN('      -b: get as binary (byte-exact) / -t: save as a text file');
+  WRITELN('  put [-c] [-b|-t] <local> [remote]  upload: a .TEXT file as text (lines');
+  WRITELN('                        end in LF), any other file byte-exact');
+  WRITELN('      -c: skip it if the server''s copy is the same as the local one');
+  WRITELN('      -b: send as binary (byte-exact) / -t: send as a text file');
+  WRITELN('  !list [name]          list all files on the default volume (prefix match)');
+  WRITELN('  delete <remote>       delete a file on the server (asks Y/N); also del');
+  WRITELN('  !delete <local>       delete a file on the Lisa (asks Y/N); also !del');
+  WRITELN('  baud [rate]           show or change the baud rate, here and on the server');
+  WRITELN('  hello                 (re-)send HELLO, wait for the server banner');
+  WRITELN('  timeout-factor [<n> | auto]  show/set timeout multiplier (auto = measure)');
+  WRITELN('  debug [on | off]      show or switch debug output (here and on the server):');
+  WRITELN('                        off = progress marks (. per chunk, x per retry),');
+  WRITELN('                        on  = a line for every protocol line and chunk');
+  WRITELN('  repeat / r            run the last command again');
+  WRITELN('  help / h / ?          show this help');
+  WRITELN('  quit / q              exit');
+  WRITELN('Use hotkey Apple + . to cancel a wait or a transfer at any time.');
+END;
+
+{$S XferSeg }
+
+{ End-of-transfer verification.  The receiver sends 'DONE <bytes> <crc>'
+  (CRC-16 over the whole file); the sender compares and answers
+  'OK <bytes> <crc>' or 'BAD <bytes> <crc>' with ITS numbers, and the
+  receiver keeps the file only on OK with numbers equal to its own.
+  Matches: TRUE if line V is '<W> <bytes> <crc>' with these N and C
+  (the hex CRC in any case). }
+FUNCTION Matches (V: string255; W: string255; N: longint; C: integer): BOOLEAN;
+VAR vw, va, vb, sn, sc: string255;
+BEGIN
+  ParseCmd(V, vw, va, vb);        { vw is upper-cased by ParseCmd }
+  UpperStr(vb);
+  IntToStr(N, sn);
+  IntToHex(C, sc);                { 4 upper-case hex digits }
+  Matches := (vw = W) AND (va = sn) AND (vb = sc);
+END;
+
+{ GET: read the server's OK/BAD verdict (into V) after our DONE line D.
+  If the server sends the end-of-file chunk (number E) again instead --
+  our ACK and DONE were lost, or its wait for them ran out before they
+  arrived -- ACK it again and send DONE again, rather than taking the
+  frame for a garbled verdict.  FALSE (and reported) if no verdict. }
+FUNCTION GetVerdict (E: LONGINT; D: string255; VAR V: string255): BOOLEAN;
+VAR ch: CHAR;
+    w, got, tries, c: integer;
+    h: ARRAY [1..6] OF ByteT;  { seq, len, crc of an end-of-file chunk }
+    rs, cr, cu: LONGINT;
+    r: string255;
+    t1: string[1];
+BEGIN
+  GetVerdict := FALSE;
+  FOR tries := 1 TO MAXRETRY DO
+  BEGIN
+    w := WaitChar(ch, T_CMD, TRUE);
+    IF w <> W_OK THEN
+    BEGIN
+      NoServer(w);
+      EXIT(GetVerdict);
+    END;
+    IF ch <> 'T' THEN
+    BEGIN
+      { a line: the verdict (its first char is already in ch) }
+      V := '';
+      IF ch <> CHR(10) THEN
+      BEGIN
+        w := WaitLine(r, T_LINE, TRUE);
+        IF w = W_ABORT THEN
+        BEGIN
+          NoServer(w);
+          EXIT(GetVerdict);
+        END;
+        IF ch = CHR(13) THEN
+          V := r
+        ELSE
+        BEGIN
+          t1 := ' ';
+          t1[1] := ch;
+          V := concat(t1, r);
+        END;
+      END;
+      ShowRx(V);
+      GetVerdict := TRUE;
+      EXIT(GetVerdict);
+    END;
+    { a chunk frame: is it the end-of-file chunk E again? }
+    got := TryGetBlock(@h[1], 6, T_BLOCK);
+    rs := ByteVal(h[1]);
+    rs := rs * 256 + ByteVal(h[2]);
+    cr := ByteVal(h[5]);
+    cr := cr * 256 + ByteVal(h[6]);
+    c := $FFFF;
+    CRC16(@h[1], 4, c);
+    cu := c;
+    IF cu < 0 THEN cu := cu + 65536;
+    IF (got = 6) AND (rs = E) AND (h[3] = 0) AND (h[4] = 0) AND (cu = cr) THEN
+    BEGIN
+      IF debugon THEN
+        WRITELN('    chunk ', E:1, ': end-of-file chunk received again (our ACK or DONE was lost) -> ACK and DONE again');
+      SendACK(E);
+      SendLine(D);
+    END
+    ELSE
+    BEGIN
+      IF debugon THEN
+        WRITELN('    unexpected bytes instead of the verdict -> discarded');
+      DiscardUntilQuiet;
+    END;
+  END;
+  WRITELN('no verdict from the server');
+END;
+
+{--- text decoding, the -c check, file writing ---------------------------}
+
+{ text: the LEN bytes collected in buf are full (or the last ones).
+  tmode 1: send them as one chunk; tmode 2: add them to the -c check.
+  Both add them to crc and total. }
+PROCEDURE TxFlush;
+BEGIN
+  IF ok AND (len > 0) THEN
+  BEGIN
+    CRC16(@buf[1], len, crc);
+    total := total + len;
+    IF tmode = 2 THEN
+      Sum16(@buf[1], len, bsum)
+    ELSE
+    BEGIN
+      ok := SendChunk(seq, @buf, len);
+      IF ok THEN NextSeq(seq);
+    END;
+  END;
+  len := 0;
+END;
+
+{ Decode the Lisa .TEXT file open as FREF into the bytes put sends: each
+  is counted (tmode 0), or collected in buf, which TxFlush sends (tmode 1)
+  or adds to the -c check (tmode 2) when it is full.  The raw pages are
+  read with READ_DATA, TBUF bytes (4 pages) at a time, NOT with the
+  Pascal text type: its READLN edits the line (a CHR(8) deletes the
+  previous character) and may stop early, so it does not return the
+  file's real contents.  The decoding is the one LisaFileSystemTool uses
+  (see LisaOsTextFileSpecification.txt):
+    * the first 1024-byte page is a header, not text: skipped;
+    * every other page holds CR-terminated lines; the first CR-NUL pair
+      ends the page (the rest is NUL padding);
+    * a DLE (16) + CHR(32 + n) at the start of a line is n spaces;
+    * CR becomes LF (the reverse of 'get'); all other bytes are sent as is.
+  Each page is decoded by DECODEP (assembly, ~15 times faster) if the
+  assembly routines passed AsmSelfTest, else by the Pascal loop below,
+  which does everything inline (no procedure call per byte: in Lisa
+  Pascal a call costs more than the rest of the work on a byte).  Counts
+  the lines in tlines.  FALSE on a read error (reported). }
+{ text: N decoded bytes in dbuf (DECODEP's output) -- counted (tmode 0),
+  added to the -c check (tmode 2), or cut into chunks in buf, which
+  TxFlush sends (tmode 1). }
+PROCEDURE TxBytes (n: integer);
+VAR k, m: integer;
+BEGIN
+  IF tmode = 0 THEN
+    size := size + n
+  ELSE IF tmode = 2 THEN
+  BEGIN
+    CRC16(@dbuf[1], n, crc);
+    Sum16(@dbuf[1], n, bsum);
+    total := total + n;
+  END
+  ELSE
+  BEGIN
+    k := 0;
+    WHILE ok AND (k < n) DO
+    BEGIN
+      m := CHUNK - len;
+      IF m > n - k THEN m := n - k;
+      MoveBytes(@dbuf[k + 1], @buf[len + 1], m);
+      len := len + m;
+      k := k + m;
+      IF len = CHUNK THEN TxFlush;
+    END;
+  END;
+END;
+
+FUNCTION TextPass (fref: integer): BOOLEAN;
+VAR n, p, pe, pg, k, cnt, at, dl: integer;
+    v: ByteT;
+    first, atstart, done, pad, counting: boolean;
+BEGIN
+  TextPass := FALSE;
+  tlines := 0;
+  first := TRUE;
+  done := FALSE;
+  counting := (tmode = 0);
+  REPEAT
+    ecode := 0;
+    actual := 0;
+    READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), TBUF, actual, sequential, 0);
+    { end of file: as in DoPut's binary loop }
+    IF (ecode = 848) OR (ecode = 881) OR (ecode = 883) OR (ecode = 956) THEN
+    BEGIN
+      ecode := 0;
+      done := TRUE;
+    END;
+    IF ecode > 0 THEN
+    BEGIN
+      ProgEnd;
+      WRITELN('file read error: ', ecode);
+      EXIT(TextPass);
+    END;
+    n := actual;
+    IF n = 0 THEN done := TRUE;
+    pg := 0;                     { the current page is pgbuf[pg+1 .. pe] }
+    WHILE ok AND (pg < n) DO
+    BEGIN
+      pe := pg + TPAGE;
+      IF pe > n THEN pe := n;
+      IF first THEN
+        first := FALSE           { the header page: not text }
+      ELSE IF asmok THEN
+      BEGIN
+        { the page in assembly (DECODEP), a dbuf full at a time }
+        p := 0;
+        at := 1;
+        REPEAT
+          dl := 0;
+          DECODEP(@big.pgbuf[pg + 1], pe - pg, p, at, @dbuf[1], DECMAX, dl, tlines);
+          IF dl > 0 THEN TxBytes(dl);
+        UNTIL (p >= pe - pg) OR NOT ok;
+      END
+      ELSE
+      BEGIN
+        p := pg + 1;
+        atstart := TRUE;
+        {$R-}    { p <= pe <= TBUF, len <= CHUNK: no range checks in the loop }
+        WHILE ok AND (p <= pe) DO
+        BEGIN
+          v := big.pgbuf[p];
+          p := p + 1;
+          IF v = 13 THEN
+          BEGIN
+            IF counting THEN
+              size := size + 1
+            ELSE
+            BEGIN
+              len := len + 1;
+              buf[len] := 10;    { CR -> LF }
+              IF len = CHUNK THEN TxFlush;
+            END;
+            tlines := tlines + 1;
+            atstart := TRUE;
+            IF p <= pe THEN
+              IF big.pgbuf[p] = 0 THEN
+                p := pe + 1      { CR-NUL: the end of this page }
+          END
+          ELSE IF v = 0 THEN
+          BEGIN
+            { a page without CR-NUL: its trailing NULs are padding; a
+              NUL inside a line is kept }
+            pad := TRUE;
+            FOR k := p TO pe DO
+              IF big.pgbuf[k] <> 0 THEN pad := FALSE;
+            IF pad THEN
+              p := pe + 1
+            ELSE IF counting THEN
+              size := size + 1
+            ELSE
+            BEGIN
+              len := len + 1;
+              buf[len] := 0;
+              IF len = CHUNK THEN TxFlush;
+            END;
+            atstart := FALSE;
+          END
+          ELSE
+          BEGIN
+            cnt := 0;            { DLE + CHR(32 + n) at the start: n spaces }
+            IF (v = 16) AND atstart THEN
+              IF p <= pe THEN
+              BEGIN
+                cnt := big.pgbuf[p];
+                IF cnt < 0 THEN cnt := cnt + 256;
+                cnt := cnt - 32;
+              END;
+            IF cnt > 0 THEN
+            BEGIN
+              p := p + 1;
+              IF counting THEN
+                size := size + cnt
+              ELSE
+                FOR k := 1 TO cnt DO
+                BEGIN
+                  len := len + 1;
+                  buf[len] := 32;
+                  IF len = CHUNK THEN TxFlush;
+                END;
+            END
+            ELSE IF counting THEN
+              size := size + 1
+            ELSE
+            BEGIN
+              len := len + 1;
+              buf[len] := v;     { any other byte, as it is }
+              IF len = CHUNK THEN TxFlush;
+            END;
+            atstart := FALSE;
+          END;
+        END;
+        {$R+}
+      END;
+      pg := pg + TPAGE;
+    END;
+  UNTIL done OR NOT ok;
+  TextPass := TRUE;
+END;
+
+{ -c: size, CRC-16 and byte sum of the local file LNAME as it would be
+  sent by put -- the bytes as they are (binary), or decoded (text) -- in
+  total, crc and bsum.  FALSE if it cannot be read (said so, ending the
+  line SameFile began). }
+FUNCTION LocalSum (lname: pathname; binary, isget: boolean): BOOLEAN;
+VAR fref: integer; done: boolean;
+BEGIN
+  LocalSum := FALSE;
+  crc := $FFFF;
+  total := 0;
+  bsum := 0;
+  len := 0;
+  ok := TRUE;
+  tmode := 2;
+  ecode := 0;
+  OPEN(ecode, lname, fref, [dread]);
+  IF ecode > 0 THEN
+  BEGIN
+    IF isget THEN
+      WRITELN('no local file to compare, so getting the file')
+    ELSE
+      WRITELN('no local file');      { DoPut then reports it too }
+    EXIT(LocalSum);
+  END;
+  IF binary THEN
+  BEGIN
+    done := FALSE;
+    REPEAT
+      ecode := 0;
+      actual := 0;
+      READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), TBUF, actual, sequential, 0);
+      IF (ecode = 848) OR (ecode = 881) OR (ecode = 883) OR (ecode = 956) THEN
+      BEGIN
+        ecode := 0;              { end of file, with the last bytes in actual }
+        done := TRUE;
+      END;
+      IF ecode > 0 THEN
+      BEGIN
+        WRITELN('file read error: ', ecode);
+        ok := FALSE;
+      END
+      ELSE
+      BEGIN
+        IF actual = 0 THEN done := TRUE;
+        IF actual > 0 THEN
+        BEGIN
+          CRC16(@big.pgbuf[1], actual, crc);
+          Sum16(@big.pgbuf[1], actual, bsum);
+          total := total + actual;
+        END;
+      END;
+    UNTIL done OR NOT ok;
+  END
+  ELSE
+  BEGIN
+    IF NOT TextPass(fref) THEN ok := FALSE;
+    TxFlush;                     { the last, short part }
+  END;
+  ecode := 0;
+  CLOSE_OBJECT(ecode, fref);
+  LocalSum := ok;
+END;
+
+{ Write obuf[1..opos] to the file FREF at offset ooff (one WRITE_DATA:
+  each call costs a disk access, so the blocks are made big).  A write
+  error is kept in operr (the first one) and checked by the caller. }
+PROCEDURE OutFlush (fref: integer);
+BEGIN
+  IF (opos > 0) AND (operr = 0) THEN
+  BEGIN
+    ecode := 0;
+    WRITE_DATA(ecode, fref, ORD4(@big.obuf[1]), opos, actual, absolute, ooff);
+    IF ecode > 0 THEN operr := ecode;
+    ooff := ooff + opos;
+  END;
+  opos := 0;
+END;
+
+{ The Lisa's own text page writer (TxtPage, TxtEnd, TxtChunk, PutLine):
+  get used it until the server built the pages (GET <name> T,
+  lisa_pages in LisaSerialFtpServer.py, which mirrors it exactly); now
+  only 'bench' uses it, to compare.  tests/test_text_pages.py checks that
+  the two give the same pages. }
+{ end the page being built in obuf (pad it with NULs to its 1024 bytes),
+  if it holds anything; write obuf if it is full. }
+PROCEDURE TxtPage (fref: integer);
+VAR k: integer;
+BEGIN
+  IF opos > pbase THEN
+  BEGIN
+    FOR k := opos + 1 TO pbase + TPAGE DO
+      big.obuf[k] := 0;
+    opos := pbase + TPAGE;
+    IF opos = WBLOCK THEN OutFlush(fref);   { sets opos to 0 }
+    pbase := opos;
+  END;
+END;
+
+{ the end of the file -- end the last page, write the pages not written
+  yet. }
+PROCEDURE TxtEnd (fref: integer);
+BEGIN
+  TxtPage(fref);
+  OutFlush(fref);
+  pbase := 0;
+END;
+
+{ in assembly: fold the N bytes in buf into Lisa lines and pages in obuf
+  (TXTPUT, ~10 times faster than the Pascal loop and PutLine); each time
+  obuf's 4 pages are full, write them.  CHARS: the chars of
+  the lines placed.  N = 0 with txst[3] = 1: place the last line. }
+PROCEDURE TxtChunk (fref: integer; n: integer; VAR chars: longint);
+BEGIN
+  txst[0] := 0;
+  txst[4] := opos;
+  txst[5] := pbase;
+  REPEAT
+    TXTPUT(@buf[1], n, @txst[0], @tline[0], @big.obuf[1], chars);
+    opos := txst[4];
+    pbase := txst[5];
+    IF txst[6] = 1 THEN
+    BEGIN
+      OutFlush(fref);            { writes the 4 pages; opos := 0 }
+      pbase := 0;
+      txst[4] := 0;
+      txst[5] := 0;
+    END;
+  UNTIL txst[6] = 0;
+END;
+
+{ add a line (the first N chars of S) to the text page being
+  built in obuf, in the Lisa text format: leading spaces as DLE +
+  CHR(32 + n) (2 or more of them, at most 223 per code), the chars, a CR.
+  A line goes onto a new page if it does not fit with at least one NUL
+  left at the end of the page.  This replaces WRITELN to a Pascal text
+  file, which took ~36 ms per line on a real Lisa. }
+PROCEDURE PutLine (VAR S: string255; N: integer; fref: integer);
+VAR sp, k, need: integer; more: boolean;
+BEGIN
+  {$R-}          { S is read up to N, past its current length }
+  sp := 0;
+  more := N > 0;
+  WHILE more DO
+    IF S[sp + 1] = ' ' THEN
+    BEGIN
+      sp := sp + 1;
+      more := sp < N;
+    END
+    ELSE
+      more := FALSE;
+  IF sp > 223 THEN sp := 223;
+  IF sp < 2 THEN sp := 0;        { 0 or 1 space: as it is }
+  IF sp > 0 THEN
+    need := 2 + (N - sp) + 1
+  ELSE
+    need := N + 1;
+  IF opos - pbase + need > TPAGE - 1 THEN TxtPage(fref);
+  IF sp > 0 THEN
+  BEGIN
+    big.obuf[opos + 1] := 16;        { DLE }
+    IF 32 + sp > 127 THEN        { 34..255, stored as ByteT -128..127 }
+      big.obuf[opos + 2] := 32 + sp - 256
+    ELSE
+      big.obuf[opos + 2] := 32 + sp;
+    opos := opos + 2;
+  END;
+  IF N > sp THEN
+  BEGIN
+    MoveBytes(POINTER(ORD4(@S) + sp + 1), @big.obuf[opos + 1], N - sp);
+    opos := opos + N - sp;
+  END;
+  opos := opos + 1;
+  big.obuf[opos] := 13;              { CR }
+  {$R+}
+END;
+
+{ Create the Lisa text file NAME, open as FREF for writing its pages with
+  PutLine/TxtPage.  The header page comes from the Pascal run-time
+  system: REWRITE + CLOSE makes a text file of just its 1024-byte header
+  (see LisaOsTextFileSpecification.txt); the pages go after it.  FALSE
+  (said why) if that is not what it made. }
+FUNCTION OpenText (name: pathname; VAR fref: integer): BOOLEAN;
+VAR tf: text;
+BEGIN
+  OpenText := FALSE;
+  REWRITE(tf, name);
+  ecode := IORESULT;
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot create ', name, ': ', ecode);
+    EXIT(OpenText);
+  END;
+  CLOSE(tf, lock);
+  ecode := 0;
+  LOOKUP(ecode, name, finfo);
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot look up ', name, ': ', ecode);
+    EXIT(OpenText);
+  END;
+  IF finfo.size <> TPAGE THEN
+  BEGIN
+    WRITELN('a new text file is ', finfo.size, ' bytes, not the 1024-byte header page:');
+    WRITELN('cannot write ', name, ' in the Lisa text format');
+    EXIT(OpenText);
+  END;
+  ecode := 0;
+  OPEN(ecode, name, fref, [dwrite]);
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot open ', name, ': ', ecode);
+    EXIT(OpenText);
+  END;
+  opos := 0;
+  pbase := 0;
+  ooff := TPAGE;                 { the pages go after the header }
+  operr := 0;
+  OpenText := TRUE;
+END;
+
+
+{ get -c / put -c: TRUE if the server's copy of RNAME and the local file
+  LNAME are the same: equal size, CRC-16 and byte sum (MOD 65536), all
+  over the bytes put would send -- for a text file, the server works them
+  out from its file as the Lisa would store it (see SUM in
+  LisaSerialFtpServer.py).  Two different files pass all three only in
+  rare cases (see README).  FALSE on any difference or problem: the
+  caller then transfers the file as usual (a missing file on either side
+  is reported by that transfer).  isget: called by get (see LocalSum).  If the server does not answer,
+  'connected' is FALSE afterwards (or 'aborted' TRUE). }
+FUNCTION SameFile (rname: string255; lname: pathname; binary, isget: boolean): BOOLEAN;
+VAR t1, t2, t3, want: string255; si: integer;
+BEGIN
+  SameFile := FALSE;
+  { one line: the question, then the answer (here or in LocalSum) }
+  WRITE('-c: checking if file ', lname, ' is the same on both sides ... ');
+  IF debugon THEN WRITELN;       { the protocol lines follow on lines of their own }
+  IF NOT LocalSum(lname, binary, isget) THEN EXIT(SameFile);
+  IF binary THEN
+    SendLine(concat('SUM ', rname, ' B'))
+  ELSE
+    SendLine(concat('SUM ', rname, ' T'));
+  IF NOT GetResponse(l) THEN EXIT(SameFile);   { it said why }
+  IF (LENGTH(l) = 0) OR (l[1] <> 'O') THEN
+  BEGIN
+    IF POS('ERR 11 ', l) = 1 THEN  { no such file on the server }
+    BEGIN
+      IF isget THEN
+        WRITELN('no copy on the server')        { the get then says so too }
+      ELSE
+        WRITELN('no copy on the server, so sending the file');
+    END
+    ELSE
+      WRITELN('server: ', l);
+    EXIT(SameFile);
+  END;
+  IntToStr(total, t1);
+  IntToHex(crc, t2);
+  IF bsum >= 32768 THEN          { unsigned -> signed, for IntToHex }
+    si := bsum - 65536
+  ELSE
+    si := bsum;
+  IntToHex(si, t3);
+  want := concat('OK ', t1, ' ', t2, ' ', t3);
+  UpperStr(l);
+  IF l = want THEN
+  BEGIN
+    SameFile := TRUE;
+    IF isget THEN
+      WRITELN('unchanged: the local copy is the same -- not fetched')
+    ELSE
+      WRITELN('unchanged: the server''s copy is the same -- not sent');
+  END
+  ELSE
+  BEGIN
+    WRITELN('the two copies differ: transferring it');
+    IF debugon THEN
+      WRITELN('    local: ', want, '  server: ', l);
+  END;
+END;
+
+PROCEDURE DoGet (rname: string255; lname: pathname; binary: boolean;
+                 skipsame: boolean);
+VAR fref: integer;
+    t1: string255;
+    t2: string255;
+    want: integer;         { the length of the next chunk (RecvChunk) }
+    tmpname: pathname;     { temp file: written during the transfer, renamed to lname at the end }
+    vok: boolean;          { the server's verdict: OK with our byte count and CRC }
+    eofseq: longint;       { the number of the last chunk received (end of file) }
+    dline: string255;      { our DONE line (sent again if the server repeats the end) }
+    leaf: e_name;          { leaf of lname, for RENAME_ENTRY }
+BEGIN
+  IF binary THEN
+    WRITELN('get ', rname, ' -> ', lname, '  (saving it as-is, byte-exact)')
+  ELSE
+    WRITELN('get ', rname, ' -> ', lname, '  (saving it as text file, converting line endings to \r)');
+  IF skipsame THEN
+  BEGIN
+    IF SameFile(rname, lname, binary, TRUE) THEN
+    BEGIN
+      xferfail := FALSE;
+      EXIT(DoGet);
+    END;
+    IF aborted OR NOT connected THEN EXIT(DoGet);   { the check found no server }
+  END;
+  { text: GET <name> T -- the server sends the text pages of the Lisa
+    .TEXT file (its header page is made here by OpenText), so both kinds
+    are received and stored the same way, as they come }
+  IF binary THEN
+    SendLine(concat('GET ', rname))
+  ELSE
+    SendLine(concat('GET ', rname, ' T'));
+  IF NOT GetResponse(l) THEN EXIT(DoGet);
+  IF (LENGTH(l) > 0) AND (l[1] <> 'O') THEN
+  BEGIN
+    WRITELN(l);
+    EXIT(DoGet);
+  END;
+  size := StrToInt(COPY(l, 4, LENGTH(l) - 3));   { "OK <size>" -> digits from pos 4 to end }
+  ProgStart(size);
+  { Receive into a temp file beside the target and rename it only when the
+    transfer is whole, so a failed get never leaves a truncated target. }
+  TmpNameOf(lname, binary, tmpname);
+  ecode := 0;
+  KILL_OBJECT(ecode, tmpname);        { remove a leftover from a failed get }
+  IF binary THEN
+  BEGIN
+    { byte-exact copy: a plain binary file }
+    ecode := 0;
+    MAKE_FILE(ecode, tmpname, 0);
+    IF ecode > 0 THEN
+    BEGIN
+      WRITELN('cannot create ', tmpname, ': ', ecode);
+      SendLine('FAIL cannot create the local file');
+      EXIT(DoGet);
+    END;
+    ecode := 0;
+    OPEN(ecode, tmpname, fref, [dwrite]);
+    IF ecode > 0 THEN
+    BEGIN
+      WRITELN('cannot open ', tmpname, ': ', ecode);
+      SendLine('FAIL cannot open the local file');
+      EXIT(DoGet);
+    END;
+    opos := 0;
+    ooff := 0;
+    operr := 0;
+  END
+  ELSE
+  BEGIN
+    { text: a Lisa text file with its header page (OpenText); the pages
+      the server sends go after it (ooff = TPAGE) }
+    IF NOT OpenText(tmpname, fref) THEN
+    BEGIN
+      SendLine('FAIL cannot create the local file');
+      EXIT(DoGet);
+    END;
+  END;
+  seq := 0;
+  crc := $FFFF;
+  total := 0;
+  linkdead := FALSE;
+  holdack := TRUE;          { the ACK after the disk write (AckNow below), so
+                              nothing arrives during a disk write.  ACKing at
+                              once and writing while the next frame arrives
+                              (holdack FALSE) measured the same on a real Lisa
+                              (3.1 KB/s for a binary get): apparently the Lisa
+                              OS does no serial transfer while a disk operation
+                              is in progress, so nothing overlaps; and with a 1023-
+                              byte frame in a 1024-byte buffer it risks losing
+                              bytes.  So the ACK is always held. }
+  ackdue := FALSE;
+  { Ready: the server sends chunk 0 only now.  Sent straight after its OK,
+    it arrived while we read the OK line and created the file, and the
+    unread rest of that line plus the frame overflowed the type-ahead
+    buffer (1024 bytes): chunk 0 always failed once. }
+  SendLine('GO');
+  REPEAT
+    { RecvChunk handles loss recovery internally: it NAKs a bad/partial
+      chunk (the server retransmits), re-ACKs a duplicate, and retries up
+      to MAXRETRY times before giving up.  So one call per chunk here. }
+    eofseq := seq;
+    { trace (debug on), used to find where a hang happened -- to restore it,
+      delete these two lines and the closing brace below:
+    IF debugon THEN
+      WRITELN('    chunk ', seq:1, ': waiting for it...');
+    }
+    IF size - total >= CHUNK THEN  { the length of the chunk to come }
+      want := CHUNK
+    ELSE IF size - total > 0 THEN
+      want := size - total
+    ELSE
+      want := 0;
+    ok := RecvChunk(seq, len, @buf[1], want);
+    IF ok THEN
+    BEGIN
+      { Any disk write this chunk needs, then the ACK (RecvChunk held it),
+        then file the chunk in obuf (no disk).  So the next frame never
+        arrives during a disk write (see holdack above).  Binary and text
+        alike: a text get receives the finished pages (GET <name> T). }
+      IF len > 0 THEN
+        IF opos + len > WBLOCK THEN OutFlush(fref);
+      AckNow;
+      IF len > 0 THEN
+      BEGIN
+        { collect the chunks in obuf, written 4 KB at a time (above,
+          before the ACK of the chunk that does not fit any more) }
+        MoveBytes(@buf[1], @big.obuf[opos + 1], len);
+        opos := opos + len;
+        IF operr > 0 THEN
+        BEGIN
+          ProgEnd;
+          WRITELN('file write error: ', operr);
+          ok := FALSE;
+        END;
+        IF ok THEN
+        BEGIN
+          { total/crc are over the RECEIVED bytes (for text, the pages),
+            checked against the server's in the DONE exchange }
+          CRC16(@buf[1], len, crc);
+          total := total + len;
+        END;
+        { trace (debug on), used to find where a hang happened -- to restore it,
+      delete these two lines and the closing brace below:
+        IF debugon THEN
+          WRITELN('    chunk ', eofseq:1, ': written');
+        }
+      END;
+    END;
+  UNTIL (NOT ok) OR (len = 0);
+  holdack := FALSE;
+  ackdue := FALSE;
+  ProgEnd;                  { end the line of progress marks }
+  { write what is still in obuf: the last block }
+  IF ok THEN
+  BEGIN
+    OutFlush(fref);
+    IF operr > 0 THEN
+    BEGIN
+      WRITELN('file write error: ', operr);
+      ok := FALSE;
+    END;
+  END;
+  IF ok THEN
+  BEGIN
+    IntToStr(total, t1);
+    IntToHex(crc, t2);
+    dline := concat('DONE ', t1, ' ', t2);
+    SendLine(dline);
+    vok := FALSE;                     { the server's verdict: OK/BAD <bytes> <crc> }
+    IF GetVerdict(eofseq, dline, l) THEN
+    BEGIN
+      vok := Matches(l, 'OK', total, crc);
+      IF NOT vok THEN
+        WRITELN('VERIFY FAILED: received ', total, ' bytes, CRC ', t2,
+                '; the server says: ', l);
+    END;
+    ecode := 0;
+    CLOSE_OBJECT(ecode, fref);
+    IF ecode > 0 THEN
+    BEGIN
+      { DONE was already sent, so the server is back in command state:
+        no AbortTransfer, just discard the temp file. }
+      WRITELN('error closing ', tmpname, ': ', ecode);
+      ecode := 0;
+      KILL_OBJECT(ecode, tmpname);
+      EXIT(DoGet);
+    END;
+    IF NOT vok THEN
+    BEGIN
+      { not verified: never let it replace (or become) the target }
+      ecode := 0;
+      KILL_OBJECT(ecode, tmpname);
+      WRITELN('get failed: ', lname, ' was not written');
+      EXIT(DoGet);
+    END;
+    { The transfer is whole: remove any existing target, then rename the
+      temp file to it, so the target appears only when it is complete. }
+    ecode := 0;
+    KILL_OBJECT(ecode, lname);
+    LeafNameOf(lname, leaf);
+    RENAME_ENTRY(ecode, tmpname, leaf);
+    IF ecode > 0 THEN
+      WRITELN('received ', total, ' bytes, but rename to ', lname,
+              ' failed: ', ecode, ' -- data is in ', tmpname)
+    ELSE
+    BEGIN
+      xferfail := FALSE;               { the only way a get succeeds }
+      IF binary THEN
+        WRITELN('received ', total, ' of ', size, ' bytes into ', lname,
+                ', verified (CRC ', t2, ')')
+      ELSE
+        WRITELN('received ', total DIV TPAGE, ' pages of Lisa text into ', lname,
+                ', verified (CRC ', t2, ')');
+    END;
+  END
+  ELSE
+  BEGIN
+    ecode := 0;
+    CLOSE_OBJECT(ecode, fref);
+    ecode := 0;
+    KILL_OBJECT(ecode, tmpname);
+    AbortTransfer('get aborted');
+    IF aborted THEN
+      WRITELN('transfer stopped (Apple-period)')
+    ELSE
+      WRITELN('transfer failed');
+  END;
+END;
+
+{ Upload lname as rname.  binary: the file's bytes as they are (READ_DATA).
+  Text (a Lisa .TEXT file): decoded by TextPass (see there).  PUT needs the
+  byte count first, so the file is decoded twice: once to count (tmode 0),
+  once to send (tmode 1).  skipsame (put -c): first ask the server whether
+  its copy is the same (SameFile); if so, nothing is sent. }
+{ put -t: does the file look like a Lisa text file?  Its size is a
+  whole number of 1024-byte pages, at least the header page; and its
+  first text page (the second page), if any, is lines of text up to the
+  first CR-NUL and only NULs after it (see TextPass).  A file that is not
+  text (e.g. a .OBJ) fails this almost always.  Reports why not. }
+FUNCTION LooksText (lname: pathname): BOOLEAN;
+VAR fref, j, e: integer; endp: integer;
+BEGIN
+  LooksText := FALSE;
+  ecode := 0;
+  LOOKUP(ecode, lname, finfo);
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot stat ', lname, ': ', ecode);
+    EXIT(LooksText);
+  END;
+  IF (finfo.size < TPAGE) OR (finfo.size MOD TPAGE <> 0) THEN
+  BEGIN
+    WRITELN(lname, ' is not a Lisa text file (', finfo.size,
+            ' bytes, not whole 1024-byte pages)');
+    EXIT(LooksText);
+  END;
+  IF finfo.size = TPAGE THEN
+  BEGIN
+    LooksText := TRUE;               { only the header page: an empty text file }
+    EXIT(LooksText);
+  END;
+  ecode := 0;
+  OPEN(ecode, lname, fref, [dread]);
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot open ', lname, ': ', ecode);
+    EXIT(LooksText);
+  END;
+  actual := 0;
+  READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), 2 * TPAGE, actual, sequential, 0);
+  e := 0;
+  CLOSE_OBJECT(e, fref);
+  IF actual <> 2 * TPAGE THEN
+  BEGIN
+    WRITELN('cannot read ', lname, ': ', ecode);
+    EXIT(LooksText);
+  END;
+  { the first CR-NUL in the second page; no NUL before it }
+  endp := 0;
+  j := TPAGE + 1;
+  WHILE (endp = 0) AND (j < 2 * TPAGE) DO
+  BEGIN
+    IF big.pgbuf[j] = 0 THEN j := 2 * TPAGE          { a NUL inside the text: not text }
+    ELSE IF (big.pgbuf[j] = 13) AND (big.pgbuf[j + 1] = 0) THEN endp := j + 1
+    ELSE j := j + 1;
+  END;
+  IF endp > 0 THEN
+  BEGIN
+    j := endp + 1;                   { only NUL padding after it }
+    WHILE (j <= 2 * TPAGE) AND (endp > 0) DO
+    BEGIN
+      IF big.pgbuf[j] <> 0 THEN endp := 0;
+      j := j + 1;
+    END;
+  END;
+  IF endp = 0 THEN
+    WRITELN(lname, ' is not a Lisa text file (its pages are not lines of text)')
+  ELSE
+    LooksText := TRUE;
+END;
+
+PROCEDURE DoPut (lname: pathname; rname: string255; binary: boolean;
+                 skipsame: boolean);
+VAR fref: integer;
+    t1: string255;
+    t2: string255;
+    vok: boolean;          { the server's DONE matches what we sent }
+    gotl: boolean;         { we have the server's DONE line in l }
+    k: integer;            { binary: bytes of pgbuf already sent }
+    got: integer;          { binary: bytes in pgbuf.  NOT the global actual:
+                             SendChunk's serial reads overwrite that }
+
+BEGIN
+  IF binary THEN
+    WRITELN('put ', lname, ' -> ', rname, '  (sending it as-is, byte-exact)')
+  ELSE
+    WRITELN('put ', lname, ' -> ', rname, '  (sending it as text file, converting line endings to \n)');
+  IF skipsame THEN
+  BEGIN
+    IF SameFile(rname, lname, binary, FALSE) THEN
+    BEGIN
+      xferfail := FALSE;
+      EXIT(DoPut);
+    END;
+    IF aborted OR NOT connected THEN EXIT(DoPut);   { the check found no server }
+  END;
+  ok := TRUE;
+  ecode := 0;
+  IF binary THEN
+  BEGIN
+    LOOKUP(ecode, lname, finfo);
+    IF ecode > 0 THEN
+    BEGIN
+      WRITELN('cannot stat ', lname, ': ', ecode);
+      EXIT(DoPut);
+    END;
+    size := finfo.size;
+  END
+  ELSE
+  BEGIN
+    OPEN(ecode, lname, fref, [dread]);
+    IF ecode > 0 THEN
+    BEGIN
+      WRITELN('cannot open ', lname, ': ', ecode);
+      EXIT(DoPut);
+    END;
+    tmode := 0;                    { pass 1: count the bytes to send }
+    size := 0;
+    vok := TextPass(fref);
+    ecode := 0;
+    CLOSE_OBJECT(ecode, fref);
+    IF NOT vok THEN EXIT(DoPut);
+  END;
+  IntToStr(size, t1);
+  ProgStart(size);
+  SendLine(concat('PUT ', rname, ' ', t1));
+  IF NOT GetResponse(l) THEN EXIT(DoPut);
+  IF (LENGTH(l) > 0) AND (l[1] <> 'O') THEN
+  BEGIN
+    WRITELN(l);
+    EXIT(DoPut);
+  END;
+  ecode := 0;
+  OPEN(ecode, lname, fref, [dread]);
+  IF ecode > 0 THEN
+  BEGIN
+    WRITELN('cannot open ', lname, ': ', ecode);
+    AbortTransfer('put aborted');  { the server already said OK }
+    EXIT(DoPut);
+  END;
+  seq := 0;
+  linkdead := FALSE;
+  eofdone := FALSE;
+  ok := TRUE;
+  crc := $FFFF;                    { CRC-16 and count of everything sent, }
+  total := 0;                      { for the end-of-transfer verification }
+  IF binary THEN
+  BEGIN
+    { 4 * CHUNK bytes per READ_DATA (each call costs a disk access), sent as
+      chunks of up to CHUNK bytes; then the empty end-of-file chunk.
+      The OS reports end of file as an ERROR code, with ACTUAL = the bytes
+      that were read (possibly fewer than asked, possibly 0):
+        848 End of file encountered
+        881 Attempt to read empty file
+        883 Attempt to read past LEOF
+        956 Attempt to position FMARK past LEOF not allowed
+            (returned when the FMARK is already exactly at LEOF, i.e. when
+            the file size is an exact multiple of 4 * CHUNK: no bytes are read)
+      None of these is a failure: the bytes read are still sent. }
+    atend := FALSE;
+    REPEAT
+      ecode := 0;
+      actual := 0;
+      { 4 whole chunks per READ_DATA (4064 bytes, not TBUF): 4096 left a
+        32-byte chunk at the end of each block, an extra round trip }
+      READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), 4 * CHUNK, actual, sequential, 0);
+      IF (ecode = 848) OR (ecode = 881) OR (ecode = 883) OR (ecode = 956) THEN
+      BEGIN
+        ecode := 0;
+        atend := TRUE;
+      END;
+      IF ecode > 0 THEN
+      BEGIN
+        ProgEnd;
+        WRITELN('file read error: ', ecode);
+        ok := FALSE
+      END
+      ELSE
+      BEGIN
+        got := actual;
+        IF got = 0 THEN atend := TRUE;
+        k := 0;
+        WHILE ok AND (k < got) DO
+        BEGIN
+          len := got - k;
+          IF len > CHUNK THEN len := CHUNK;
+          CRC16(@big.pgbuf[k + 1], len, crc);
+          total := total + len;
+          ok := SendChunk(seq, @big.pgbuf[k + 1], len);
+          IF ok THEN NextSeq(seq);
+          k := k + len;
+        END;
+      END;
+    UNTIL (NOT ok) OR atend;
+    IF ok AND (total <> size) THEN { never end a file that came out short }
+    BEGIN
+      ProgEnd;
+      WRITELN('read ', total, ' bytes of ', lname, ', but its size is ', size);
+      ok := FALSE;
+    END;
+    IF ok THEN                     { the empty chunk: end of file }
+    BEGIN
+      ok := SendChunk(seq, @buf, 0);
+      IF ok THEN NextSeq(seq);
+    END;
+  END
+  ELSE
+  BEGIN
+    { text: pass 2, decode again and send; a line may straddle two
+      chunks.  The end is marked, as for binary, by an empty chunk after
+      the last short (or full) one. }
+    tmode := 1;
+    len := 0;
+    IF NOT TextPass(fref) THEN ok := FALSE;
+    TxFlush;                       { the last, short chunk }
+    IF ok THEN                     { the empty chunk: end of file }
+    BEGIN
+      ok := SendChunk(seq, @buf, 0);
+      IF ok THEN NextSeq(seq);
+    END;
+  END;
+  ProgEnd;                         { end the line of progress marks }
+  IF ok THEN
+  BEGIN
+    { DONE <bytes> <crc>: what the server got (already in donel if it
+      came in place of the end-of-file chunk's ACK) }
+    IF eofdone THEN              { (no OR: Lisa Pascal may evaluate both sides) }
+    BEGIN
+      l := donel;
+      ShowRx(l);
+      gotl := TRUE;
+    END
+    ELSE
+      gotl := GetLine(l);
+    IF gotl THEN
+    BEGIN
+      vok := Matches(l, 'DONE', total, crc);
+      IntToStr(total, t1);
+      IntToHex(crc, t2);
+      IF vok THEN                  { verdict, with our numbers }
+        SendLine(concat('OK ', t1, ' ', t2))
+      ELSE
+        SendLine(concat('BAD ', t1, ' ', t2));
+      IF vok THEN
+      BEGIN
+        xferfail := FALSE;             { the only way a put succeeds }
+        IF binary THEN
+          WRITELN('sent ', total, ' bytes from ', lname, ', verified (CRC ', t2, ')')
+        ELSE
+          WRITELN('sent ', tlines, ' lines (', total, ' bytes) from ', lname,
+                  ', verified (CRC ', t2, ')');
+      END
+      ELSE
+      BEGIN
+        WRITELN('VERIFY FAILED: sent ', total, ' bytes, CRC ', t2,
+                '; the server says: ', l);
+        WRITELN('put failed: the server deletes its copy');
+      END;
+    END;
+  END
+  ELSE
+  BEGIN
+    AbortTransfer('put aborted');
+    IF aborted THEN
+      WRITELN('transfer stopped (Apple-period)')
+    ELSE
+      WRITELN('transfer failed');
+  END;
+  ecode := 0;
+  CLOSE_OBJECT(ecode, fref);
+END;
+
+{$S CmdSeg  }
+
+{--- setup -------------------------------------------------------------------}
+
+PROCEDURE SetupPort;
+VAR
+  e    : integer;
+  mvol : e_name;
+  mpw  : e_name;
+  mdev : e_name;
+  opn  : pathname;
+BEGIN
+  { MOUNT the serial device.  Same as LISACom's PortUp and fnbus.pas: the
+    result is reported but not fatal (1052 = already mounted is normal).
+    If the OPEN below fails with 946, the port is not set to Serial Cable
+    in the environment this program is running in. }
+  mvol := '';
+  mpw  := '';
+  mdev := devname;
+  e := 0;
+  MOUNT(e, mvol, mpw, mdev);
+  { WRITELN('mount result: ', e); }
+  IF (e > 0) AND (e <> 1052) THEN
+  BEGIN
+    WRITELN('cannot mount ', devname, ': ', e);
+    WRITELN('(1051 = no device by that name: set the port to Serial Cable)');
+    HALT;
+  END;
+
+  { Configure the port.  The Lisa manual at 
+    https://www.bitsavers.org/pdf/apple/lisa/workshop_3.0/Lisa_Pascal_3.0_System_Software_1984.pdf
+    (pages 47 to 55) requires every DEVICE_CONTROL
+    group to be set before using a serial port.  Everything is set to
+    8N1, no handshake, no timeouts -- the same sequence fnbus.pas uses. }
+  dcpath := concat('-', devname);          { '-RS232B' }
+  DCp( 1, 0, 0, 0);                        { A: 8 bits, no parity }
+  DCp( 5, BAUD, 0, 0);                     { C: baud rate }
+  DCp( 6, 0, 0, 0);                        { D: READ_DATA waits for full count }
+  DCp( 7, 0, 0, 0);                        { E: input handshake none, part 1 }
+  DCp( 9, -1, -1, 32767);                  { E: input handshake none, part 2 }
+  DCp( 9, 1024, -1, 32767);                { F: type-ahead buffer 1024 bytes (the most); no
+                                             full threshold: the driver would send XOFF at it }
+  DCp(10, 0, 0, 0);                        { G: no disconnect detection }
+  SetTmo(0);                               { L: no input timeout (via SetTmo: curtmo) }
+  DCp(25, 0, 0, 0);                        { M: no BREAK on close }
+  DCp(11, 0, 0, 0);                        { B: output handshake none }
+  DCp(12, 0, 0, 0);                        { H: no output timeout }
+  DCp(17, 0, 0, 0);                        { I: no automatic linefeed }
+
+  { Read the driver state back (code 19) so the settings can be checked:
+    [0] parity, [1] output handshake, [2] baud, [4] type-ahead size. }
+  DCp(19, 0, 0, 0);
+  { WRITELN('port state: parity=', cparm.dcdata[0], ' outHS=', cparm.dcdata[1],
+          ' baud=', cparm.dcdata[2], ' typeahead=', cparm.dcdata[4]); }
+
+  { OPEN wants a file component, so we open '-RS232B-XYZ'
+    (a dummy name the driver ignores). }
+  opn := concat(dcpath, '-XYZ');
+  e := 0;
+  OPEN(e, opn, refnum, [dread, dwrite]);
+  IF e > 0 THEN
+  BEGIN
+    WRITELN('cannot open ', opn, ': ', e);
+    WRITELN('(946 = port not set to Serial Cable in this environment)');
+    HALT;
+  END;
+END;
+
+{ Measure the timeout-factor (tfactor): how many EMULATED seconds pass per REAL
+  second.  The OS timeouts (DEVICE_CONTROL 14) count emulated time, so
+  in LisaEm at a high throttle they expire far too early; every timeout
+  in this program is multiplied by tfactor to make it real time.
+
+  We send CAL; the server answers 'CAL ...' exactly CALSECS real seconds
+  after it got the request.  Meanwhile we read with a 1-second timeout
+  and count the timeouts: n timeouts in CALSECS real seconds gives
+  tfactor = n / CALSECS (rounded up, at least 1).  A real Lisa gives 1; LisaEm
+  at 512 MHz gives about 100.  This measures the speed the emulator
+  REALLY reaches, not the throttle it was asked for.  Lines other than
+  the CAL reply (e.g. a stale banner) are skipped; 'ERR ...' means an
+  old server without CAL.  Gives up after CALMAX timeouts or on
+  Apple-period, keeping the old factor.  Called only by 'timeout-factor
+  auto', after Ready, so the server is known to be running. }
+PROCEDURE Calibrate;
+VAR n: longint; e: integer; v: integer; c: CHAR; sl: integer;
+    s: string255; done: boolean;
+BEGIN
+  WRITELN('measuring the timeout-factor (', CALSECS, ' s)...');
+  SendLine('CAL');
+  SetTmo(1);
+  n := 0;
+  sl := 0;
+  done := FALSE;
+  {$R-}
+  WHILE NOT done DO
+  BEGIN
+    IF UserAbort THEN
+    BEGIN
+      WRITELN('measurement stopped; timeout-factor stays ', tfactor);
+      dirty := TRUE;
+      EXIT(Calibrate);
+    END;
+    IF n >= CALMAX THEN
+    BEGIN
+      WRITELN('no CAL reply from the server; timeout-factor stays ', tfactor);
+      dirty := TRUE;
+      EXIT(Calibrate);
+    END;
+    e := 0;
+    actual := 0;
+    READ_DATA (e, refnum, ORD4(@rxb), 1, actual, sequential, 0);
+    IF (e > 0) OR (actual <> 1) THEN
+      n := n + 1                       { one more emulated second went by }
+    ELSE
+    BEGIN
+      v := rxb[0];
+      IF v < 0 THEN v := v + 256;
+      c := CHR(v);
+      IF c = CHR(10) THEN
+      BEGIN
+        s[0] := CHR(sl);
+        IF (sl >= 3) AND (COPY(s, 1, 3) = 'CAL') THEN
+          done := TRUE
+        ELSE IF (sl >= 3) AND (COPY(s, 1, 3) = 'ERR') THEN
+        BEGIN
+          WRITELN('the server does not know CAL (old LisaSerialFtpServer.py?)');
+          WRITELN('timeout-factor stays ', tfactor, ' -- set it with: timeout-factor <n>');
+          EXIT(Calibrate);
+        END;
+        sl := 0;                       { any other line: skip it }
+      END
+      ELSE IF (c <> CHR(13)) AND (sl < MAXLINE) THEN
+      BEGIN
+        sl := sl + 1;
+        s[sl] := c;
+      END;
+    END;
+  END;
+  {$R+}
+  tfactor := (n + CALSECS - 1) DIV CALSECS;
+  IF tfactor < 1 THEN tfactor := 1;
+  WRITELN('timeout-factor: ', tfactor, 'x (emulator at about ', tfactor * 5, ' MHz; ', n,
+          ' emulated s in ', CALSECS, ' real s)');
+END;
+
+{ Tell the server the debug setting (DEBUG ON / DEBUG OFF), so its console
+  output matches ours.  TRUE if it agreed; an old server answers ERR
+  (said only when turning debug ON: with it off, nothing is lost).  On
+  no reply, GetResponse has reported it and cleared 'connected'. }
+FUNCTION SyncDebug: BOOLEAN;
+BEGIN
+  SyncDebug := FALSE;
+  IF debugon THEN
+    SendLine('DEBUG ON')
+  ELSE
+    SendLine('DEBUG OFF');
+  IF NOT GetResponse(l) THEN EXIT(SyncDebug);
+  IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
+    SyncDebug := TRUE
+  ELSE IF debugon THEN
+    WRITELN('the server does not know DEBUG (old LisaSerialFtpServer.py?): ', l);
+END;
+
+{ Send HELLO and wait for the server's banner line (starts with 'H');
+  returns TRUE on a banner.  It does NOT measure the timeout-factor (that
+  is 'timeout-factor auto').  Used at startup and by the 'hello' command (e.g. after the server was
+  restarted, the baud rate changed, or the emulator throttle changed),
+  and automatically before a server command when not connected.  A
+  missing server is NOT fatal: it says so and returns FALSE. }
+{ The major version in S: the digits after 'v' that follow the first
+  PROTONAM ('LISA-SERIAL-FTP/v1.0' -> '1').  '' if there is none (an older
+  server: LISA-FTP/5). }
+PROCEDURE MajorOf (S: string255; VAR M: string255);
+VAR k: integer; t1: string[1];
+BEGIN
+  M := '';
+  k := POS(PROTONAM, S);
+  IF k = 0 THEN EXIT(MajorOf);
+  k := k + LENGTH(PROTONAM);
+  IF k > LENGTH(S) THEN EXIT(MajorOf);
+  IF (S[k] <> 'v') AND (S[k] <> 'V') THEN EXIT(MajorOf);
+  k := k + 1;
+  t1 := ' ';
+  WHILE k <= LENGTH(S) DO
+  BEGIN
+    IF (S[k] < '0') OR (S[k] > '9') THEN EXIT(MajorOf);
+    t1[1] := S[k];
+    M := concat(M, t1);
+    k := k + 1;
+  END;
+END;
+
+{ The server's chunk size in its banner S: the digits after 'chunk_size='.
+  -1 if there is none. }
+FUNCTION ChunkOf (S: string255): longint;
+VAR k: integer; n: longint;
+BEGIN
+  ChunkOf := -1;
+  k := POS('chunk_size=', S);
+  IF k = 0 THEN EXIT(ChunkOf);
+  k := k + 11;                   { LENGTH('chunk_size=') }
+  n := 0;
+  IF k > LENGTH(S) THEN EXIT(ChunkOf);
+  IF (S[k] < '0') OR (S[k] > '9') THEN EXIT(ChunkOf);
+  WHILE k <= LENGTH(S) DO
+  BEGIN
+    IF (S[k] < '0') OR (S[k] > '9') THEN k := LENGTH(S)
+    ELSE IF n < 100000 THEN n := n * 10 + ORD(S[k]) - ORD('0');
+    k := k + 1;
+  END;
+  ChunkOf := n;
+END;
+
+FUNCTION DoHello: BOOLEAN;
+VAR j: integer; w: integer;
+    banner: string255;         { the banner line: SyncDebug reuses l }
+    mine, theirs: string255;   { major versions: this client's, the server's }
+    sch: longint;              { the server's chunk size (banner), -1 = not named }
+BEGIN
+  DoHello := FALSE;
+  connected := FALSE;
+  DrainInput;
+  WRITELN('sending HELLO, waiting for the server...');
+  WRITELN('(use hotkey Apple + . to cancel it at any time)');
+  SendLine('HELLO');
+  FOR j := 1 TO 10 DO
+  BEGIN
+    w := WaitLine(l, T_HELLO, TRUE);
+    IF w <> W_OK THEN
+    BEGIN
+      NoServer(w);
+      EXIT(DoHello);
+    END;
+    IF (LENGTH(l) = 0) OR (l[1] <> 'H') THEN
+      WRITELN('server line: [', l, ']')     { not the banner (e.g. a stale line) }
+    ELSE
+    BEGIN
+      banner := l;
+      connected := TRUE;
+      SetTmo(0);                       { back to no timeout }
+      { HELLO resets the server's debug output to its startup setting
+        (on if it was started with --debug), so always send ours.  If
+        that gets no reply, SyncDebug (GetResponse) has said so and
+        cleared 'connected': then there is no usable server after all. }
+      dbsync := SyncDebug;
+      IF connected THEN
+      BEGIN
+        WRITELN('Connected. [', banner, ']');
+        { another major version (or none: an older server) may not speak
+          the same protocol: connect anyway, but say so }
+        MajorOf(concat(PROTONAM, VERSION), mine);
+        MajorOf(banner, theirs);
+        IF theirs <> mine THEN
+        BEGIN
+          IF theirs = '' THEN theirs := 'unknown';
+          WRITELN('WARNING: this client (', PROTONAM, VERSION, ', major version ', mine,
+                  ') may not be compatible');
+          WRITELN('with this server (major version ', theirs,
+                  '). Use LisaSerialFtpServer.py and LisaSerialFtpClient.text');
+          WRITELN('of the same major version.');
+        END;
+        { the chunk size is fixed at compile time on both sides: another
+          one makes every get and put fail (chunks rejected as too long,
+          or not the size the other side expects) }
+        sch := ChunkOf(banner);
+        IF sch <> CHUNK THEN
+        BEGIN
+          IF sch < 0 THEN
+            WRITELN('WARNING: the server does not name its chunk size; this client''s is ', CHUNK, '.')
+          ELSE
+            WRITELN('WARNING: the server''s chunk size is ', sch, ', this client''s is ', CHUNK, '.');
+          WRITELN('get and put will fail: use LisaSerialFtpServer.py and');
+          WRITELN('LisaSerialFtpClient.text with the same chunk size.');
+        END;
+      END;
+      DoHello := connected;
+      EXIT(DoHello);
+    END;
+  END;
+  { reaching here means no banner: DoHello is FALSE (TRUE only exits via EXIT),
+    and a bare DoHello here would be a recursive CALL, not a value read }
+  WRITELN('no banner from server -- is LisaSerialFtpServer.py running?');
+  NoServer(W_TMO);
+END;
+
+{ Before a server command: clear stale input and, if not connected,
+  (re-)send HELLO first.  FALSE if there is still no server. }
+FUNCTION Ready: BOOLEAN;
+BEGIN
+  IF connected THEN
+  BEGIN
+    DrainInput;
+    Ready := TRUE;
+  END
+  ELSE
+    Ready := DoHello;
+END;
+
+{ BAUD: send HELLO at the rate just set and wait for the banner (a stray
+  line or two from the switch is skipped).  Quiet: the caller says what
+  happened.  TRUE on the banner. }
+FUNCTION BannerAt: BOOLEAN;
+VAR j, w: integer;
+BEGIN
+  BannerAt := FALSE;
+  FlushTypeahead;                  { anything garbled by the switch }
+  SendLine('HELLO');
+  FOR j := 1 TO 3 DO
+  BEGIN
+    w := WaitLine(l, T_HELLO, TRUE);
+    IF w <> W_OK THEN EXIT(BannerAt);
+    IF (LENGTH(l) > 0) AND (l[1] = 'H') THEN
+    BEGIN
+      BannerAt := TRUE;
+      EXIT(BannerAt);
+    END;
+  END;
+END;
+
+{ 'baud'        : print the current baud rate.
+  'baud <rate>' : change it here and on the server.  The rate must be one
+  the Lisa's driver can set (DEVICE_CONTROL code 5) and the server knows
+  (BAUDS in LisaSerialFtpServer.py).  Connected: BAUD <rate> is sent; the
+  server answers OK at the old rate, then switches; so does the client,
+  and checks the new rate with HELLO.  If no banner comes, the client
+  goes back to the old rate, and so does the server (it keeps the new
+  rate only if the client talks at it within 10 s; the client's HELLO
+  at the old rate is a garbled line there, which sends it back at once).
+  Not connected: the rate changes here only; the server must match. }
+PROCEDURE DoBaud (arg: string255);
+VAR
+  j   : integer;
+  nb  : longint;
+  old : longint;
+  t   : string255;
+  ch  : CHAR;
+BEGIN
+  IF arg = '' THEN
+  BEGIN
+    WRITELN('baud rate is ', curbaud);
+    WRITELN('to change it: baud <rate>  (300 600 1200 2400 4800 9600 19200 38400 57600)');
+    EXIT(DoBaud);
+  END;
+  FOR j := 1 TO LENGTH(arg) DO
+    IF (arg[j] < '0') OR (arg[j] > '9') THEN
+    BEGIN
+      WRITELN('error: baud rate must be a number: ', arg);
+      EXIT(DoBaud);
+    END;
+  IF LENGTH(arg) > 6 THEN
+    nb := 0                        { too long for any rate (StrToInt would overflow) }
+  ELSE
+    nb := StrToInt(arg);
+  { 57600 is the maximum: the driver (dcode 5) sets the SCC baud-rate
+    generator time constant to 115200 DIV baud - 2 on Port B (125000 on
+    Port A), which is 0 at 57600.  115200 would give -1: the driver then
+    writes $FF and 0 to WR12/WR13, i.e. a time constant of 255 -- about
+    450 baud, not 115200. }
+  IF (nb <> 300)    AND (nb <> 600)    AND (nb <> 1200)  AND (nb <> 2400) AND
+     (nb <> 4800)   AND (nb <> 9600)   AND (nb <> 19200) AND (nb <> 38400) AND
+     (nb <> 57600) THEN
+  BEGIN
+    WRITELN('error: unsupported baud rate: ', arg);
+    WRITELN('supported: 300 600 1200 2400 4800 9600 19200 38400 57600 (the maximum)');
+    EXIT(DoBaud);
+  END;
+  IF NOT connected THEN
+  BEGIN
+    DCp(5, nb, 0, 0);
+    curbaud := nb;
+    WRITELN('baud rate set to ', nb, ' here only (not connected): start the server');
+    WRITELN('at the same rate, then type hello');
+    EXIT(DoBaud);
+  END;
+  DrainInput;
+  IntToStr(nb, t);
+  SendLine(concat('BAUD ', t));
+  IF NOT GetResponse(l) THEN EXIT(DoBaud);      { it said why }
+  IF l <> concat('OK ', t) THEN
+  BEGIN
+    WRITELN('server: ', l);
+    WRITELN('baud rate unchanged: ', curbaud);
+    EXIT(DoBaud);
+  END;
+  IF nb = curbaud THEN
+  BEGIN
+    WRITELN('baud rate stays ', nb);
+    EXIT(DoBaud);
+  END;
+  old := curbaud;
+  WRITELN('the server switches to ', nb, ' baud; switching here too and checking...');
+  { the server switches once its OK has left the PC: give it a second }
+  IF TryGetChar(ch, 1) THEN ;
+  DCp(5, nb, 0, 0);
+  curbaud := nb;
+  IF BannerAt THEN
+  BEGIN
+    SetTmo(0);
+    dbsync := SyncDebug;           { HELLO reset the server's debug setting }
+    IF connected THEN
+      WRITELN('baud rate set to ', nb, ' (here and on the server)');
+    EXIT(DoBaud);
+  END;
+  { no banner at the new rate: back to the old one, here and on the
+    server (this HELLO is a garbled line at its new rate: it goes back) }
+  WRITELN('no answer at ', nb, ' baud: going back to ', old);
+  DCp(5, old, 0, 0);
+  curbaud := old;
+  SendLine('HELLO');
+  IF TryGetChar(ch, 2) THEN ;
+  DiscardUntilQuiet;
+  IF BannerAt THEN
+  BEGIN
+    SetTmo(0);
+    dbsync := SyncDebug;
+    IF connected THEN
+      WRITELN('baud rate is still ', old, ' (here and on the server)');
+  END
+  ELSE
+  BEGIN
+    SetTmo(0);
+    connected := FALSE;
+    WRITELN('no answer at ', old, ' baud either: start the server at ', old,
+            ', then type hello');
+  END;
+END;
+
+{ 'timeout-factor'      : print the current timeout-factor.
+  'timeout-factor auto' : measure it with the server (Calibrate: CAL) and
+                          set it, e.g. in LisaEm or after changing its
+                          throttle.  Sends HELLO first only if there is
+                          no connection yet.
+  'timeout-factor <n>'  : set it by hand (1..MAXTFACT), e.g. for an old
+                          server without CAL.
+  The factor is never measured by itself: it starts at 1 (a real Lisa). }
+PROCEDURE DoTFactor (arg: string255);
+VAR j: integer; n: longint; ua: string255;
+BEGIN
+  IF arg = '' THEN
+  BEGIN
+    WRITELN('Current timeout-factor is ', tfactor, 'x: all timeouts in this program are');
+    WRITELN('increased ', tfactor, 'x times, to compensate for the speed of a fast Lisa emulator.');
+    WRITELN('to change it: timeout-factor auto  (measure it)');
+    WRITELN('          or: timeout-factor <n>   (n = 1..', MAXTFACT, ')');
+    EXIT(DoTFactor);
+  END;
+  ua := arg;
+  UpperStr(ua);
+  IF ua = 'AUTO' THEN
+  BEGIN
+    IF Ready THEN                    { HELLO only if not connected yet }
+    BEGIN
+      WRITELN('timeout-factor is ', tfactor:1, 'x; measuring it...');
+      WRITELN('(use hotkey Apple + . to cancel it at any time)');
+      Calibrate;
+      SetTmo(0);                     { back to no timeout }
+    END;
+    EXIT(DoTFactor);
+  END;
+  FOR j := 1 TO LENGTH(arg) DO
+    IF (arg[j] < '0') OR (arg[j] > '9') THEN
+    BEGIN
+      WRITELN('usage: timeout-factor [<n> | auto]   (n = 1..', MAXTFACT, ')');
+      EXIT(DoTFactor);
+    END;
+  IF LENGTH(arg) > 4 THEN
+    n := MAXTFACT + 1
+  ELSE
+    n := StrToInt(arg);
+  IF (n < 1) OR (n > MAXTFACT) THEN
+  BEGIN
+    WRITELN('error: timeout-factor must be 1..', MAXTFACT);
+    EXIT(DoTFactor);
+  END;
+  tfactor := n;
+  WRITELN('timeout-factor set to ', tfactor, 'x (all timeouts are multiplied by it)');
+END;
+
+{ 'debug'         : show whether debug output is on.
+  'debug on | off' : switch it here and on the server (DEBUG ON/OFF).
+  Off: each transfer shows a line of progress marks ('.' per chunk that
+  got through, 'x' per failed try) and its outcome.  On: no marks; a line
+  for every protocol line sent or received and for every chunk, with
+  what happened to it (ACK, NAK and why, no reply, resent). }
+PROCEDURE DoDebug (arg: string255);
+VAR ua: string255; st: string255; wascon: boolean;
+BEGIN
+  ua := arg;
+  UpperStr(ua);
+  IF ua = '' THEN
+  BEGIN
+    IF debugon THEN
+      WRITELN('debug output is on')
+    ELSE
+      WRITELN('debug output is off');
+    WRITELN('to change it: debug on   (a line for every protocol line and chunk)');
+    WRITELN('          or: debug off  (progress marks: . per chunk, x per retry)');
+    EXIT(DoDebug);
+  END;
+  IF (ua <> 'ON') AND (ua <> 'OFF') THEN
+  BEGIN
+    WRITELN('usage: debug [on | off]');
+    EXIT(DoDebug);
+  END;
+  debugon := (ua = 'ON');
+  IF debugon THEN st := 'on' ELSE st := 'off';
+  { Not connected: Ready sends HELLO, and DoHello already sends the new
+    setting (dbsync), so do not send it a second time. }
+  wascon := connected;
+  IF NOT Ready THEN
+  BEGIN
+    WRITELN('debug output ', st, ' here only (no server)');
+    EXIT(DoDebug);
+  END;
+  IF wascon THEN
+    dbsync := SyncDebug;
+  IF NOT connected THEN                { SyncDebug got no reply: said so }
+    WRITELN('debug output ', st, ' here only (no server)')
+  ELSE IF dbsync THEN
+    WRITELN('debug output ', st, ' (here and on the server)')
+  ELSE
+    WRITELN('debug output ', st, ' here only');
+END;
+
+{ 'delete-test-files' (hidden: not in help): ask the server to delete the
+  files the test macro (tests/LisaSerialFtpTestMacro.text) uploaded.  The
+  server (DELTESTS) deletes only plain files directly in its tests folder
+  whose names start with 'lisatest-', nothing else. }
+{ Ask question Q and wait for Y or N (from the keyboard itself, no echo;
+  other keys are ignored).  TRUE for Y. }
+FUNCTION AskYes (Q: string255): BOOLEAN;
+VAR ch: CHAR;
+BEGIN
+  WRITE(Q, ' (Y/N) ');
+  REPEAT
+    READ(kbd, ch);
+  UNTIL (ch = 'Y') OR (ch = 'y') OR (ch = 'N') OR (ch = 'n');
+  WRITELN(ch);
+  AskYes := (ch = 'Y') OR (ch = 'y');
+END;
+
+{ 'delete <remote>' / 'del': delete a file on the server (DELETE), after
+  a Y/N question.  Whether the file exists is not checked first: the
+  server's answer says so. }
+PROCEDURE DoDelRemote (name: string255);
+BEGIN
+  IF name = '' THEN
+  BEGIN
+    WRITELN('usage: delete <remote>   (or del)');
+    EXIT(DoDelRemote);
+  END;
+  IF NOT AskYes(concat('delete ', name, ' on the server?')) THEN
+  BEGIN
+    WRITELN('not deleted');
+    EXIT(DoDelRemote);
+  END;
+  IF NOT Ready THEN EXIT(DoDelRemote);
+  SendLine(concat('DELETE ', name));
+  IF GetResponse(l) THEN
+    IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
+      WRITELN('deleted ', name, ' on the server')
+    ELSE
+      WRITELN('server: ', l);
+END;
+
+{ '!delete <local>' / '!del': delete a file on the Lisa (KILL_OBJECT),
+  after a Y/N question.  Whether the file exists is not checked first:
+  KILL_OBJECT's error says so. }
+PROCEDURE DoDelLocal (name: string255);
+VAR p: pathname;
+BEGIN
+  IF name = '' THEN
+  BEGIN
+    WRITELN('usage: !delete <local>   (or !del)');
+    EXIT(DoDelLocal);
+  END;
+  IF NOT AskYes(concat('delete ', name, ' on the Lisa?')) THEN
+  BEGIN
+    WRITELN('not deleted');
+    EXIT(DoDelLocal);
+  END;
+  p := name;
+  ecode := 0;
+  KILL_OBJECT(ecode, p);
+  IF ecode > 0 THEN
+    WRITELN('cannot delete ', name, ': error ', ecode)
+  ELSE
+    WRITELN('deleted ', name);
+END;
+
+PROCEDURE DoDelTests;
+BEGIN
+  IF NOT Ready THEN EXIT(DoDelTests);
+  SendLine('DELTESTS');
+  IF GetResponse(l) THEN
+    IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
+      WRITELN('server: ', COPY(l, 4, LENGTH(l) - 3), ' test file(s)')
+    ELSE
+      WRITELN('server: ', l);
+END;
+
+{--- bench: time the client's own work --------------------------------------}
+
+{ The Lisa has no fine clock, so the server is the stopwatch: MARK <what>
+  is answered with 'OK <ms since the previous MARK>'.  BenchStart starts a
+  measurement (its own result is not used), BenchMark ends it and prints
+  the rate for N bytes.  Printing happens between the two, so it is not
+  timed. }
+PROCEDURE BenchStart;
+BEGIN
+  SendRaw('MARK -');
+  IF GetResponse(l) THEN ;
+END;
+
+PROCEDURE BenchMark (what: string255; n: longint);
+VAR ms: longint;
+BEGIN
+  SendRaw(concat('MARK ', what));
+  IF NOT GetResponse(l) THEN EXIT(BenchMark);
+  IF (LENGTH(l) < 4) OR (l[1] <> 'O') THEN
+  BEGIN
+    WRITELN('server: ', l);
+    EXIT(BenchMark);
+  END;
+  benchms := StrToInt(COPY(l, 4, LENGTH(l) - 3));
+  ms := benchms - benchoh;       { without the cost of the measurement itself }
+  IF ms < 0 THEN ms := 0;
+  WRITE('  ', what, ': ');
+  IF n > 0 THEN WRITE(n:1, ' bytes in ');
+  WRITE(ms:1, ' ms');
+  IF (ms > 0) AND (n > 0) THEN
+    WRITE(' = ', (n * 1000) DIV ms:1, ' bytes/s');
+  WRITELN;
+END;
+
+{ The hidden 'bench [file]' command: time each part of the per-byte work
+  of a transfer and of the -c check, 10 KB each, the way it is done now
+  and (for comparison) the way it was done before, so it is clear where
+  the Lisa's time goes.  With a file (best a small .TEXT file), also time
+  reading it, decoding it, and the whole -c check of it. }
+PROCEDURE DoBench (fname: pathname);
+CONST NB = 10;                   { 10 chunks of 1024 bytes = 10240 bytes }
+VAR k, j, c1, c2, fref, fref2, d, n1, n2, want: integer;
+    nbytes, got, a1, a2: longint;
+    bname, bname2: pathname;
+    tf: text;
+    line: string255;
+
+  { write about NB * CHUNK bytes to a new binary file, PER bytes per
+    WRITE_DATA }
+  PROCEDURE WriteBin (per: integer; what: string255);
+  VAR k: integer;                { a FOR variable must be local }
+      wb: longint;
+  BEGIN
+    ecode := 0;
+    KILL_OBJECT(ecode, bname);
+    BenchStart;
+    ecode := 0;
+    MAKE_FILE(ecode, bname, 0);
+    IF ecode <= 0 THEN
+    BEGIN
+      ecode := 0;
+      OPEN(ecode, bname, fref, [dwrite]);
+    END;
+    IF ecode > 0 THEN
+      WRITELN('  cannot create ', bname, ': ', ecode)
+    ELSE
+    BEGIN
+      wb := 0;
+      FOR k := 1 TO (NB * CHUNK) DIV per DO
+      BEGIN
+        ecode := 0;
+        WRITE_DATA(ecode, fref, ORD4(@big.obuf[1]), per, actual, sequential, 0);
+        wb := wb + per;
+      END;
+      ecode := 0;
+      CLOSE_OBJECT(ecode, fref);
+      BenchMark(what, wb);
+    END;
+    ecode := 0;
+    KILL_OBJECT(ecode, bname);
+  END;
+
+  { read the file FNAME, PER bytes per READ_DATA }
+  PROCEDURE ReadAll (per: integer; what: string255);
+  BEGIN
+    ecode := 0;
+    OPEN(ecode, fname, fref, [dread]);
+    IF ecode > 0 THEN
+      WRITELN('  cannot open ', fname, ': ', ecode)
+    ELSE
+    BEGIN
+      BenchStart;
+      got := 0;
+      REPEAT
+        ecode := 0;
+        actual := 0;
+        READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), per, actual, sequential, 0);
+        got := got + actual;
+      UNTIL (ecode <> 0) OR (actual < per);
+      BenchMark(what, got);
+      ecode := 0;
+      CLOSE_OBJECT(ecode, fref);
+    END;
+  END;
+
+BEGIN
+  IF NOT Ready THEN EXIT(DoBench);
+  WRITELN('bench: timing the client''s work (the server is the clock)');
+  IF asmok THEN
+    WRITELN('  in use: the assembly routines (CRC16A, SUM16A, MOVEB)')
+  ELSE
+    WRITELN('  in use: the Pascal routines (the assembly ones failed their self-test)');
+  FOR j := 1 TO CHUNK DO
+    buf[j] := ToByte(((j MOD 256) * 37) MOD 256);        { j * 37 overflows an INTEGER for j > 885 }
+  nbytes := NB;
+  nbytes := nbytes * CHUNK;
+
+  { the cost of a measurement itself (MARK out, its OK back), taken off
+    every time printed below (the server prints the full times) }
+  benchoh := 0;
+  BenchStart;
+  BenchMark('nothing: the cost of a measurement, taken off the rest', 0);
+  benchoh := benchms;
+
+  { short protocol lines (an ACK is 'A <n>'): sending 20, and receiving 20
+    that the server sends back to back (ECHO), the way it is done now and
+    the way it was done before }
+  BenchStart;
+  FOR k := 1 TO 20 DO
+    SendRaw('NEXT');             { the server ignores a NEXT out of a listing }
+  BenchMark('send 20 short lines, one WRITE_DATA each (now)', 120);
+  BenchStart;
+  FOR k := 1 TO 20 DO
+  BEGIN
+    PutChar('N');
+    PutChar('E');
+    PutChar('X');
+    PutChar('T');
+    PutChar(CHR(13));
+    PutChar(CHR(10));
+  END;
+  BenchMark('send 20 short lines, a WRITE_DATA per char (before)', 120);
+  BenchStart;
+  SendRaw('ECHO 20');            { 20 lines 'A 12345' back }
+  FOR k := 1 TO 20 DO
+    IF ReplyLine(line, 5, FALSE, 9) <> W_OK THEN
+      WRITELN('  (line ', k:1, ' did not come)');
+  BenchMark('receive 20 short lines, read ahead (now)', 180);
+  BenchStart;
+  SendRaw('ECHO 20');
+  FOR k := 1 TO 20 DO
+    IF WaitLine(line, 5, FALSE) <> W_OK THEN
+      WRITELN('  (line ', k:1, ' did not come)');
+  BenchMark('receive 20 short lines, a READ_DATA per char (before)', 180);
+
+  { the get loop without a file: NB real chunk frames from the server
+    (FRAMES), each received, checked, ACKed and marked on the screen
+    exactly as in a get -- and the NB screen marks alone }
+  ProgStart(nbytes);
+  BenchStart;
+  SendRaw('FRAMES 10');
+  seq := 0;
+  k := 0;
+  REPEAT
+    IF k < NB THEN want := CHUNK ELSE want := 0;
+    ok := RecvChunk(seq, len, @buf[1], want);
+    k := k + 1;
+  UNTIL (NOT ok) OR (len = 0);
+  BenchMark('receive 10 chunks as a get does, no file (FRAMES)', nbytes);
+  ProgEnd;
+  IF NOT ok THEN
+    WRITELN('  (the chunks did not all come)');
+  ProgStart(nbytes);
+  BenchStart;
+  FOR k := 1 TO NB DO
+    ProgMark('.', CHUNK);
+  BenchMark('10 progress marks on the screen alone', 0);
+  ProgEnd;
+
+  BenchStart;
+  c1 := $FFFF;
+  FOR k := 1 TO NB DO
+    CRC16N(@buf[1], CHUNK, c1);
+  BenchMark('crc, Pascal (CRC16N)', nbytes);
+  IF asmok THEN
+  BEGIN
+    BenchStart;
+    c2 := $FFFF;
+    FOR k := 1 TO NB DO
+      CRC16A(@buf[1], CHUNK, c2, ORD4(@crctab));
+    BenchMark('crc, assembly (CRC16A)', nbytes);
+    IF c1 <> c2 THEN
+      WRITELN('  *** the two CRCs differ! ***');
+  END;
+
+  BenchStart;
+  bsum := 0;
+  FOR k := 1 TO NB DO
+    Sum16P(@buf[1], CHUNK, bsum);
+  BenchMark('byte sum, Pascal (Sum16P)', nbytes);
+  IF asmok THEN
+  BEGIN
+    BenchStart;
+    bsum := 0;
+    FOR k := 1 TO NB DO
+      SUM16A(@buf[1], CHUNK, bsum);
+    BenchMark('byte sum, assembly (SUM16A)', nbytes);
+  END;
+
+  bname := 'LisaSerialFtpBench.BIN';
+  WriteBin(256, 'write a binary file, 256 bytes per WRITE_DATA (before)');
+  WriteBin(WBLOCK, 'write a binary file, 4 KB per WRITE_DATA (now)');
+
+  { a text file of 80 lines of 126 chars: with WRITELN (as get did
+    before), and in pages built by PutLine (as get does now) }
+  line := '';
+  FOR j := 1 TO 126 DO
+    line := concat(line, 'x');   { 126 chars + CR = 127 bytes per line: 8 per CHUNK }
+  bname := 'LisaSerialFtpBench.TEXT';
+  bname2 := 'LisaSerialFtpBench2.TEXT';
+  ecode := 0;
+  KILL_OBJECT(ecode, bname);
+  ecode := 0;
+  KILL_OBJECT(ecode, bname2);
+  BenchStart;
+  REWRITE(tf, bname);
+  ecode := IORESULT;
+  IF ecode > 0 THEN
+    WRITELN('  cannot create ', bname, ': ', ecode)
+  ELSE
+  BEGIN
+    FOR k := 1 TO NB * (CHUNK DIV 127) DO
+      WRITELN(tf, line);
+    CLOSE(tf, lock);
+    BenchMark('write a text file with WRITELN (before)', nbytes);
+  END;
+  { the same file the way get writes it: chunks of CHUNK received bytes
+    (lines of 126 x's + LF), folded into pages by TxtChunk (assembly)
+    or PutLine (Pascal), 4 pages per WRITE_DATA }
+  FOR k := 0 TO CHUNK DIV 127 - 1 DO
+  BEGIN
+    FOR j := 1 TO 126 DO
+      buf[k * 127 + j] := 120;   { 'x' }
+    buf[k * 127 + 127] := 10;    { LF }
+  END;
+  BenchStart;
+  IF OpenText(bname2, fref) THEN
+  BEGIN
+    got := 0;
+    IF asmok THEN
+    BEGIN
+      FOR j := 0 TO 7 DO
+        txst[j] := 0;
+      FOR k := 1 TO NB DO
+        TxtChunk(fref, CHUNK, got);
+    END
+    ELSE
+      FOR k := 1 TO NB * (CHUNK DIV 127) DO
+        PutLine(line, 126, fref);
+    TxtEnd(fref);
+    ecode := 0;
+    CLOSE_OBJECT(ecode, fref);
+    IF asmok THEN
+      BenchMark('write it the way get does, in assembly (TXTPUT; now)', nbytes)
+    ELSE
+      BenchMark('write it the way get does, in Pascal (PutLine)', nbytes);
+    IF operr > 0 THEN
+      WRITELN('  *** write error ', operr, ' ***');
+  END;
+  { The two text files must be byte for byte the same, header included:
+    else the pages PutLine builds are not what the Pascal run-time makes. }
+  ecode := 0;
+  OPEN(ecode, bname, fref, [dread]);
+  j := 0;
+  OPEN(j, bname2, fref2, [dread]);
+  IF (ecode > 0) OR (j > 0) THEN
+    WRITELN('  cannot open the two text files to compare them')
+  ELSE
+  BEGIN
+    d := -1;                     { -1 = the same so far }
+    got := 0;
+    REPEAT
+      ecode := 0;
+      a1 := 0;
+      READ_DATA(ecode, fref, ORD4(@big.pgbuf[1]), TBUF DIV 2, a1, sequential, 0);
+      ecode := 0;
+      a2 := 0;
+      READ_DATA(ecode, fref2, ORD4(@big.pgbuf[TBUF DIV 2 + 1]), TBUF DIV 2, a2, sequential, 0);
+      n1 := a1;
+      n2 := a2;
+      IF n1 <> n2 THEN
+        IF d < 0 THEN d := 0;    { different lengths }
+      FOR k := 1 TO n1 DO
+        IF (d < 0) AND (k <= n2) THEN
+          IF big.pgbuf[k] <> big.pgbuf[TBUF DIV 2 + k] THEN
+            d := k;
+      got := got + a1;
+    UNTIL (a1 < TBUF DIV 2) OR (a2 < TBUF DIV 2) OR (d >= 0);
+    IF d < 0 THEN
+      WRITELN('  the two text files are the same, byte for byte (', got:1, ' bytes)')
+    ELSE IF d = 0 THEN
+      WRITELN('  *** the two text files have different lengths ***')
+    ELSE
+      WRITELN('  *** the two text files differ, at byte ', got - a1 + d:1, ' ***');
+  END;
+  ecode := 0;
+  CLOSE_OBJECT(ecode, fref);
+  ecode := 0;
+  CLOSE_OBJECT(ecode, fref2);
+  ecode := 0;
+  KILL_OBJECT(ecode, bname);
+  ecode := 0;
+  KILL_OBJECT(ecode, bname2);
+
+  IF fname <> '' THEN
+  BEGIN
+    ReadAll(TPAGE, concat('read ', fname, ', 1 KB per READ_DATA (before)'));
+    ReadAll(TBUF, concat('read ', fname, ', 4 KB per READ_DATA (now)'));
+    IF IsTextName(fname) THEN
+    BEGIN
+      ecode := 0;
+      OPEN(ecode, fname, fref, [dread]);
+      IF ecode <= 0 THEN
+      BEGIN
+        BenchStart;
+        tmode := 0;
+        size := 0;
+        ok := TRUE;
+        IF TextPass(fref) THEN ;
+        IF asmok THEN
+          BenchMark('read + decode it, assembly (DECODEP; now)', size)
+        ELSE
+          BenchMark('read + decode it, Pascal', size);
+        ecode := 0;
+        CLOSE_OBJECT(ecode, fref);
+      END;
+      IF asmok THEN              { the same with the Pascal loop (before) }
+      BEGIN
+        ecode := 0;
+        OPEN(ecode, fname, fref, [dread]);
+        IF ecode <= 0 THEN
+        BEGIN
+          asmok := FALSE;
+          BenchStart;
+          tmode := 0;
+          size := 0;
+          ok := TRUE;
+          IF TextPass(fref) THEN ;
+          BenchMark('read + decode it, Pascal (before)', size);
+          asmok := TRUE;
+          ecode := 0;
+          CLOSE_OBJECT(ecode, fref);
+        END;
+      END;
+    END;
+    BenchStart;
+    IF LocalSum(fname, NOT IsTextName(fname), FALSE) THEN ;
+    BenchMark('the whole -c check of it (read, decode, CRC, sum)', total);
+  END;
+  WRITELN('bench done');
+END;
+
+PROCEDURE Connect;
+BEGIN
+  IF NOT DoHello THEN
+    WRITELN('(you can still use !list, help and quit; hello to retry)');
+END;
+
+{$S          }  { the main program: back to the blank segment }
+
+{--- main --------------------------------------------------------------------}
+
+BEGIN
+  devname := 'RS232B';                { or 'RS232A' }
+  curbaud := BAUD;
+  tfactor := 1;                       { a real Lisa; 'timeout-factor auto' measures it }
+  curtmo := -1;                       { driver timeout not known yet (SetTmo) }
+  rxqn := 0;                          { the read-ahead queue is empty }
+  rxqp := 1;
+  ProgStart(0);                       { no progress marks on screen }
+  debugon := FALSE;                   { progress marks, not debug lines }
+  dbsync := FALSE;
+  xferfail := FALSE;
+  lastcmd := '';                      { nothing to repeat yet }
+  logrx := TRUE;
+  RESET(kbd, '-KEYBOARD');            { key reads without echo, for paging }
+  IF NOT CrcSelfTest THEN HALT;       { builds the CRC tables }
+  connected := FALSE;
+  aborted := FALSE;
+  dirty := FALSE;
+  WRITELN('LisaSerialFtpClient ', VERSION, ' (build ', BUILD, ')');
+  WRITELN('file transfer over ', devname, ' at ', curbaud, ' baud');
+  WRITELN('commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,');
+  WRITELN('          debug, repeat, help, quit');
+  SetupPort;
+  Connect;
+  REPEAT
+    WRITE('> ');                 { no newline: cursor stays on the prompt line }
+    READLN(cmdline);
+    aborted := FALSE;            { Apple-period applies to one command only }
+    IF PAbortFlag THEN;          { forget an Apple-period pressed at the prompt }
+    ParseCmd(cmdline, cmd, arga, argb);
+    IF (cmd = 'REPEAT') OR (cmd = 'R') THEN
+    BEGIN
+      { run the last command line again (any arguments are ignored) }
+      IF lastcmd = '' THEN
+      BEGIN
+        WRITELN('no command to repeat');
+        cmd := '';
+      END
+      ELSE
+      BEGIN
+        WRITELN('repeating: ', lastcmd);
+        cmdline := lastcmd;
+        ParseCmd(cmdline, cmd, arga, argb);
+      END;
+    END;
+    cmdknown := TRUE;            { FALSE below for an unknown command }
+    IF (cmd = 'Q') OR (cmd = 'EXIT') THEN cmd := 'QUIT';  { aliases }
+    IF cmd <> '' THEN
+    BEGIN
+      IF cmd = 'LIST' THEN
+      BEGIN
+        IF Ready THEN DoList(arga);
+      END
+      ELSE IF cmd = 'GET' THEN
+      BEGIN
+        xferfail := TRUE;                { until DoGet says it was verified }
+        IF NOT TakeFlags(arga, argb) THEN
+          WRITELN('get: -b (binary) and -t (text) cannot both be given')
+        ELSE IF arga = '' THEN
+        BEGIN
+          WRITELN('usage: get [-c] [-b | -t] <remote> [local]');
+          WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+        END
+        ELSE
+        BEGIN
+          remote := arga;
+          local := argb;                 { pathname is string[255]; assign directly }
+          IF local = '' THEN
+          BEGIN
+            BaseName(remote, tname);
+            local := tname;
+          END;
+          { -t: text; -b: binary.  Else text if the local name was given
+            and ends in .TEXT, or if the remote name ends in .TEXT (any
+            case); otherwise binary.  A text download must be saved under a
+            .TEXT name (a Lisa text file): refused, with a suggestion, if
+            the local name does not end in .TEXT. }
+          IF tflag OR ((NOT bflag) AND (IsTextName(local) OR IsTextName(remote))) THEN
+          BEGIN
+            IF NOT IsTextName(local) THEN
+            BEGIN
+              StripExt(local, sname);
+              IF tflag THEN
+              BEGIN
+                WRITELN('error: get -t saves a Lisa text file: give it a name ending in .TEXT,');
+                WRITELN('e.g. get -t ', remote, ' ', sname, '.TEXT');
+              END
+              ELSE
+              BEGIN
+                WRITELN('error: ', remote, ' is a text file: save it under a name ending in .TEXT,');
+                WRITELN('e.g. get ', remote, ' ', sname, '.TEXT  (or get -b to keep its bytes)');
+              END;
+            END
+            ELSE IF Ready THEN
+              DoGet(remote, local, FALSE, cflag);
+          END
+          ELSE IF Ready THEN
+            DoGet(remote, local, TRUE, cflag);
+        END;
+      END
+      ELSE IF cmd = 'PUT' THEN
+      BEGIN
+        xferfail := TRUE;                { until DoPut says it was verified }
+        IF NOT TakeFlags(arga, argb) THEN
+          WRITELN('put: -b (binary) and -t (text) cannot both be given')
+        ELSE IF arga = '' THEN
+        BEGIN
+          WRITELN('usage: put [-c] [-b | -t] <local> [remote]');
+          WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+        END
+        ELSE
+        BEGIN
+          local := arga;                 { pathname is string[255]; assign directly }
+          remote := argb;
+          IF remote = '' THEN
+            BaseName(local, remote);
+          { -b: byte-exact; -t: as text, if the file looks like a Lisa
+            text file (LooksText; else refused).  Else a name ending in
+            .TEXT (any case) is a Lisa text file: sent as text; anything
+            else byte-exact. }
+          IF bflag THEN
+          BEGIN
+            IF Ready THEN DoPut(local, remote, TRUE, cflag);
+          END
+          ELSE IF tflag THEN
+          BEGIN
+            IF LooksText(local) THEN
+              IF Ready THEN DoPut(local, remote, FALSE, cflag);
+          END
+          ELSE IF Ready THEN
+            DoPut(local, remote, NOT IsTextName(local), cflag);
+        END;
+      END
+      ELSE IF cmd = '!LIST' THEN
+        DoListVol(arga)
+      ELSE IF (cmd = 'DELETE') OR (cmd = 'DEL') THEN
+        DoDelRemote(arga)
+      ELSE IF (cmd = '!DELETE') OR (cmd = '!DEL') THEN
+        DoDelLocal(arga)
+      ELSE IF cmd = 'BAUD' THEN
+        DoBaud(arga)
+      ELSE IF cmd = 'HELLO' THEN
+        ok := DoHello   { Lisa Pascal: a function call cannot be a statement by itself }
+      ELSE IF cmd = 'TIMEOUT-FACTOR' THEN
+        DoTFactor(arga)
+      ELSE IF cmd = 'DEBUG' THEN
+        DoDebug(arga)
+      ELSE IF cmd = 'DELETE-TEST-FILES' THEN
+        DoDelTests                       { hidden: for the test macro }
+      ELSE IF cmd = 'BENCH' THEN
+        DoBench(arga)                    { hidden: time the client's work }
+      ELSE IF (cmd = 'HELP') OR (cmd = 'H') OR (cmd = '?') THEN
+        ShowHelp
+      ELSE IF cmd <> 'QUIT' THEN
+      BEGIN
+        WRITELN('unknown command: ', cmd);
+        cmdknown := FALSE;
+      END;
+      { remembered for 'repeat', unless it was unknown }
+      IF cmdknown THEN lastcmd := cmdline;
+    END;
+  UNTIL cmd = 'QUIT';
+  { If the last get/put failed, say so and wait for SPACE (from the
+    keyboard itself, not from INPUT: in an exec file this stops the
+    macro here, so the failure is not missed). }
+  IF xferfail THEN
+  BEGIN
+    WRITE('The last transfer failed! Press SPACE to quit.');
+    REPEAT
+      READ(kbd, qch);
+    UNTIL qch = ' ';
+    WRITELN;
+  END;
+  SendLine('QUIT');
+  ecode := 0;
+  CLOSE_OBJECT(ecode, refnum);
+  WRITELN('done');
+END.

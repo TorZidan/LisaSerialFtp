@@ -1,0 +1,36 @@
+$EXEC
+$
+${Fetch the newest sources from the server with the current client}
+${(LisaSerialFtpServer.py must be running; get replaces the old files)}
+R{un}LisaSerialFtpClient.OBJ
+get -c tests/LisaSerialFtpTestMacro.text LisaSerialFtpTestMacro.text
+get -c LisaSerialFtpClientInclude.text
+get -c LisaSerialFtpClientAsm.text
+get -c LisaSerialFtpClient.text
+quit
+$DOIT
+${Assemble the 68000 routines (CRC, byte sum, byte copy)}
+A{ssemble}LisaSerialFtpClientAsm.text
+{no listing file - this comment-only line is the [RETURN] answer}
+LisaSerialFtpClientAsm.OBJ
+$
+P{ascal Compile}LisaSerialFtpClient.text
+{no listing file - this comment-only line is the [RETURN] answer}
+LisaSerialFtpClientCompiled.OBJ
+$
+${Link it}
+L{inker}LisaSerialFtpClientCompiled.OBJ
+LisaSerialFtpClientAsm.OBJ
+IOSPASLIB.OBJ
+{end of the input list - this comment-only line is the blank answer}
+{no listing file - second blank answer}
+LisaSerialFtpClient.OBJ
+$
+${Delete the intermediate object files, then leave the File Manager}
+F{ile-Mgr}D{elete}LisaSerialFtpClientCompiled.OBJ
+Y{es, delete it}
+D{elete}LisaSerialFtpClientAsm.OBJ
+Y{es, delete it}
+Q{uit}
+$
+$ENDEXEC

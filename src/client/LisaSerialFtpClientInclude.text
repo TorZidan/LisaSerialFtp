@@ -1,0 +1,228 @@
+{**************************************************************************}
+{ LISA-FTP -- fragment of LisaSerialFtpClient.text, spliced in by the      }
+{ Lisa Pascal file-inclusion directive (the "I" directive) naming this     }
+{ file.                                                                    }
+{                                                                          }
+{ Holds all the code for the '!list' command (local volume listing):       }
+{   EntryKind  -- name for a catalog entry type (Q_Info.etype)             }
+{   Pad2       -- a number as two digits ('07')                            }
+{   DateStr    -- a file time stamp as MM/DD/YY-HH:MM                      }
+{   DoListVol  -- the '!list' handler itself                               }
+{                                                                          }
+{ This is NOT a standalone program: no PROGRAM statement, no USES, no      }
+{ final END.  It is included at the point of the I-inclusion directive     }
+{ in LisaSerialFtpClient.text -- after all program-scope declarations,     }
+{ so string255 is in scope -- and uses the syscall unit's                  }
+{ GET_WORKING_DIR / LOOKUP / RESET_CATALOG / LOOKUP_NEXT_ENTRY.  Works     }
+{ purely locally: no serial link or server needed.                         }
+{****************************************************************************}
+
+{ Name for a catalog entry type (Q_Info.etype).  Lisa Pascal forbids
+  string result types in functions (scalar/subrange/pointer only), so
+  this is a procedure with a VAR parameter, like BaseName/StripExt. }
+PROCEDURE EntryKind (t: entrytype; VAR s: string255);
+BEGIN
+  s := 'other';
+  IF t = catentry THEN s := 'catalog'
+  ELSE IF t = linkentry THEN s := 'link'
+  ELSE IF t = fileentry THEN s := 'file'
+  ELSE IF t = pipeentry THEN s := 'pipe'
+  ELSE IF t = ecentry THEN s := 'ec'
+  ELSE IF t = killedentry THEN s := 'killed';
+END;
+
+{ Append N (0..99) to S as two digits: 7 -> '07'. }
+PROCEDURE Pad2 (N: LONGINT; VAR S: string255);
+VAR t: string255;
+BEGIN
+  IntToStr(N, t);
+  IF N < 10 THEN t := concat('0', t);
+  S := concat(S, t);
+END;
+
+{ A file time stamp (Q_Info.DTM / DTC) as 'MM/DD/YY-HH:MM', the format of
+  the Workshop File Manager's listing.  The time stamp is an UNSIGNED
+  32-bit count of seconds since midnight, 1 January 1901 (libhw TIMERS,
+  TimeToDate), so dates after the mid 1960s have the sign bit set and
+  arrive here as negative LONGINTs.  The unsigned value is split into
+  T DIV 128 and T MOD 128 without overflow; then, as TimeToDate does,
+  128 * 675 = 86400 seconds per day and 1461 days per 4-year cycle (every
+  4th year is a leap year: right for 1901..2099).  TimeToDate is in the
+  hardware unit, which this program does not use, hence this copy. }
+PROCEDURE DateStr (T: LONGINT; VAR S: string255);
+VAR hi, lo, days, secs, cyc, dc, y, dd, year, m, ml: LONGINT;
+BEGIN
+  IF T < 0 THEN
+  BEGIN
+    { unsigned T = (T + 2^31) + 2^31, and 2^31 / 128 = 2^24 exactly }
+    T := (T + 1073741824) + 1073741824;   { now 0..2^31-1 }
+    hi := T DIV 128 + 16777216;
+  END
+  ELSE
+    hi := T DIV 128;
+  lo := T MOD 128;
+  days := hi DIV 675;                     { days since 1 Jan 1901 }
+  secs := (hi MOD 675) * 128 + lo;        { seconds into the day }
+  cyc := days DIV 1461;                   { 4-year cycles }
+  dc := days MOD 1461;
+  y := dc DIV 365;                        { year in the cycle, 0..3 }
+  dd := dc MOD 365;                       { day in the year, from 0 }
+  IF y = 4 THEN                           { 31 Dec of the leap year }
+  BEGIN
+    y := 3;
+    dd := 365;
+  END;
+  year := 1901 + cyc * 4 + y;
+  m := 1;
+  ml := 31;
+  WHILE dd >= ml DO                       { find the month }
+  BEGIN
+    dd := dd - ml;
+    m := m + 1;
+    IF m = 2 THEN
+    BEGIN
+      IF year MOD 4 = 0 THEN ml := 29 ELSE ml := 28;
+    END
+    ELSE IF (m = 4) OR (m = 6) OR (m = 9) OR (m = 11) THEN
+      ml := 30
+    ELSE
+      ml := 31;
+  END;
+  S := '';
+  Pad2(m, S);
+  S := concat(S, '/');
+  Pad2(dd + 1, S);
+  S := concat(S, '/');
+  Pad2(year MOD 100, S);
+  S := concat(S, '-');
+  Pad2(secs DIV 3600, S);
+  S := concat(S, ':');
+  Pad2((secs MOD 3600) DIV 60, S);
+END;
+
+{ List the catalog of the default volume -- every file on it, not just
+  one directory (the same scan UltraLOS's ListFile does).  Without an
+  argument, all entries on the volume are listed; with one, only
+  entries whose name begins with the argument (the catalog prefix match
+  is case-insensitive).  Paged by PageStart / PageMore (LisaSerialFtpClient.text):
+  'Type SPACE to continue, CLEAR to exit.' after every 30 lines.  One
+  line per entry, with the attributes LOOKUP_NEXT_ENTRY's Q_Info carries
+  (no second LOOKUP per entry).  Works purely locally -- no serial
+  link or server needed.
+
+  The layout is the Workshop File Manager's (List):
+    Contents of -vol-=
+    Filename                     Size Psize   Last-Mod-Date   Creation-Date  Attr
+    --------                     ---- -----   -------------   -------------  ----
+    ALERT                       18432    36  06/22/84-14:08  06/22/84-14:06
+  A name longer than 24 characters is cut to 23 plus an ellipsis.  Attr
+  shows the entry type when it is not a plain file (catalog, link, ...)
+  and 'protected' for a protected file.
+
+  LOOKUP_NEXT_ENTRY does the prefix match (case-insensitive).  A
+  trailing '=' (the Workshop's wildcard, as in 'ALEX=') is accepted and
+  dropped first.  The volume name in the heading is the first part of
+  the working directory's path ('-#12' -> '-#12-'). }
+PROCEDURE DoListVol (arg: string255);
+VAR
+  err    : integer;
+  path   : pathname;
+  vol    : pathname;
+  prefix : e_name;
+  uprefix: string255;          { the argument, cleaned up into prefix }
+  q      : Q_Info;
+  outl   : string255;
+  tn     : string255;
+  attr   : string255;
+  dm, dcr: string255;          { last-modified and creation dates }
+  j      : integer;
+  n      : longint;
+  more   : boolean;
+BEGIN
+  err := 0;
+  path := '';
+  GET_WORKING_DIR(err, path);
+  IF err <> 0 THEN
+  BEGIN
+    WRITELN('!list: cannot get working directory: ', err);
+    EXIT(DoListVol);
+  END;
+  { The volume is the first component of the working directory's path:
+    '-#12' or '-#12-SUBDIR' -> '-#12-'.  An empty path gives '-'. }
+  j := 2;
+  WHILE (j <= LENGTH(path)) AND (path[j] <> '-') DO j := j + 1;
+  IF LENGTH(path) = 0 THEN
+    vol := '-'
+  ELSE
+    vol := concat(COPY(path, 1, j - 1), '-');
+  { the prefix: without a trailing '=' (Workshop wildcard), at most the
+    32 characters of an entry name }
+  uprefix := arg;
+  IF LENGTH(uprefix) > 0 THEN
+    IF uprefix[LENGTH(uprefix)] = '=' THEN
+      uprefix := COPY(uprefix, 1, LENGTH(uprefix) - 1);
+  IF LENGTH(uprefix) > 32 THEN
+    uprefix := COPY(uprefix, 1, 32);
+  prefix := uprefix;
+  err := 0;
+  RESET_CATALOG(err, path);
+  IF err <> 0 THEN
+  BEGIN
+    WRITELN('!list: cannot reset catalog of ', path, ': ', err);
+    EXIT(DoListVol);
+  END;
+  PageStart;
+  more := PageMore;
+  WRITELN('Contents of ', vol, prefix, '=');
+  IF PageMore THEN
+    WRITELN('Filename                     Size Psize   Last-Mod-Date   Creation-Date  Attr')
+  ELSE
+    EXIT(DoListVol);
+  IF PageMore THEN
+    WRITELN('--------                     ---- -----   -------------   -------------  ----')
+  ELSE
+    EXIT(DoListVol);
+  n := 0;
+  REPEAT
+    err := 0;
+    LOOKUP_NEXT_ENTRY(err, prefix, q);
+    IF err = 0 THEN
+    BEGIN
+      n := n + 1;
+      outl := q.name;
+      IF LENGTH(outl) > 24 THEN           { cut to 23 + an ellipsis }
+      BEGIN
+        outl := COPY(outl, 1, 23);
+        outl := concat(outl, ' ');
+        outl[24] := CHR(201);             { the Lisa character set's ... }
+      END;
+      FOR j := LENGTH(outl) + 1 TO 24 DO
+        outl := concat(outl, ' ');
+      attr := '';
+      IF q.etype <> fileentry THEN
+      BEGIN
+        EntryKind(q.etype, tn);
+        attr := tn;
+      END;
+      IF q.protected THEN
+        IF attr = '' THEN
+          attr := 'protected'
+        ELSE
+          attr := concat(attr, ' protected');
+      DateStr(q.DTM, dm);
+      DateStr(q.DTC, dcr);
+      more := PageMore;
+      IF more THEN
+        { Psize: 512-byte blocks.  Q_Info.psize is the physical size in
+          BYTES (18432 for 36 blocks); rounded up, in case it is not a
+          whole number of blocks. }
+        WRITELN(outl, q.size:9, (q.psize + 511) DIV 512:6, '  ', dm, '  ', dcr, '  ', attr);
+    END;
+  UNTIL (err <> 0) OR NOT more;
+  IF NOT more THEN EXIT(DoListVol);       { CLEAR at a page prompt }
+  IF err <> 848 THEN
+    IF PageMore THEN
+      WRITELN('!list: catalog error: ', err);
+  IF PageMore THEN
+    WRITELN(n, ' entries');
+END;

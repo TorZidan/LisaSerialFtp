@@ -391,6 +391,27 @@ The two cables plugged together:
 ![The dongle and the null-modem cable plugged together](assets/photos/cables-connected.jpg)
 
 
+## Serial line settings
+
+Both sides set the port the same way; there is nothing to configure
+(the server and the client set it up themselves):
+
+| setting | value |
+|---|---|
+| data bits, parity, stop bits | **8N1**: 8 data bits, no parity, 1 stop bit |
+| hardware flow control (RTS/CTS, DTR/DSR) | **none**: only TX, RX and GND are needed |
+| software flow control (XON/XOFF) | **none** (see [Why no XON/XOFF](#why-no-xonxoff)) |
+| baud rate | **57600** by default, the highest the Lisa's Port B can do (see [Baud rates](#baud-rates)); the client's `baud` command changes it on both sides |
+
+There is no parity because every chunk carries a CRC-16, which catches far
+more errors than parity would, and the whole file is checked again at the
+end.  Flow control is done by the protocol itself: the sender waits for an
+ACK after each chunk, so the Lisa is never sent more than it can hold.
+
+On the Lisa the client sets these with `DEVICE_CONTROL` at startup
+(`dvParity`, `dvBaud`, `dvInDTR`, `dvInXON`, `dvOutDTR`, `dvOutXON`, ...);
+on the PC the server sets them with `termios` (or pyserial on Windows).
+
 ## Baud rates
 
 The Lisa's SCC divisor math (see `CONTROLIT` dcode 5 in
@@ -469,6 +490,31 @@ Neither side ever uses XON/XOFF: the server clears IXON/IXOFF on its
 port, and the Lisa client sets no handshake.  It could not be used even
 for text files: every chunk is a binary frame, whose sequence number,
 length and CRC bytes can be 0x11 or 0x13 too.
+
+## Transfer speeds
+
+Typical speeds at 57600 baud, in bytes per second of file data, for a
+file of a few tens of KB copied to or from the ProFile.  57600 baud is at
+most 5760 bytes/s on the wire; the Lisa itself is the limit, not the line.
+
+| transfer | real Lisa | LisaEm |
+|---|---|---|
+| `get`, binary file | about 3,100 bytes/s | TO DO |
+| `get`, text file | TO DO | TO DO |
+| `put`, binary file | about 2,070 bytes/s | TO DO |
+| `put`, text file | TO DO | TO DO |
+
+Notes:
+* A text `get` moves about 3% more bytes than the file's size (the NUL
+  padding at the end of each 1 KB page), and the server builds the Lisa
+  text pages, so it should come close to a binary `get`.
+* A `put` is slower than a `get` because the Lisa sends a frame more
+  slowly than it receives one (about 2,600 bytes/s at best).
+* In LisaEm the baud rate does not limit the speed: the emulated port
+  moves bytes at a pace set by the emulator.
+* The server prints the time and speed at the end of each transfer
+  (`... verified (crc e317) in 12.3 s (2650 bytes/s)`), so you can
+  measure your own setup.
 
 ## The LISA-SERIAL-FTP/v1.0 protocol
 

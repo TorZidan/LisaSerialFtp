@@ -6,7 +6,8 @@ Mirrors the Pascal client code in LisaSerialFtpClient.text (the table-driven CRC
 RecvChunk, DoGet text mode, retry/NAK logic, the DONE -> OK/BAD
 verification and the FAIL handshake) and runs it against a fresh
 LisaSerialFtpServer.py instance on a pty pair, GETting the real README.md
-from this directory.
+from the repository root as a Lisa text file (GET README.md T, whose
+pages must equal lisa_pages) and checking that its lines come back intact.
 
 Usage:
   python3 test_get_readme.py               clean link: expect success
@@ -26,7 +27,8 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOP = os.path.dirname(HERE)              # the project folder (tests/..)
+TOP = os.path.dirname(HERE)              # the server folder (src/server)
+REPO = os.path.dirname(os.path.dirname(TOP))   # the repository (README.md)
 SERVER = os.path.join(TOP, "LisaSerialFtpServer.py")
 REMOTE = "README.md"
 sys.path.insert(0, TOP)
@@ -308,7 +310,7 @@ def connect(sim):
 
 def main():
     drop = "--drop-0xff" in sys.argv[1:]
-    filedata = open(os.path.join(TOP, REMOTE), "rb").read()
+    filedata = open(os.path.join(REPO, REMOTE), "rb").read()
     print("== test_get_readme.py: simulating LisaSerialFtpClient.text 'get %s' ==" % REMOTE)
     print("   file size: %d bytes, link: %s\n"
           % (len(filedata), "DROPPING 0xFF BYTES (lisaem bug)" if drop
@@ -319,7 +321,7 @@ def main():
     # --timeout 2: in drop mode the first retry needs the server's
     # retransmit-after-timeout, exactly like the real link (15 s there).
     server_args = [sys.executable, SERVER, "--port", "ignored",
-                   "--baud", "9600", "--root", TOP,
+                   "--baud", "9600", "--home_dir", REPO,
                    "--timeout", "2", "--debug"]
     proc = subprocess.Popen(server_args, pass_fds=[slave], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

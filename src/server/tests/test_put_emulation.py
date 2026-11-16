@@ -10,13 +10,18 @@ This replicates, byte for byte, what LisaSerialFtpClient.text sends:
     where the CRC is computed with the *Pascal* bitwise CRC-16/CCITT-FALSE
     (CRC16 procedure in LisaSerialFtpClient.text), not the server's table version --
     so a mismatch between the two implementations would be caught here.
-  * the zero-length final chunk and the DONE read.
+  * the zero-length final chunk and the DONE read;
+  * a second PUT with a run of garbage bytes injected between chunks:
+    the server must recover (NAK, the chunk is sent again) and still store
+    the exact file.
 
 If this passes, the protocol logic is sound and a real-hardware failure
 is in the physical/driver layer (or timing), not in the framing.
 """
+import atexit
 import os
 import pty
+import shutil
 import subprocess
 import sys
 import time
@@ -53,6 +58,7 @@ def pascal_frame(seq, payload):
 
 def main():
     root = "/tmp/lisaftp_put_emu"
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     os.system("rm -rf %s" % root)
     os.makedirs(os.path.join(root, "sub dir"))
     # a file with every byte value, to be mean to any byte mangling
@@ -65,7 +71,7 @@ def main():
     proc = subprocess.Popen(
         # --port is required; LISAFTP_FD makes the server use the pty instead
         [sys.executable, os.path.join(TOP, "LisaSerialFtpServer.py"), "--port", "ignored",
-         "--root", root,
+         "--home_dir", root,
          "--timeout", "5"],
         pass_fds=[slave],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

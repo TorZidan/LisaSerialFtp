@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-test_lisaftp.py -- loopback test for LisaSerialFtpServer.py.
+test_lisaftp.py -- loopback test of the whole LisaSerialFtpServer.py
+command set, with no hardware: a pty pair, the server on its slave end, and
+a Python stand-in for the Lisa client on the master end.
 
-Creates a pty pair, runs the server on the slave, and emulates the Lisa
-RS-232 client on the master: banner, HELLO, LIST, GET, PUT, QUIT, plus
-rejection of the removed commands (STAT, DEL, MKDIR, PWD), DEBUG ON/OFF.
-Verify the transferred bytes match, and the end-of-transfer verification
-(DONE <bytes> <crc>, answered with OK <bytes> <crc>).
+  * banner and HELLO: the protocol version and chunk size, and the client's
+    warnings when they differ from its own;
+  * LIST, GET (also of a file in a subfolder) and PUT, with the bytes and the
+    end-of-transfer check (DONE <bytes> <crc> / OK <bytes> <crc>) verified;
+  * NAK and retransmit, duplicate chunks, empty files, the GO / FAIL / "N 0"
+    start of a GET, a client that restarts in the middle of a transfer;
+  * names: a path outside --home_dir refused, long names, non-ASCII names
+    (Mac Roman on the wire, percent-encoding for the rest);
+  * GET name T (the server builds the Lisa text pages);
+  * DELETE, DELTESTS, DEBUG ON/OFF, unknown and removed commands (STAT,
+    MKDIR, DEL, PWD) answered ERR 99, and QUIT (the server waits for the
+    next client).
+
+Run:  python3 src/server/tests/test_lisaftp.py
 """
 import os
 import pty
@@ -16,18 +27,19 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOP = os.path.dirname(HERE)              # the project folder (tests/..)
+TOP = os.path.dirname(HERE)              # the server folder (src/server)
+REPO = os.path.dirname(os.path.dirname(TOP))   # the repository
 SERVER = os.path.join(TOP, "LisaSerialFtpServer.py")
 
 
 def is_banner(line):
     """The server's banner: 'Hi from Lisa Serial FTP Server version
-    LISA-SERIAL-FTP/v1.0 : root_folder=... chunk_size=...' (the client only checks
+    LISA-SERIAL-FTP/v1.0 : home_dir=... chunk_size=...' (the client only checks
     that it starts with 'H')."""
     return line.startswith("H") and "LISA-SERIAL-FTP/v1.0" in line
 
 
-CLIENT = os.path.join(TOP, "LisaSerialFtpClient.text")
+CLIENT = os.path.join(REPO, "src", "client", "LisaSerialFtpClient.text")
 
 
 def major_of(s):
@@ -116,7 +128,7 @@ class Lisa:
         while True:
             b = self.read_byte(timeout)
             if b == 0x0A:
-                return line.rstrip(b"\r").decode()
+                return line.rstrip(b"\r").decode("mac_roman")   # the Lisa's characters
             line += bytes([b])
 
     def drain(self, pause=0.2):
@@ -138,7 +150,7 @@ class Lisa:
         raise AssertionError("no banner")
 
     def send_line(self, s):
-        os.write(self.fd, s.encode() + b"\r\n")
+        os.write(self.fd, s.encode("mac_roman") + b"\r\n")
         self.need_go = s.startswith("GET ")   # the client's GO before chunk 0
 
 
@@ -185,7 +197,7 @@ def main():
         master, slave = pty.openpty()
         env = dict(os.environ, LISAFTP_FD=str(slave))
         server_args = [sys.executable, SERVER, "--port", "ignored",
-                       "--baud", "9600", "--root", root,
+                       "--baud", "9600", "--home_dir", root,
                        "--timeout", "5", "--debug"]
         proc = subprocess.Popen(
             server_args,
@@ -215,8 +227,8 @@ def main():
         check("chunk-size-same", chunk_of(banner) == client_chunk(),
               "server %d, client %d" % (chunk_of(banner), client_chunk()))
         check("chunk-size-other-warns",
-              chunk_of("Hi ... root_folder=/x chunk_size=256") == 256
-              and chunk_of("Hi ... LISA-FTP/5 : root_folder=/x") == -1)
+              chunk_of("Hi ... home_dir=/x chunk_size=256") == 256
+              and chunk_of("Hi ... LISA-FTP/5 : home_dir=/x") == -1)
         check("version-other-major-warns",
               major_of("Hi ... LISA-SERIAL-FTP/v2.0 : x") == "2"
               and major_of("Hi ... LISA-FTP/5 : x") == ""
@@ -268,8 +280,8 @@ def main():
         check("get-verified", r == "OK %d %04x" % (len(got), crc), r)
         check("get-bytes", got == filedata)
 
-        # 5. GET nested name with ':' separator and percent-encoding
-        lisa.send_line("GET sub%20dir:x.bin")
+        # 5. GET nested name with the '/' separator and percent-encoding
+        lisa.send_line("GET sub%20dir/x.bin")
         r = lisa.read_line()
         check("get-nested-ok", r == "OK 3", r)
         got = b""
@@ -431,7 +443,7 @@ def main():
         r, _, _ = _sel.select([lisa.fd], [], [], 1.0)
         check("go-fail-quiet", not r)
         check("go-fail-alive", is_banner(lisa.command("HELLO")))
-        lisa.send_line("GET sub%20dir:x.bin")
+        lisa.send_line("GET sub%20dir/x.bin")
         lisa.read_line()                          # OK 3
         lisa.send_line("N 0")                     # our GO was lost: NAK of chunk 0
         sq, pl, _ = lisa.recv_chunk()
@@ -443,7 +455,7 @@ def main():
         check("go-nak0-verified", (lisa.read_line() or "").startswith("OK 3"))
 
         # 13c. HELLO during the FAIL -> OK handshake: the server re-banners
-        lisa.send_line("GET sub%20dir:x.bin")
+        lisa.send_line("GET sub%20dir/x.bin")
         lisa.read_line()                          # OK 3
         lisa.recv_chunk()
         lisa.send_line("A 0")
@@ -475,7 +487,7 @@ def main():
         # 13e. GET: the ACK of the end-of-file chunk is lost, the DONE
         #      arrives: the server takes the DONE as the ACK and answers
         #      the verdict (no resend of the end-of-file chunk)
-        lisa.send_line("GET sub%20dir:x.bin")
+        lisa.send_line("GET sub%20dir/x.bin")
         lisa.read_line()                          # OK 3
         sq, pl, _ = lisa.recv_chunk()
         lisa.send_line("A %d" % sq)
@@ -541,6 +553,76 @@ def main():
         check("delete-escape-refused", r is not None and r.startswith("ERR 2 "), repr(r))
         r = lisa.command("DELETE")
         check("delete-usage", r is not None and r.startswith("ERR 1 "), repr(r))
+
+        # 13h2. no 32-character limit of the server's own: a 40-character
+        #       name can be put and got; a name the OS refuses (over 255
+        #       bytes) is refused before the OK, with nothing created
+        longname = "a-server-file-name-of-40-characters.bin"[:40]
+        longname = longname + "x" * (40 - len(longname))
+        r = lisa.command("PUT %s 3" % longname)
+        acks = []
+        if r == "OK":
+            acks.append(lisa.send_chunk(0, b"abc"))
+            acks.append(lisa.send_chunk(1, b""))
+            done = lisa.read_line()
+            lisa.send_line("OK 3 %04x" % crc16(b"abc"))
+            time.sleep(0.3)
+        check("longname-put", r == "OK" and acks == ["A 0", "A 1"]
+              and os.path.exists(os.path.join(root, longname)), repr((r, acks)))
+        r = lisa.command("GET %s" % longname)
+        check("longname-get", r == "OK 3", repr(r))
+        if r == "OK 3":
+            lisa.recv_chunk()
+            lisa.send_line("A 0")
+            lisa.recv_chunk()
+            lisa.send_line("A 1")
+            lisa.send_line("DONE 3 %04x" % crc16(b"abc"))
+            lisa.read_line()
+        toolong = "y" * 300
+        r = lisa.command("PUT %s 3" % toolong)
+        check("toolong-refused", r is not None and r.startswith("ERR 13 ")
+              and not os.path.exists(os.path.join(root, toolong[:255])), repr(r)[:70])
+
+        # 13h3. non-ASCII names: the wire is Mac Roman, the Lisa's
+        #       character set.  LIST shows a character the Lisa has as
+        #       itself (e-acute = 0x8E on the wire), one it lacks and a name
+        #       that is not UTF-8 percent-encoded (UTF-8 / raw bytes); every
+        #       name LIST shows can be typed back; a PUT of a Lisa name with
+        #       e-acute makes a UTF-8 name; an error reply naming a
+        #       character the Lisa lacks does not stop the server
+        nd = os.path.join(root, "names")
+        os.mkdir(nd)
+        for n in ("caf\u00e9.txt", "\u4e2d.txt"):
+            with open(os.path.join(nd, n), "wb") as f:
+                f.write(b"abc")
+        with open(os.path.join(nd.encode(), b"raw\xff.txt"), "wb") as f:
+            f.write(b"abc")
+        lisa.send_line("LIST names")
+        listed = []
+        while True:
+            l = lisa.read_line()
+            if l == "DONE":
+                break
+            if l.startswith("F "):
+                listed.append(l.split(" ", 2)[2])
+        check("nonascii-list", sorted(listed) == sorted(
+            ["caf\u00e9.txt", "%E4%B8%AD.txt", "raw%FF.txt"]), repr(listed))
+        for n in listed:
+            r = lisa.command("SUM names/%s B" % n)
+            check("nonascii-typed-back " + n.encode("unicode_escape").decode(),
+                  r is not None and r.startswith("OK 3 "), repr(r))
+        r = lisa.command("PUT names/na\u00efve.bin 3")
+        if r == "OK":
+            lisa.send_chunk(0, b"abc")
+            lisa.send_chunk(1, b"")
+            lisa.read_line()
+            lisa.send_line("OK 3 %04x" % crc16(b"abc"))
+            time.sleep(0.3)
+        check("nonascii-put-utf8", os.path.exists(os.path.join(nd, "na\u00efve.bin")), repr(r))
+        r = lisa.command("GET names/%E9%9B%BB.txt")
+        check("nonascii-error-reply", r is not None and r.startswith("ERR 11 ")
+              and r.endswith("?.txt"), repr(r))
+        check("nonascii-server-alive", is_banner(lisa.command("HELLO")))
 
         # 13i. GET <name> T: the finished Lisa text pages (lisa_pages), whole
         #      1024-byte pages, verified like any GET; a bad mode is refused

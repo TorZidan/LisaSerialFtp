@@ -23,9 +23,11 @@ slow Lisa: after each MORE it waits before answering NEXT.
 Run:  python3 tests/test_list_paging.py
 """
 
+import atexit
 import os
 import pty
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,7 +82,7 @@ def start(root, extra=()):
     master, slave = pty.openpty()
     env = dict(os.environ, LISAFTP_FD=str(slave))
     proc = subprocess.Popen(
-        [sys.executable, SERVER, "--port", "x", "--root", root] + list(extra),
+        [sys.executable, SERVER, "--port", "x", "--home_dir", root] + list(extra),
         pass_fds=[slave], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.close(slave)
@@ -128,10 +130,12 @@ def read_listing(link, hold=0.0, skip_first_more=False):
 
 def main():
     root = tempfile.mkdtemp(prefix="lisaftp_list_")
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     for i in range(NFILES):
         with open(os.path.join(root, "LisaListPagingFile%02d.text" % i), "w") as f:
             f.write("x" * (i * 37))
     small = tempfile.mkdtemp(prefix="lisaftp_small_")
+    atexit.register(shutil.rmtree, small, True)   # deleted when the test ends
     open(os.path.join(small, "one.text"), "w").close()
 
     # 1. paging, with a slow Lisa

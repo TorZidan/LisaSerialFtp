@@ -3,13 +3,16 @@
 LisaSerialFtpServer.py -- serial file server for the Apple Lisa RS-232 driver.
 
 Runs on the modern side of an RS-232 link (USB-serial adapter or real
-serial port).  The Lisa side opens the built-in serial device files
-RS232A / RS232B (see LISA_OS/OS/source-fsui1.text.unix.txt, the Alias
-procedure maps them to #10#1 / #10#2) and speaks the LISA-SERIAL-FTP/v1.0 line
+serial port).  The Lisa side opens its built-in serial device RS232B,
+Port B, the only port the client supports (see
+LISA_OS/OS/source-fsui1.text.unix.txt: the Alias procedure maps RS232A /
+RS232B to #10#1 / #10#2) and speaks the LISA-SERIAL-FTP/v1.0 line
 protocol implemented here, so it can LIST, GET and PUT files on this
 machine.
 
-POSIX only (termios).  No third-party dependencies.
+Linux and macOS: the standard library only (termios).  Windows: needs
+pyserial for the serial port (pip install pyserial); --port is then a
+COM port such as COM3.
 
 Protocol summary (full spec in README.md):
   * ASCII command lines, CRLF terminated, case-insensitive.
@@ -45,7 +48,7 @@ Protocol summary (full spec in README.md):
     asked the user): "OK deleted", or ERR 11 (no such file), 12 (a folder:
     never deleted), 13 (the OS refused); refused with --read-only.
   * DELTESTS deletes the files the Lisa test macro uploaded: only plain
-    files directly in <root>/tests whose names start with "lisatest-"
+    files directly in <home_dir>/tests whose names start with "lisatest-"
     (any case), nothing else.  Answers "OK <n> deleted".
   * DEBUG ON / DEBUG OFF (answered "OK debug on|off") switches the
     server's console output, like the client's own 'debug' command.  Off:
@@ -87,26 +90,34 @@ Protocol summary (full spec in README.md):
     reply is expected means the peer crashed and restarted; the server
     abandons the transfer (removing any partial PUT file) and answers
     with a fresh banner, so the new session can continue.
-  * Path separator in names is ':' (Lisa style); the server maps it to
-    '/' under the configured root directory.
+  * Path separator in names is '/', under the shared folder (--home_dir)
+    (':' is just a character).
 
 Example:
     python3 LisaSerialFtpServer.py --port /dev/ttyUSB0 --baud 57600 \
-        --root /home/my_username/lisa-share
+        --home_dir /home/my_username/lisa-share
 """
 
 import argparse
 import errno
-import fcntl
 import io
 import os
 import random
 import select
 import sys
-import termios
 import time
-import tty
 import urllib.parse
+
+# Linux / macOS: the serial port through termios (the standard library).
+# Windows has no termios: there the port goes through pyserial (pip
+# install pyserial), the only case that needs a package (PySerialPort).
+try:
+    import fcntl
+    import termios
+    import tty
+    POSIX = True
+except ImportError:
+    POSIX = False
 
 VERSION = "v1.0"            # the server's version; the 1 is the MAJOR
                             # version: the client warns when its own major
@@ -180,11 +191,7 @@ SAFE_CHARS = set(
 # The rates the Lisa can use too: 57600 is the most its serial driver can
 # set (at 115200 its baud-rate generator time constant would be -1; see
 # README, "Baud rate").
-BAUDS = {
-    300: termios.B300, 600: termios.B600, 1200: termios.B1200,
-    2400: termios.B2400, 4800: termios.B4800, 9600: termios.B9600,
-    19200: termios.B19200, 38400: termios.B38400, 57600: termios.B57600,
-}
+BAUDS = (300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600)
 
 # --------------------------------------------------------------------------
 # CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, no final xor)
@@ -283,15 +290,39 @@ def lisa_pages(data):
     return bytes(out)
 
 
+# Lines on the wire are Mac Roman, the Lisa's character set (as in
+# LisaFileSystemTool): a byte 0x8E is 'e-acute' on the Lisa and here.
+WIRE = "mac_roman"
+
+
 def enc(name):
-    """Percent-encode a file name for the wire (Lisa names are short, but
-    spaces and other characters are possible)."""
-    return "".join(c if c in SAFE_CHARS else "%{:02X}".format(ord(c))
-                   for c in name)
+    """A server file name as the Lisa sees it (LIST): letters, digits and
+    ._-~ as they are; a character the Lisa has (Mac Roman 0x80..0xFF, e.g.
+    e-acute) as itself, so the Lisa shows it; everything else (spaces,
+    other ASCII punctuation, characters the Lisa lacks, bytes that are not
+    UTF-8) percent-encoded as UTF-8 bytes, e.g. %20 or %E4%B8%AD.  dec()
+    reverses it, so any name LIST shows can be typed back."""
+    out = []
+    for c in name:
+        if c in SAFE_CHARS:
+            out.append(c)
+            continue
+        if c >= "\x80" and c != "\xa0" and not "\udc80" <= c <= "\udcff":
+            try:
+                c.encode(WIRE)
+                out.append(c)
+                continue
+            except UnicodeEncodeError:
+                pass
+        out.extend("%{:02X}".format(b) for b in c.encode("utf-8", "surrogateescape"))
+    return "".join(out)
 
 
 def dec(s):
-    return urllib.parse.unquote(s)
+    """A name from the wire (already Mac Roman -> text): %XX escapes are
+    UTF-8 bytes; bytes that are not UTF-8 stay as they are on disk
+    (surrogateescape, as os.listdir gives them)."""
+    return urllib.parse.unquote(s, errors="surrogateescape")
 
 
 class ProtocolError(Exception):
@@ -316,7 +347,10 @@ class PeerRestarted(Exception):
 # Serial port (POSIX, termios, raw mode)
 # --------------------------------------------------------------------------
 
-class SerialPort:
+class PosixSerialPort:
+    """The serial port on Linux / macOS (termios, non-blocking reads with
+    select).  PySerialPort is the same for Windows."""
+
     def __init__(self, port, baud, debug=False):
         self.port = port
         self.path = port            # reopened by this path (see wait_back)
@@ -372,7 +406,7 @@ class SerialPort:
         # the per-chunk CRC-16 catches far more than parity would).
         attrs[2] &= ~(termios.PARENB | termios.CSTOPB | termios.CSIZE)
         attrs[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
-        bconst = BAUDS[baud]
+        bconst = getattr(termios, "B%d" % baud)
         attrs[2] |= bconst          # cflag baud
         attrs[4] = bconst           # ispeed
         attrs[5] = bconst           # ospeed
@@ -509,6 +543,147 @@ class SerialPort:
             pass
 
 
+class PySerialPort:
+    """The serial port on Windows, through pyserial (pip install pyserial):
+    the same methods as PosixSerialPort, so the server does not see the
+    difference.  --port is a COM port name, e.g. COM3."""
+
+    def __init__(self, port, baud, debug=False):
+        try:
+            import serial
+        except ImportError:
+            sys.exit("On Windows the server needs pyserial for the serial "
+                     "port: pip install pyserial")
+        self.serial = serial
+        self.port = port
+        self.path = port
+        self.baud = baud
+        self.debug = debug
+        self.pending = b""
+        self.ser = None
+        self._open_wait()
+
+    def _open(self):
+        # 8N1, no XON/XOFF and no hardware handshake, as on Linux / macOS;
+        # timeouts are set per read and write
+        self.ser = self.serial.Serial(
+            port=self.path, baudrate=self.baud, bytesize=8, parity="N",
+            stopbits=1, xonxoff=False, rtscts=False, dsrdtr=False,
+            timeout=0, write_timeout=60.0)
+
+    def _not_there(self, e):
+        """True if the SerialException means the port does not exist
+        (yet): e.g. the adapter is not plugged in."""
+        # pyserial: on Linux / macOS the OS errno; on Windows a message
+        # like "could not open port 'COM3': FileNotFoundError(2, 'The
+        # system cannot find the file specified.', ...)"
+        if getattr(e, "errno", None) in (errno.ENOENT, errno.ENXIO, errno.ENODEV):
+            return True
+        text = str(e)
+        return ("FileNotFoundError" in text or "No such file" in text
+                or "cannot find the file" in text)
+
+    def _open_wait(self, poll=1.0):
+        """Open the port; if it is not there yet, say so once and check
+        again every POLL seconds.  Other errors stop the server."""
+        said = False
+        while True:
+            try:
+                self._open()
+                if said:
+                    print("serial port %s: found it" % self.path, flush=True)
+                return
+            except self.serial.SerialException as e:
+                if not self._not_there(e):
+                    raise OSError(str(e))
+                if not said:
+                    print("serial port %s is not there; waiting for it.  "
+                          "Ctrl-C to stop." % self.path, flush=True)
+                    said = True
+                time.sleep(poll)
+
+    def set_baud(self, baud):
+        """Switch the port to another rate (BAUD, and back)."""
+        self.baud = baud
+        self.ser.baudrate = baud
+
+    def wait_back(self, poll=1.0):
+        """The port went away (e.g. the adapter was unplugged): reopen it
+        by its name once it is back."""
+        while True:
+            time.sleep(poll)
+            self.close()
+            try:
+                self._open()
+                return
+            except self.serial.SerialException:
+                continue              # not there (yet)
+
+    def read(self, n, timeout):
+        """Read exactly n bytes or raise TimeoutError / ClientGone."""
+        buf = self.pending[:n]
+        self.pending = self.pending[n:]
+        deadline = time.monotonic() + timeout
+        while len(buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("read timeout after %d bytes" % len(buf))
+            try:
+                # 0.2 s slices: the timeout is set only when it changes
+                # (each change is an OS call on Windows)
+                t = 0.2 if remaining >= 0.2 else remaining
+                if self.ser.timeout != t:
+                    self.ser.timeout = t
+                buf += self.ser.read(n - len(buf))
+            except self.serial.SerialException as e:
+                raise ClientGone("port error: %s" % e)
+        return buf
+
+    def write(self, data):
+        """Write all of data; TimeoutError if it does not go out within
+        60 s (e.g. a long LIST while the peer is gone)."""
+        try:
+            self.ser.write(data)
+        except self.serial.SerialTimeoutException:
+            raise TimeoutError("write timeout: port not draining")
+        except self.serial.SerialException as e:
+            raise ClientGone("port error: %s" % e)
+
+    def drain(self, limit=2.0):
+        """Wait until everything written has left the PC (the bytes still
+        queued for output, polled every ms), at most LIMIT seconds."""
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline:
+            try:
+                if not self.ser.out_waiting:
+                    return
+            except self.serial.SerialException:
+                return
+            time.sleep(0.001)
+
+    def flush_input(self):
+        """Discard received-but-unread bytes."""
+        self.pending = b""
+        try:
+            self.ser.reset_input_buffer()
+        except self.serial.SerialException:
+            pass
+
+    def close(self):
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except self.serial.SerialException:
+                pass
+
+
+# LISAFTP_PYSERIAL=1 uses pyserial on Linux / macOS too: the tests run the
+# Windows code that way (tests/test_pyserial_port.py)
+SerialPort = (PosixSerialPort if POSIX and not os.environ.get("LISAFTP_PYSERIAL")
+              else PySerialPort)
+PORT_SETUP_ERRORS = (termios.error,) if POSIX else ()   # see main
+
+
 # --------------------------------------------------------------------------
 # Server
 # --------------------------------------------------------------------------
@@ -611,7 +786,7 @@ class LisaFtpServer:
 
     def __init__(self, args):
         self.args = args
-        self.root = os.path.realpath(args.root)
+        self.home_dir = os.path.realpath(args.home_dir)
         self.chunk = CHUNK
         self.timeout = args.timeout
         self.max_retries = MAX_RETRIES
@@ -638,11 +813,13 @@ class LisaFtpServer:
         if len(line) > MAX_LINE:
             # The Lisa client holds lines in string[255] and would drop
             # the excess chars silently; truncate here instead.  The tail
-            # is always the expendable part (names, error text, root path).
+            # is always the expendable part (names, error text, home_dir path).
             self.dlog("line truncated to %d chars: %r"
                           % (MAX_LINE, line))
             line = line[:MAX_LINE]
-        self.port.write(line.encode("ascii") + b"\r\n")
+        # a character the Lisa does not have becomes '?' (never an error:
+        # a reply must not stop the server)
+        self.port.write(line.encode(WIRE, "replace") + b"\r\n")
         self.dlog("sent: " + line)
 
     def read_line(self, timeout, quiet=False):
@@ -660,7 +837,7 @@ class LisaFtpServer:
                 return None          # idle timeout
             buf += b
             if b == b"\n":
-                line = buf[:-1].rstrip(b"\r").decode("ascii", "replace")
+                line = buf[:-1].rstrip(b"\r").decode(WIRE)
                 if len(line) > 1024:
                     self.dlog("line too long, dropped")
                     return ""
@@ -669,20 +846,20 @@ class LisaFtpServer:
                 return line
 
     def send_banner(self):
-        # The root path is the only part of the banner that can exceed
+        # The home_dir path is the only part of the banner that can exceed
         # MAX_LINE, so truncate it there (the client only displays the
         # banner), keeping the chunk= field intact.  It is sent as it is,
         # not percent-encoded, so it is readable on the Lisa (nothing
         # parses it); only characters outside printable ASCII, which the
         # line cannot carry, are shown as '?'.
         head = "Hi from Lisa Serial FTP Server version %s : " % PROTOCOL
-        shown = "".join(c if " " <= c <= "~" else "?" for c in self.root)
-        root = "root_folder=%s " % shown
+        shown = "".join(c if " " <= c <= "~" else "?" for c in self.home_dir)
+        home = "home_dir=%s " % shown
         tail = "chunk_size=%d" % self.chunk
         room = MAX_LINE - len(head) - len(tail)
-        if len(root) > room:
-            root = root[:room]
-        self.send_line(head + root + tail)
+        if len(home) > room:
+            home = home[:room]
+        self.send_line(head + home + tail)
 
     def abort(self, text):
         """Tell the peer the transfer is dead; it must answer OK.
@@ -776,7 +953,7 @@ class LisaFtpServer:
                 break
             if b != b"\r":
                 buf += b
-        return buf.decode("ascii", "replace")
+        return buf.decode(WIRE)
 
     # -- path safety -------------------------------------------------------
 
@@ -784,16 +961,16 @@ class LisaFtpServer:
         name = dec(name.strip())
         if not name:
             raise ProtocolError(1, "empty name")
-        # ':' is the Lisa path separator -> '/'
-        rel = name.replace(":", "/").lstrip("/")
+        # '/' is the separator; the name is under home_dir
+        rel = name.lstrip("/")
         if ".." in rel.split("/"):
             raise ProtocolError(2, "bad name")
-        for part in rel.split("/"):
-            if len(part) > 32:
-                raise ProtocolError(3, "name component longer than 32 chars")
-        p = os.path.realpath(os.path.join(self.root, rel))
-        if p != self.root and not p.startswith(self.root + os.sep):
-            raise ProtocolError(2, "name escapes root")
+        # no length limit of our own: the OS's applies (a name it refuses
+        # is an error reply); the Lisa's 32 characters are the client's
+        # concern, for the names it stores
+        p = os.path.realpath(os.path.join(self.home_dir, rel))
+        if p != self.home_dir and not p.startswith(self.home_dir + os.sep):
+            raise ProtocolError(2, "name outside the shared folder (--home_dir)")
         return p
 
     # -- commands ----------------------------------------------------------
@@ -803,18 +980,18 @@ class LisaFtpServer:
         self.send_banner()
         self.say("  ok: banner sent")
 
-    TEST_DIR = "tests"          # DELTESTS: the folder (under the root) ...
+    TEST_DIR = "tests"          # DELTESTS: the folder (under home_dir) ...
     TEST_PREFIX = "lisatest-"   # ... and the name prefix it may delete
 
     def cmd_deltests(self, args):
         """Hidden command used by the Lisa test macro (the client's
         'delete-test-files'): delete the files it uploaded.  Deliberately
-        narrow -- only plain files directly in <root>/tests whose names
+        narrow -- only plain files directly in <home_dir>/tests whose names
         start with 'lisatest-' (any case); never a folder, never anything
         outside tests/, so the test scripts there cannot be touched."""
         if self.readonly:
             raise ProtocolError(20, "server is read-only")
-        d = os.path.join(self.root, self.TEST_DIR)
+        d = os.path.join(self.home_dir, self.TEST_DIR)
         if not os.path.isdir(d):
             raise ProtocolError(10, "no tests folder on the server")
         n = 0
@@ -909,7 +1086,7 @@ class LisaFtpServer:
         self.say("  ok: answered after %g s" % CAL_SECONDS)
 
     def cmd_list(self, args):
-        d = self.safe_path(args[0]) if args else self.root
+        d = self.safe_path(args[0]) if args else self.home_dir
         if not os.path.isdir(d):
             raise ProtocolError(10, "no such directory on server: %s" % d)
         self._page = 0
@@ -1283,6 +1460,13 @@ class LisaFtpServer:
         d = os.path.dirname(p)
         if not os.path.isdir(d):
             raise ProtocolError(10, "no such directory")
+        # create the file before the OK: a name the OS refuses (too long,
+        # a character it does not allow) is then an error reply, not a
+        # failure in the middle of the transfer
+        try:
+            f = open(p, "wb")
+        except OSError as e:
+            raise ProtocolError(13, "cannot create %s: %s" % (p, e.strerror))
         self.prog_start(size)
         self.tm_reset()
         self.send_line("OK")
@@ -1293,7 +1477,7 @@ class LisaFtpServer:
         giveup = False
         t_acked = None                  # our last ACK left the PC (timing)
         try:
-            with open(p, "wb") as f:
+            with f:
                 while not giveup:
                     # 1. First byte of a chunk, long timeout: if the whole
                     #    chunk was lost, the peer retransmits it after
@@ -1521,8 +1705,8 @@ class LisaFtpServer:
             except TimeoutError:
                 return None
             if b != b"T":
-                line = (b + self._read_rest_of_line().encode("ascii", "replace"))
-                line = line.rstrip(b"\r\n").decode("ascii", "replace")
+                line = (b + self._read_rest_of_line().encode(WIRE))
+                line = line.rstrip(b"\r\n").decode(WIRE)
                 self.dlog("received: " + line)
                 return line
             try:
@@ -1574,7 +1758,7 @@ class LisaFtpServer:
                 continue              # idle or partial line: keep waiting
             parts = line.split()
             cmd = parts[0].upper() if parts else ""
-            if cmd not in self.KNOWN or not all(" " <= c <= "~" for c in line):
+            if cmd not in self.KNOWN or any(c < " " or c == "\x7f" for c in line):
                 # bytes sent at another rate: back to the old rate (on
                 # trial) or to the startup rate, where the client may be
                 if self._confirm_until is not None:
@@ -1642,8 +1826,8 @@ class LisaFtpServer:
                     self.say("")
 
     def run(self):
-        self.say("%s listening on %s at %d baud, root=%s, debug output %s"
-                 % (PROTOCOL, self.args.port, self.args.baud, self.root,
+        self.say("%s listening on %s at %d baud, home_dir=%s, debug output %s"
+                 % (PROTOCOL, self.args.port, self.args.baud, self.home_dir,
                     "on" if self.debug_on else "off"))
         try:
             self.send_banner()
@@ -1679,26 +1863,31 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   LisaEm, Serial B set to PseudoTTY named /tmp/lisaem-port-b:
-    python3 LisaSerialFtpServer.py --port /tmp/lisaem-port-b --root ~/lisa-share
+    python3 LisaSerialFtpServer.py --port /tmp/lisaem-port-b --home_dir ~/lisa-share
 
   a real Lisa on a USB-serial adapter, with debug output:
     python3 LisaSerialFtpServer.py --port /dev/ttyUSB0 --baud 57600 \\
-        --root ~/lisa-share --debug
+        --home_dir ~/lisa-share --debug
+
+  the same on Windows (needs: pip install pyserial):
+    python LisaSerialFtpServer.py --port COM3 --home_dir C:\\lisa-share
 
 The baud rate must match the Lisa's (57600 by default); the client's 'baud'
 command then changes it on both sides (BAUD), and QUIT goes back to it.""")
     req = ap.add_argument_group("required arguments")
     req.add_argument("--port", required=True, metavar="DEVICE",
                      help="the serial device connected to the Lisa, e.g. "
-                          "/dev/ttyUSB0, or LisaEm's PseudoTTY link such as "
-                          "/tmp/lisaem-port-b")
+                          "/dev/ttyUSB0 (Windows: COM3), or LisaEm's PseudoTTY "
+                          "link such as /tmp/lisaem-port-b")
     # list the required arguments first in the help, before the options
     ap._action_groups.insert(1, ap._action_groups.pop())
     ap.add_argument("--baud", type=int, default=57600, choices=sorted(BAUDS),
                     help="baud rate (default 57600, the Lisa's "
-                         "maximum; see README for Port A limits)")
-    ap.add_argument("--root", default=".",
-                    help="directory shared to the Lisa (default: cwd)")
+                         "maximum on Port B, the only port the client uses)")
+    ap.add_argument("--home_dir", default=".",
+                    help="the folder shared with the Lisa: its files and "
+                         "subfolders are what the Lisa sees (default: the "
+                         "current folder)")
     ap.add_argument("--timeout", type=float, default=15.0,
                     help="timeout in seconds for command/abort replies "
                          "(default 15); the per-chunk loss-recovery "
@@ -1722,13 +1911,13 @@ command then changes it on both sides (BAUD), and QUIT goes back to it.""")
         ap.print_help()             # no arguments: show how to use it
         sys.exit(2)
     args = ap.parse_args()
-    if not os.path.isdir(args.root):
-        ap.error("root directory does not exist: %s" % args.root)
+    if not os.path.isdir(args.home_dir):
+        ap.error("--home_dir: no such folder: %s" % args.home_dir)
     try:
         LisaFtpServer(args).run()
     except KeyboardInterrupt:
         pass                        # Ctrl-C while waiting for the port
-    except termios.error as e:
+    except PORT_SETUP_ERRORS as e:
         sys.exit("cannot set up %s: %s" % (args.port, e))
     except OSError as e:
         sys.exit("cannot open %s: %s" % (args.port, e))

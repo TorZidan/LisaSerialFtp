@@ -15,9 +15,11 @@ of stopping with "No such file or directory".
 Run:  python3 tests/test_wait_for_port.py
 """
 
+import atexit
 import os
 import pty
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,13 +60,14 @@ def read_until(fd, needle, timeout):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="lisaftp_wait_")
+    atexit.register(shutil.rmtree, tmp, True)   # deleted when the test ends
     port = os.path.join(tmp, "b")
     env = dict(os.environ)
     env.pop("LISAFTP_FD", None)
 
     # 1. the port is not there: the server waits
     proc = subprocess.Popen(
-        [sys.executable, SERVER, "--port", port, "--root", tmp],
+        [sys.executable, SERVER, "--port", port, "--home_dir", tmp],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     out = read_until(proc.stdout.fileno(), b"waiting for it", 5)
     check("waits-message", b"is not there" in out and b"waiting for it" in out,
@@ -90,7 +93,7 @@ def main():
     with open(port, "w") as f:
         f.write("x")
     proc = subprocess.Popen(
-        [sys.executable, SERVER, "--port", port, "--root", tmp],
+        [sys.executable, SERVER, "--port", port, "--home_dir", tmp],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     try:
         out, _ = proc.communicate(timeout=10)

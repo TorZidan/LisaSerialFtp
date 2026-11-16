@@ -1,6 +1,6 @@
 $EXEC
 ${Round-trip test of LisaSerialFtpClient, run on the Lisa.}
-${Needs: LisaSerialFtpServer.py running with --root at the project}
+${Needs: LisaSerialFtpServer.py running with --home_dir at the project}
 ${folder (the one holding the tests folder), and LisaSerialFtpClient.OBJ}
 ${on the Lisa.  Files it makes on the Lisa: LisaFtpClientTestFile1.text,}
 ${LisaFtpClientTestFile2.text and LisaFtpClientTestFile3.text.}
@@ -35,12 +35,12 @@ R{un}LisaSerialFtpClient.OBJ
 timeout-factor 5
 timeout-factor auto
 debug on
-get tests:test_lisaftp.py LisaFtpClientTestFile1.text
+get tests/test_lisaftp.py LisaFtpClientTestFile1.text
 quit
 $DOIT
 $
 $IF NOT (EXISTS('LisaFtpClientTestFile1.text')) THEN
-$  WRITELN 'TEST FAILED: get tests:test_lisaftp.py did not create LisaFtpClientTestFile1.text'
+$  WRITELN 'TEST FAILED: get tests/test_lisaftp.py did not create LisaFtpClientTestFile1.text'
 $ELSE
 $  WRITELN 'test 1 passed: LisaFtpClientTestFile1.text received'
 $
@@ -56,13 +56,13 @@ R{un}LisaSerialFtpClient.OBJ
 timeout-factor 5
 timeout-factor auto
 debug on
-put LisaFtpClientTestFile1.text tests:lisatest-upload1.txt
-put -c LisaFtpClientTestFile1.text tests:lisatest-upload1.txt
-get tests:lisatest-upload1.txt LisaFtpClientTestFile2.text
-get -c tests:lisatest-upload1.txt LisaFtpClientTestFile2.text
-get -c tests:test_lisaftp.py LisaFtpClientTestFile1.text
-get -c tests:test_sum.py LisaFtpClientTestFile3.text
-get -c tests:test_lisaftp.py LisaFtpClientTestFile3.text
+put LisaFtpClientTestFile1.text tests/lisatest-upload1.txt
+put -c LisaFtpClientTestFile1.text tests/lisatest-upload1.txt
+get tests/lisatest-upload1.txt LisaFtpClientTestFile2.text
+get -c tests/lisatest-upload1.txt LisaFtpClientTestFile2.text
+get -c tests/test_lisaftp.py LisaFtpClientTestFile1.text
+get -c tests/test_sum.py LisaFtpClientTestFile3.text
+get -c tests/test_lisaftp.py LisaFtpClientTestFile3.text
 delete-test-files
 quit
 $DOIT

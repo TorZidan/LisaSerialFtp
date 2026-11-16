@@ -4,12 +4,14 @@ PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
 { LisaSerialFtpClient -- file transfer client for the Apple Lisa RS-232    }
 { driver.                                                                  }
 {                                                                          }
-{ Runs on the Lisa.  MOUNTs the built-in serial device (RS232A or RS232B   }
-{ -- see the Alias procedure in LISA_OS/OS/source-fsui1, which maps them   }
-{ to #10#1 / #10#2), configures it with DEVICE_CONTROL under its PnP name  }
-{ '-RS232B', opens it as '-RS232B-XYZ', and speaks the LISA-SERIAL-FTP    }
-{ protocol with LisaSerialFtpServer.py on the other end of the line, so    }
-{ files can be listed, read and written across the link.                   }
+{ Runs on the Lisa.  MOUNTs the built-in serial device RS232B, Port B      }
+{ (see the Alias procedure in LISA_OS/OS/source-fsui1, which maps RS232A   }
+{ and RS232B to #10#1 / #10#2).  Port B only: the port is hard-coded       }
+{ (devname); Port A is not supported.  It configures the port with         }
+{ DEVICE_CONTROL under its PnP name '-RS232B', opens it as '-RS232B-HI',   }
+{ and speaks the LISA-SERIAL-FTP protocol with LisaSerialFtpServer.py on   }
+{ the other end of the line, so files can be listed, read and written      }
+{ across the link.                                                         }
 {                                                                          }
 { Commands (typed at the console prompt):                                  }
 {   list [dir]         list files on the server                            }
@@ -37,8 +39,8 @@ PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
 { Notes:                                                                   }
 {   * The server must already be running at the same baud rate             }
 {     (default 57600, 8N1).                                                }
-{   * Remote names use ':' as the path separator (Lisa style); the         }
-{     server maps it to '/' under its root directory.                      }
+{   * Remote names use '/' as the path separator, as on the server (the   }
+{     Lisa itself does not: there '/' is just a character in a name).      }
 {   * get as text writes a proper Lisa text file (CRLF/LF line-endings     }
 {     become Lisa text lines): the server sends the finished text pages    }
 {     (GET <name> T), and the client puts them after the header page it    }
@@ -88,9 +90,9 @@ USES
     {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
 
 CONST
-  BUILD = '2026-11-16 v1.0: baud on both sides';  { printed at startup, so it is easy
+  BUILD = '2026-11-15 15:45';  { printed at startup, so it is easy
                                  to see which build runs; change it with each change }
-  BAUD     = 57600;           { the maximum; Port B only (Port A: 9600 or lower) }
+  BAUD     = 57600;           { the maximum (Port B, the only port this client uses) }
   VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.
                                 The server's banner names its own, after PROTONAM
                                 ('LISA-SERIAL-FTP/v1.0'); if its major version
@@ -108,6 +110,7 @@ CONST
   MAXRETRY = 10;              { give up a chunk after this many failed tries;
                                 equals MAX_RETRIES in LisaSerialFtpServer.py }
   MAXLINE  = 255;             { Lisa Pascal's max string length }
+  MAXNAME  = 32;              { the longest Lisa file name (max_ename in syscall) }
   { Loss-recovery timeouts, in REAL seconds.  DEVICE_CONTROL code 14 takes
     the timeout in (emulated) SECONDS (the RS232 driver multiplies it by
     1000 for its ms alarm -- see source-rs232, dcontrol 14); every timeout
@@ -889,7 +892,7 @@ PROCEDURE BaseName (SRC: string255; VAR DST: string255);
 VAR j: integer;
 BEGIN
   j := LENGTH(SRC);
-  WHILE (j > 0) AND (SRC[j] <> ':') DO j := j - 1;
+  WHILE (j > 0) AND (SRC[j] <> '/') DO j := j - 1;   { remote names: '/' }
   IF j = 0 THEN
     DST := SRC
   ELSE
@@ -923,18 +926,32 @@ BEGIN
   WHILE (j > 1) AND (SRC[j] <> '-') DO j := j - 1;
   IF (j >= 1) AND (SRC[j] = '-') AND (j < n) THEN
   BEGIN
-    IF n - j > 31 THEN
-      LEAF := COPY(SRC, j + 1, 31)
+    IF n - j > MAXNAME THEN
+      LEAF := COPY(SRC, j + 1, MAXNAME)
     ELSE
       LEAF := COPY(SRC, j + 1, n - j);
   END
   ELSE
   BEGIN
-    IF n > 31 THEN
-      LEAF := COPY(SRC, 1, 31)
+    IF n > MAXNAME THEN
+      LEAF := COPY(SRC, 1, MAXNAME)
     ELSE
       LEAF := SRC;
   END;
+END;
+
+{ The length of the file name in a local pathname (after the last '-',
+  as LeafNameOf): get checks it against MAXNAME before it starts. }
+FUNCTION LeafLen (SRC: pathname): integer;
+VAR j: integer; n: integer;
+BEGIN
+  n := LENGTH(SRC);
+  j := n;
+  WHILE (j > 1) AND (SRC[j] <> '-') DO j := j - 1;
+  IF (j >= 1) AND (SRC[j] = '-') AND (j < n) THEN
+    LeafLen := n - j
+  ELSE
+    LeafLen := n;
 END;
 
 { TRUE if NAME ends with '.TEXT' in any case ('.text', '.Text', ...) }
@@ -1798,7 +1815,8 @@ END;
   ends with MORE, and only when we answer NEXT (having read the page) does
   the next one come.  Waiting for a key in the middle would keep the
   server waiting too long, so the whole listing is first read into lbuf
-  and then shown screen by screen. }
+  and then shown screen by screen.  A long listing shows a '.' per page
+  as it comes in, so it does not look like a hang. }
 PROCEDURE DoList (dir: string255);
 VAR j, k, n, nl, np: integer; full: boolean;
 BEGIN
@@ -1827,6 +1845,13 @@ BEGIN
     BEGIN
       SendRaw('NEXT');           { this page is read: send the next one }
       np := np + 1;
+      { progress: a '.' per page (the next page arrives meanwhile; it
+        fits the type-ahead buffer).  Not with debug on: its lines. }
+      IF NOT debugon THEN
+      BEGIN
+        IF np = 2 THEN WRITE('receiving a long listing ');
+        WRITE('.');
+      END;
     END
     ELSE IF l <> 'DONE' THEN
       IF lbused + LENGTH(l) + 1 <= LISTBUF THEN
@@ -1844,6 +1869,8 @@ BEGIN
         full := TRUE;
   UNTIL l = 'DONE';
   logrx := TRUE;
+  IF (np > 1) AND NOT debugon THEN
+    WRITELN(' ', np:1, ' pages');
   IF debugon THEN
     WRITELN('    received: ', nl:1, ' entries in ', np:1, ' page(s), then DONE');
   PageStart;
@@ -1876,6 +1903,8 @@ PROCEDURE ShowHelp;
 BEGIN
   WRITELN('commands:');
   WRITELN('  list [dir]            list files on the server');
+  WRITELN('  !list [name]          list all filenames starting with [name] on the');
+  WRITELN('                        default volume');
   WRITELN('  get [-c] [-b|-t] <remote> [local]  download: as text (CRLF/LF -> CR)');
   WRITELN('                        if the local or remote name ends in .TEXT,');
   WRITELN('                        else byte-exact');
@@ -1885,7 +1914,6 @@ BEGIN
   WRITELN('                        end in LF), any other file byte-exact');
   WRITELN('      -c: skip it if the server''s copy is the same as the local one');
   WRITELN('      -b: send as binary (byte-exact) / -t: send as a text file');
-  WRITELN('  !list [name]          list all files on the default volume (prefix match)');
   WRITELN('  delete <remote>       delete a file on the server (asks Y/N); also del');
   WRITELN('  !delete <local>       delete a file on the Lisa (asks Y/N); also !del');
   WRITELN('  baud [rate]           show or change the baud rate, here and on the server');
@@ -3032,9 +3060,9 @@ BEGIN
   { WRITELN('port state: parity=', cparm.dcdata[0], ' outHS=', cparm.dcdata[1],
           ' baud=', cparm.dcdata[2], ' typeahead=', cparm.dcdata[4]); }
 
-  { OPEN wants a file component, so we open '-RS232B-XYZ'
+  { OPEN wants a file component, so we open '-RS232B-HI'
     (a dummy name the driver ignores). }
-  opn := concat(dcpath, '-XYZ');
+  opn := concat(dcpath, '-HI');
   e := 0;
   OPEN(e, opn, refnum, [dread, dwrite]);
   IF e > 0 THEN
@@ -3951,7 +3979,7 @@ END;
 {--- main --------------------------------------------------------------------}
 
 BEGIN
-  devname := 'RS232B';                { or 'RS232A' }
+  devname := 'RS232B';                { Port B only: hard-coded; Port A is not supported }
   curbaud := BAUD;
   tfactor := 1;                       { a real Lisa; 'timeout-factor auto' measures it }
   curtmo := -1;                       { driver timeout not known yet (SetTmo) }
@@ -4022,12 +4050,34 @@ BEGIN
             BaseName(remote, tname);
             local := tname;
           END;
+          { With no local name, the file would be saved under the remote
+            file name; on the Lisa a '-' separates the parts of a path
+            (-volume-name), so a remote name with '-' would not be the
+            name stored.  Refused, with a suggestion ('-' as '_'). }
+          IF (argb = '') AND (POS('-', local) > 0) THEN
+          BEGIN
+            sname := local;
+            FOR i := 1 TO LENGTH(sname) DO
+              IF sname[i] = '-' THEN sname[i] := '_';
+            WRITELN('error: ', local, ' has a ''-'', which the Lisa reads as a path separator');
+            WRITELN('(-volume-name): give a local name without one, e.g.');
+            WRITELN('get ', remote, ' ', sname);
+          END
+          ELSE
           { -t: text; -b: binary.  Else text if the local name was given
             and ends in .TEXT, or if the remote name ends in .TEXT (any
             case); otherwise binary.  A text download must be saved under a
             .TEXT name (a Lisa text file): refused, with a suggestion, if
-            the local name does not end in .TEXT. }
-          IF tflag OR ((NOT bflag) AND (IsTextName(local) OR IsTextName(remote))) THEN
+            the local name does not end in .TEXT.  A Lisa file name has at
+            most MAXNAME characters: a longer one is refused first. }
+          IF LeafLen(local) > MAXNAME THEN
+          BEGIN
+            WRITELN('error: the Lisa file name is ', LeafLen(local), ' characters long; at most ',
+                    MAXNAME, ' are allowed:');
+            WRITELN('  ', local);
+            WRITELN('give a shorter local name, e.g. get ', remote, ' <name>');
+          END
+          ELSE IF tflag OR ((NOT bflag) AND (IsTextName(local) OR IsTextName(remote))) THEN
           BEGIN
             IF NOT IsTextName(local) THEN
             BEGIN

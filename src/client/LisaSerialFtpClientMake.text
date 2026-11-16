@@ -2,6 +2,9 @@ $EXEC
 $
 ${Fetch the newest sources from the server with the current client}
 ${(LisaSerialFtpServer.py must be running; get replaces the old files)}
+${The server must share THIS folder (src/client of the repository): the}
+${names below are relative to it.  E.g., in the repository folder:}
+${  python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/client}
 R{un}LisaSerialFtpClient.OBJ
 get -c tests/LisaSerialFtpTestMacro.text LisaSerialFtpTestMacro.text
 get -c LisaSerialFtpClientInclude.text

@@ -10,6 +10,13 @@ same identifier.  Collisions that matter:
     syscall unit (its INTERFACE section)
 Local (procedure-body) declarations shadow program scope legally and
 are reported only as informational.
+
+Not a test of the server: a check to run after changing the client.
+Usage (the client and its include file together, then the syscall unit):
+  cat src/client/LisaSerialFtpClient.text \
+      src/client/LisaSerialFtpClientInclude.text > /tmp/client-all.text
+  python3 src/server/tests/audit_8char.py /tmp/client-all.text \
+      <Lisa OS sources>/OS/source-syscall.text.unix.txt
 """
 import re, sys, collections
 

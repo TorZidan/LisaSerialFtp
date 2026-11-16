@@ -21,9 +21,11 @@ one set on it, so the test reads the server's rate from its end of the pty.
 Run:  python3 tests/test_baud.py
 """
 
+import atexit
 import os
 import pty
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,9 +35,13 @@ import time
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tests/..
 SERVER = os.path.join(TOP, "LisaSerialFtpServer.py")
 sys.path.insert(0, TOP)
-from LisaSerialFtpServer import BAUDS   # noqa: E402
 
 failures = []
+
+
+def speed(baud):
+    """termios' code for a rate, as the server sets it on its port."""
+    return getattr(termios, "B%d" % baud)
 
 
 def check(name, cond, info=""):
@@ -72,10 +78,11 @@ class Link:
 
 def main():
     root = tempfile.mkdtemp(prefix="lisaftp_baud_")
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     master, slave = pty.openpty()
     env = dict(os.environ, LISAFTP_FD=str(slave))
     proc = subprocess.Popen(
-        [sys.executable, SERVER, "--port", "x", "--root", root, "--baud", "57600"],
+        [sys.executable, SERVER, "--port", "x", "--home_dir", root, "--baud", "57600"],
         pass_fds=[slave], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # the slave stays open here too: its line speed is the server's rate
@@ -87,51 +94,51 @@ def main():
     try:
         banner = link.read_line()
         check("banner", banner is not None and banner.startswith("H"), repr(banner)[:40])
-        check("start-57600", rate() == BAUDS[57600])
+        check("start-57600", rate() == speed(57600))
 
         # 1. switch, then talk at the new rate
         r = link.ask("BAUD 19200")
         time.sleep(0.5)
         check("baud-ok", r == "OK 19200", repr(r))
-        check("baud-switched", rate() == BAUDS[19200])
+        check("baud-switched", rate() == speed(19200))
         r = link.ask("HELLO")
         check("baud-hello-answered", r is not None and r.startswith("H"), repr(r)[:40])
         time.sleep(1.5)
-        check("baud-kept", rate() == BAUDS[19200])
+        check("baud-kept", rate() == speed(19200))
 
         # 2. a garbled line during the trial: back at once
         r = link.ask("BAUD 9600")
         time.sleep(0.5)
-        check("trial-switched", r == "OK 9600" and rate() == BAUDS[9600], repr(r))
+        check("trial-switched", r == "OK 9600" and rate() == speed(9600), repr(r))
         link.send(b"\xff\x13\x80\xfe")         # no line end: a partial, garbled line
         time.sleep(2.0)
-        check("garbled-back", rate() == BAUDS[19200])
+        check("garbled-back", rate() == speed(19200))
         r = link.ask("HELLO")
         check("garbled-then-hello", r is not None and r.startswith("H"), repr(r)[:40])
 
         # 3. nothing during the trial: back after BAUD_TRIAL (10 s)
         r = link.ask("BAUD 4800")
         time.sleep(0.5)
-        check("silent-switched", r == "OK 4800" and rate() == BAUDS[4800], repr(r))
+        check("silent-switched", r == "OK 4800" and rate() == speed(4800), repr(r))
         time.sleep(11.0)
-        check("silent-back", rate() == BAUDS[19200])
+        check("silent-back", rate() == speed(19200))
         r = link.ask("HELLO")
         check("silent-then-hello", r is not None and r.startswith("H"), repr(r)[:40])
 
         # 4. a garbled line later, not at the startup rate: back to it
         link.send(b"\x80\x81\x82\r\n")
         time.sleep(0.5)
-        check("garbled-to-start", rate() == BAUDS[57600])
+        check("garbled-to-start", rate() == speed(57600))
 
         # 5. QUIT: back to the startup rate
         r = link.ask("BAUD 38400")
         time.sleep(0.5)
         r2 = link.ask("HELLO")
-        check("quit-switched", r == "OK 38400" and rate() == BAUDS[38400]
+        check("quit-switched", r == "OK 38400" and rate() == speed(38400)
               and r2 is not None and r2.startswith("H"), repr((r, r2))[:60])
         link.send(b"QUIT\r\n")
         time.sleep(0.5)
-        check("quit-back", rate() == BAUDS[57600])
+        check("quit-back", rate() == speed(57600))
         r = link.ask("HELLO")
         check("quit-then-hello", r is not None and r.startswith("H"), repr(r)[:40])
 
@@ -142,7 +149,7 @@ def main():
         check("usage", r is not None and r.startswith("ERR 1 "), repr(r))
         r = link.ask("BAUD 57600")
         time.sleep(0.5)
-        check("same-rate", r == "OK 57600" and rate() == BAUDS[57600], repr(r))
+        check("same-rate", r == "OK 57600" and rate() == speed(57600), repr(r))
         r = link.ask("HELLO")
         check("same-rate-hello", r is not None and r.startswith("H"), repr(r)[:40])
         link.send(b"QUIT\r\n")

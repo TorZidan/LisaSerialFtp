@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""Exercise the server's loss-recovery (PUT direction) against a simulated
-Lisa sender that randomly drops bytes in chunks.  Verifies that the file is
-still received correctly (retransmits recover the lost bytes) and that a
-catastrophic loss aborts cleanly instead of hanging."""
+"""
+test_loss_recovery.py -- the server's loss recovery, in both directions,
+against a simulated Lisa whose serial link drops bytes.
+
+  * PUT: the simulated Lisa sender drops 1-3 bytes from some of its chunks;
+    the server must NAK them and still store the exact file.
+  * GET: bytes the server sends are dropped on the way to the simulated
+    Lisa receiver, which NAKs; the file must still arrive exactly.
+  * Both directions with no loss (also a size that is an exact multiple
+    of the chunk size), and the end-of-transfer check failing on purpose
+    (the client says BAD / reports a bad CRC): the transfer must be
+    refused cleanly, not hang.
+
+Run:  python3 src/server/tests/test_loss_recovery.py
+"""
+import atexit
 import os
 import random
+import shutil
 import sys
 import tempfile
 import threading
@@ -137,7 +150,7 @@ def make_server(root):
     s.max_retries = srv.MAX_RETRIES
     s.readonly = False
     s.monkey_wrench = False
-    s.root = root
+    s.home_dir = root
     s.args = None
     return s
 
@@ -190,6 +203,7 @@ def lisa_sender(port, data, chunk, drop_fn, max_retry=1000, lie=False):
 
 def run_case(name, data, drop_fn, lie=False):
     root = tempfile.mkdtemp(prefix="lisaftp_test_")
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     s = make_server(root)
     path = os.path.join(root, "out.bin")
     result = {}
@@ -319,6 +333,7 @@ def lisa_receiver(port, chunk, drop_fn, max_retry=1000, lie=False):
 
 def run_get_case(name, data, drop_fn, lie=False):
     root = tempfile.mkdtemp(prefix="lisaftp_get_")
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     src = os.path.join(root, "src.bin")
     with open(src, "wb") as f:
         f.write(data)

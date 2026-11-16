@@ -21,10 +21,12 @@ and put -c: "SUM name T|B" answers "OK <size> <crc16> <sum16>".
 Run:  python3 tests/test_sum.py
 """
 
+import atexit
 import os
 import pty
 import random
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -162,6 +164,7 @@ def main():
 
     # 3. the server
     root = tempfile.mkdtemp(prefix="lisaftp_sum_")
+    atexit.register(shutil.rmtree, root, True)   # deleted when the test ends
     lf = b"program x;\nbegin\n  writeln('hi');\nend.\n"
     with open(os.path.join(root, "unix.text"), "wb") as f:
         f.write(lf)
@@ -174,7 +177,7 @@ def main():
     master, slave = pty.openpty()
     env = dict(os.environ, LISAFTP_FD=str(slave))
     proc = subprocess.Popen(
-        [sys.executable, SERVER, "--port", "x", "--root", root],
+        [sys.executable, SERVER, "--port", "x", "--home_dir", root],
         pass_fds=[slave], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.close(slave)

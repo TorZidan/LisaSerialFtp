@@ -96,6 +96,12 @@ Protocol summary (full spec in README.md):
 Example:
     python3 LisaSerialFtpServer.py --port /dev/ttyUSB0 --baud 57600 \
         --home_dir /home/my_username/lisa-share
+
+Without --port (or with --port auto) the server finds the port itself:
+the only one there is, else a link to a pty, then LisaEm's pty, then a
+USB serial adapter, then a built-in serial port (auto_port).  --port
+auto-pty picks among the PseudoTTYs only (LisaEm), --port auto-serial
+among the USB adapters and built-in ports only (a real Lisa).
 """
 
 import argparse
@@ -347,6 +353,210 @@ class PeerRestarted(Exception):
 # Serial port (POSIX, termios, raw mode)
 # --------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Port discovery: when the --port device is not there, list the USB serial
+# adapters and PseudoTTYs that ARE there, to help pick the right name.
+
+USB_GLOBS = ("/dev/ttyUSB*", "/dev/ttyACM*",              # Linux
+             "/dev/cu.usbserial*", "/dev/cu.usbmodem*",   # macOS
+             "/dev/cu.PL2303*", "/dev/cu.SLAB*", "/dev/cu.wchusbserial*")
+
+
+def _real_builtin(dev):
+    """True if /dev/ttyS<n> (Linux) is a real built-in serial port: Linux
+    creates ttyS0-ttyS31 whether or not there is hardware behind them,
+    and /sys/class/tty/ttyS<n>/type is 0 (unknown) when there is none."""
+    try:
+        with open("/sys/class/tty/%s/type" % os.path.basename(dev)) as f:
+            return f.read().strip() not in ("", "0")
+    except OSError:
+        return False
+
+
+def _builtin_ports():
+    """[(device, description)] of the real built-in serial ports (Linux:
+    /dev/ttyS<n>, e.g. a motherboard's COM1 is /dev/ttyS0)."""
+    import glob
+    return sorted((dev, "built-in") for dev in glob.glob("/dev/ttyS*")
+                  if _real_builtin(dev))
+
+
+def _usb_ports():
+    """[(device, description)] of the USB serial adapters: from pyserial if
+    it is installed (the only way on Windows), else from /dev."""
+    try:
+        from serial.tools import list_ports
+        found = []
+        for p in list_ports.comports():
+            # Linux lists every /dev/ttyS* too: the built-in ports are
+            # found by _builtin_ports
+            if p.device.startswith("/dev/ttyS"):
+                continue
+            desc = p.description if p.description not in (None, "", "n/a") else ""
+            found.append((p.device, desc))
+        return sorted(found)
+    except ImportError:
+        pass
+    import glob
+    names = {}                      # Linux: /dev/serial/by-id names the adapter
+    for link in glob.glob("/dev/serial/by-id/*"):
+        names[os.path.realpath(link)] = os.path.basename(link)
+    found = set()
+    for pattern in USB_GLOBS:
+        for dev in glob.glob(pattern):
+            found.add((dev, names.get(dev, "")))
+    return sorted(found)
+
+
+PTY_LINK_FOLDERS = ("/tmp", "/dev")   # where links to a pty are looked for
+if os.environ.get("LISAFTP_LINK_DIRS"):   # tests only: other folders
+    PTY_LINK_FOLDERS = tuple(os.environ["LISAFTP_LINK_DIRS"].split(os.pathsep))
+
+
+def _is_pty(path):
+    return path.startswith("/dev/pts/") or path.startswith("/dev/ttys")
+
+
+def _pseudo_ttys():
+    """[(device, description)] of the PseudoTTYs an emulator may be using:
+      * Linux: the pty of each running LisaEm (it holds the master end,
+        /dev/ptmx; /proc/<pid>/fdinfo gives the pty number);
+      * symbolic links to a pty (as made for LisaEm, e.g. /tmp/lisaem-port-b
+        -> /dev/pts/3) in PTY_LINK_FOLDERS, whatever --port says."""
+    found = set()
+    for pid in (os.listdir("/proc") if os.path.isdir("/proc") else ()):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % pid) as f:
+                comm = f.read().strip()
+            if "lisaem" not in comm.lower():
+                continue
+            for fd in os.listdir("/proc/%s/fd" % pid):
+                if os.readlink("/proc/%s/fd/%s" % (pid, fd)) != "/dev/ptmx":
+                    continue
+                with open("/proc/%s/fdinfo/%s" % (pid, fd)) as f:
+                    for line in f:
+                        if line.startswith("tty-index:"):
+                            found.add(("/dev/pts/" + line.split()[1],
+                                       "%s, pid %s" % (comm, pid)))
+        except OSError:
+            continue                # gone meanwhile, or not ours to read
+    own = set()                     # the terminal the server runs in: not a port
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            own.add(os.ttyname(stream.fileno()))
+        except (OSError, AttributeError, ValueError):
+            pass
+    for d in PTY_LINK_FOLDERS:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for e in entries:
+            link = os.path.join(d, e)
+            if e in ("stdin", "stdout", "stderr") or not os.path.islink(link):
+                continue
+            target = os.path.realpath(link)
+            if _is_pty(target) and os.path.exists(target) and target not in own:
+                found.add((link, "-> " + target))
+    return sorted(found)
+
+
+# --port auto picks the first port of the best kind there is: a link to a
+# pty first (made on purpose for the emulator, e.g. /tmp/lisaem-port-b),
+# then the pty of a running LisaEm, then a USB serial adapter, then a
+# built-in serial port.
+LINK, LISAEM, USB, BUILTIN = 0, 1, 2, 3
+
+
+def port_entries():
+    """[(kind, device, description)] of the ports there are now, best
+    kind first (see LINK, LISAEM, USB)."""
+    found = []
+    for dev, desc in _pseudo_ttys():
+        found.append((LINK if desc.startswith("-> ") else LISAEM, dev, desc))
+    for dev, desc in _usb_ports():
+        found.append((USB, dev, desc))
+    for dev, desc in _builtin_ports():
+        found.append((BUILTIN, dev, desc))
+    return sorted(found)
+
+
+def port_line(entry):
+    kind, dev, desc = entry
+    label = {USB: "USB serial:", BUILTIN: "serial:    "}.get(kind, "PseudoTTY: ")
+    return "  %s %s%s" % (label, dev, "  (%s)" % desc if desc else "")
+
+
+def find_ports():
+    """The ports there are now, as printable lines (also used to see
+    whether that changed)."""
+    return [port_line(e) for e in port_entries()]
+
+
+# --port auto, auto-pty, auto-serial: the kinds of port each may pick,
+# and what to call them when there is none
+AUTO_MODES = {
+    "auto": ((LINK, LISAEM, USB, BUILTIN), "serial port or PseudoTTY"),
+    "auto-pty": ((LINK, LISAEM), "PseudoTTY"),
+    "auto-serial": ((USB, BUILTIN), "serial port"),
+}
+
+
+def auto_port(mode="auto", poll=1.0):
+    """--port auto / auto-pty / auto-serial: the port to use, among the
+    kinds MODE allows (auto: all; auto-pty: the PseudoTTYs, for LisaEm;
+    auto-serial: the USB adapters and built-in ports, for a real Lisa).
+    The only one if there is just one; else the first of the best kind (a
+    link to a pty before LisaEm's own pty, before a USB adapter, before a
+    built-in port).  None there yet: wait for one."""
+    kinds, what = AUTO_MODES[mode]
+    said = False
+    while True:
+        try:
+            entries = [e for e in port_entries() if e[0] in kinds]
+        except Exception as e:      # discovery failed: say so, keep trying
+            entries = []
+            if not said:
+                print("--port %s: could not list the ports: %s" % (mode, e),
+                      flush=True)
+        if entries:
+            chosen = entries[0]
+            if len(entries) > 1:
+                print("--port %s: ports found on this computer:" % mode, flush=True)
+                for e in entries:
+                    print(port_line(e), flush=True)
+            print("--port %s: using %s (give --port to use another one)"
+                  % (mode, chosen[1]), flush=True)
+            return chosen[1]
+        if not said:
+            print("--port %s: no %s found; waiting for one.  Ctrl-C to stop."
+                  % (mode, what), flush=True)
+            said = True
+        time.sleep(poll)
+
+
+def report_ports(before):
+    """Print the ports found, if they differ from BEFORE (None: the first
+    time).  Returns them, to pass back in as BEFORE next time."""
+    try:
+        now = find_ports()
+    except Exception as e:          # discovery is only a help: never fatal
+        now = ["  (could not list the ports: %s)" % e]
+    if now != before:
+        if before is None:
+            print("ports found on this computer:" if now else
+                  "no serial ports or PseudoTTYs found on this computer",
+                  flush=True)
+        else:
+            print("the ports changed; now:" if now else
+                  "the ports changed; now there are none", flush=True)
+        for line in now:
+            print(line, flush=True)
+    return now
+
+
 class PosixSerialPort:
     """The serial port on Linux / macOS (termios, non-blocking reads with
     select).  PySerialPort is the same for Windows."""
@@ -378,6 +588,7 @@ class PosixSerialPort:
         again every POLL seconds until it appears.  Any other error (no
         permission, not a serial device, ...) is raised as before."""
         said = False
+        ports = None                # the ports last listed
         while True:
             try:
                 self._open()
@@ -392,6 +603,7 @@ class PosixSerialPort:
                           "Ctrl-C to stop."
                           % (self.path, e.strerror), flush=True)
                     said = True
+                ports = report_ports(ports)
                 time.sleep(poll)
 
     def _open(self):
@@ -587,6 +799,7 @@ class PySerialPort:
         """Open the port; if it is not there yet, say so once and check
         again every POLL seconds.  Other errors stop the server."""
         said = False
+        ports = None                # the ports last listed
         while True:
             try:
                 self._open()
@@ -600,6 +813,7 @@ class PySerialPort:
                     print("serial port %s is not there; waiting for it.  "
                           "Ctrl-C to stop." % self.path, flush=True)
                     said = True
+                ports = report_ports(ports)
                 time.sleep(poll)
 
     def set_baud(self, baud):
@@ -1874,13 +2088,16 @@ def main():
 
 The baud rate must match the Lisa's (57600 by default); the client's 'baud'
 command then changes it on both sides (BAUD), and QUIT goes back to it.""")
-    req = ap.add_argument_group("required arguments")
-    req.add_argument("--port", required=True, metavar="DEVICE",
-                     help="the serial device connected to the Lisa, e.g. "
-                          "/dev/ttyUSB0 (Windows: COM3), or LisaEm's PseudoTTY "
-                          "link such as /tmp/lisaem-port-b")
-    # list the required arguments first in the help, before the options
-    ap._action_groups.insert(1, ap._action_groups.pop())
+    ap.add_argument("--port", default="auto", metavar="DEVICE",
+                    help="the serial device connected to the Lisa, e.g. "
+                         "/dev/ttyUSB0 (Windows: COM3), or LisaEm's PseudoTTY "
+                         "link such as /tmp/lisaem-port-b.  Default: auto = "
+                         "find it: the only port there is, else a link to a "
+                         "pty first, then LisaEm's pty, then a USB adapter, "
+                         "then a built-in serial port (/dev/ttyS0).  "
+                         "auto-pty: the same among the PseudoTTYs only (for "
+                         "LisaEm); auto-serial: among the USB adapters and "
+                         "built-in ports only (for a real Lisa)")
     ap.add_argument("--baud", type=int, default=57600, choices=sorted(BAUDS),
                     help="baud rate (default 57600, the Lisa's "
                          "maximum on Port B, the only port the client uses)")
@@ -1907,13 +2124,12 @@ command then changes it on both sides (BAUD), and QUIT goes back to it.""")
                          "line and per chunk, to stderr); the client's "
                          "'debug on|off' switches it, HELLO restores this "
                          "setting"),
-    if len(sys.argv) == 1:
-        ap.print_help()             # no arguments: show how to use it
-        sys.exit(2)
     args = ap.parse_args()
     if not os.path.isdir(args.home_dir):
         ap.error("--home_dir: no such folder: %s" % args.home_dir)
     try:
+        if args.port in AUTO_MODES and not os.environ.get("LISAFTP_FD"):
+            args.port = auto_port(args.port)
         LisaFtpServer(args).run()
     except KeyboardInterrupt:
         pass                        # Ctrl-C while waiting for the port

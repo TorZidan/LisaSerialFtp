@@ -6,8 +6,6 @@ transfers data in retryable chunks; every chunk is verified and, if needed,
 retried; the whole file size, CRC16 checksum and byte sum is verified at the
 end, and the file is accepted only then.
 
-The client on a real Lisa: it connects to the server, gets its own source code as a Lisa text file, then puts its object file back.
-
 The server: a non-interactive Python-based LisaSerialFtpServer.py program that runs on your modern computer and listens for commands.
 
 The tool is useful for developing applications for the Apple Lisa (both Lisa Office system and Workshop apps). Here is a typical development setup:
@@ -16,20 +14,22 @@ The tool is useful for developing applications for the Apple Lisa (both Lisa Off
 * Download your code onto your Lisa: go on your Lisa (either on a real Lisa or the LisaEm emulator running on the same PC), launch the LisaSerialFtpClient app in the Workshop development environment,
   and run one-or-more "get" commands to download your files.
 * Compile, link and test your app on the Lisa.
-* The powerful option: use a Workshop Macro like [this one](src/client/LisaSerialFtpClientMake.text) to download, compile and link your code with just one command on the Lisa!
+* A powerful option: use a Workshop Macro like [this one](src/client/LisaSerialFtpClientMake.text)  on your Lisa to download, compile and link your code with just one command!
 
 ![The client on a real Lisa: a get of its own source as a text file, then a put of its executable file](assets/photos/lisa-in-action.jpg)
 
 
 ## Installing and running the client app in Lisa Workshop
 
+Clone this repository to a folder on your PC.
+
 ### Get the `LisaSerialFtpClient.obj` executable into Workshop.
 
-Clone this repository to a folder on your PC.
-The DC42 floppy disk image file `LisaSerialFtpClient.dc42` contains the
+* Option 1: The DC42 floppy disk image file `LisaSerialFtpClient.dc42` contains the
 executable file `LisaSerialFtpClient.obj`. Boot into Lisa Workshop, then insert ("mount") that
 disk image, e.g. using a FloppyEmu or ESFloppy floppy disk hardware
-emulator. Once in Workshop, you will have to copy it to your ProFile hard
+emulator on a real Lisa, or in the LisaEm emulator, from the File -> Insert Diskette menu item.
+Once in Workshop, you will have to copy it to your ProFile hard
 drive, this way: Press F to get into the File Manager submenu, then press C for
 "copy", then enter source filename `-UPPER-LisaSerialFtpClient.obj`, enter,
 then the target filename `-LOWER-LisaSerialFtpClient.obj`, and follow the
@@ -39,7 +39,19 @@ in the source filename). On a Lisa 2/10 the boot menu looks different: your
 floppy disk drive is named "LOWER", and the hard disk is "UPPER" in Workshop.
 Press Q to exit to the main Workshop menu.
 
-Note: once you have `LisaSerialFtpClient.obj` on your hard drive, you can get newer versions of this tool (if any) by running this tool.
+* Option 2: Most people use a ProFile hardware emulator on their Lisa-s such as ESProfile (the most popular one) and others; the hard disk image files sit on an micro-SD card.
+Plug the SD card in your PC, and use my "copy" tool at https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files
+to copy file [LisaSerialFtpClient.obj](./LisaSerialFtpClient.obj) onto your desired disk image, then move the mocroSD card back into the ProFile hardware emulator.
+
+* Option 3: Just copy the
+  [profile-5MB-LOSAndWorkshop3-UseWith88iorom.image](./profile-5MB-LOSAndWorkshop3-UseWith88iorom.image)
+  to your SD card and boot it up into Workshop. It has a clean installation of
+  Lisa Office System 3.1, Workshop 3.0 and the LisaSerialFtpClient.obj
+  executable. As the file name says, it should be used with I/O Rom version 88
+  (aka Lisa 2/10). Booting it up using any other I/O Rom version may result in
+  a boot error.
+
+Note: once you have `LisaSerialFtpClient.obj` on your ProFile hard drive, you can get newer versions of this tool (if any) by running this tool.
 
 ### Ensure Serial Port B is set to "Serial Cable" in the Workshop Preferences
 In Workshop, press S for Sys-Manager submenu, then P to run the Preferences app.
@@ -99,6 +111,28 @@ your USB serial adapter: see the FAQ
 . If using the LisaEm emulator (instead of a real Apple Lisa computer), use its virtual port instead, e.g. `--port /tmp/lisaem-port-b`. Find detailed instructions
 at [Setting up LisaEm for a 1st time](https://github.com/arcanebyte/lisaem/blob/master/LisaEmAsASoftwareDevelopmentEnvironment.md#setting-up-lisaem-for-a-1st-time).
 
+`--port` can also be left out: it defaults to `--port auto`, which finds the
+port itself.  If there is just one serial or PseudoTTY port, it uses
+that one; if there are more, it lists them and chooses one this way: a symbolic link to a pty
+(such as `/tmp/lisaem-port-b` (created by the LisaEm emulator) first, then the pty of a running LisaEm, then a USB adapter, then a
+built-in serial port.  If there
+is none yet, it waits for one.  Two narrower variants pick in the same way,
+but only among some of the ports:
+
+* `--port auto-pty`: only the PseudoTTYs, for LisaEm;
+* `--port auto-serial`: only the USB adapters and built-in serial ports, for
+  a real Lisa.
+
+For example, `--port auto`:
+
+```
+--port auto: ports found on this computer:
+  PseudoTTY:  /tmp/b  (-> /dev/pts/0)
+  PseudoTTY:  /dev/pts/0  (lisaem, pid 838896)
+  USB serial: /dev/ttyUSB0  (USB-Serial Controller D)
+--port auto: using /tmp/b (give --port to use another one)
+```
+
 When the server starts, it prints a line such as
 
 ```
@@ -112,6 +146,7 @@ it is served.
 
 | Option | What it does |
 |---|---|
+| `--port DEVICE` | the serial port; default `auto`, also `auto-pty` and `auto-serial` (see above) |
 | `--baud N` | the starting baud rate (default 57600); the client's `baud` command can change it later |
 | `--debug` | print every protocol line and chunk (the client's `debug on/off` switches it too) |
 | `--read-only` | refuse PUT and DELETE: the Lisa can only list and get |
@@ -124,7 +159,24 @@ it is served.
 The server runs until you stop it with Ctrl-C.
 
 If the port is not there when it starts (LisaEm emulator not running yet, adapter not
-plugged in), the server says so once and waits for it.  If the port goes away
+plugged in), the server says so once and waits for it.  It also lists the
+ports it can find, to help you pick the right `--port` name, and lists them
+again when they change (e.g. when you plug the adapter in):
+
+```
+serial port /tmp/lisaem-port-b is not there (No such file or directory); waiting for it.  Ctrl-C to stop.
+ports found on this computer:
+  USB serial: /dev/ttyUSB0  (USB-Serial Controller D)
+  PseudoTTY:  /dev/pts/0  (lisaem, pid 838896)
+  PseudoTTY:  /tmp/b  (-> /dev/pts/0)
+```
+
+USB serial adapters are found on Linux, macOS and Windows; built-in serial
+ports (`/dev/ttyS0`, ...) on Linux.  PseudoTTYs are the
+pty of each running LisaEm (Linux only) and any link to a pty in `/tmp` or
+`/dev`, whatever `--port` says.
+
+If the port goes away
 while it runs (the emulator quits, the adapter is unplugged), it says so once,
 checks every second, and reopens the port by its path when it is back (a
 virtual port created again, e.g. a `socat` link, is picked up too).  It then sends
@@ -491,18 +543,15 @@ port, and the Lisa client sets no handshake.  It could not be used even
 for text files: every chunk is a binary frame, whose sequence number,
 length and CRC bytes can be 0x11 or 0x13 too.
 
-## Transfer speeds
+## Measured transfer speeds
 
-Typical speeds at 57600 baud, in bytes per second of file data, for a
-file of a few tens of KB copied to or from the ProFile.  57600 baud is at
-most 5760 bytes/s on the wire; the Lisa itself is the limit, not the line.
+Below are typical speeds at 57600 baud (the default, recommended baud), in bytes per second of file data, for a
+file of a few tens of KB copied to or from the ProFile. The Lisa itself is the limit, not the line.
 
-| transfer | real Lisa | LisaEm |
+| transfer | real Lisa | LisaEm emulator via Pseudo TTY |
 |---|---|---|
-| `get`, binary file | about 3,100 bytes/s | TO DO |
-| `get`, text file | TO DO | TO DO |
-| `put`, binary file | about 2,070 bytes/s | TO DO |
-| `put`, text file | TO DO | TO DO |
+| `get`| about 3.1 KB/s | about 54   KB/s |
+| `put`| about 2.1 KB/s | about  1.6 KB/s |
 
 Notes:
 * A text `get` moves about 3% more bytes than the file's size (the NUL
@@ -996,6 +1045,18 @@ right but the Lisa still gets no answer, check that no other program
 (an old server, a terminal program) has the port open: two programs
 reading one port each get only part of the bytes.
 `pgrep -af LisaSerialFtpServer` lists the servers that are running.
+
+A serial port built into the PC (on the motherboard, or a PCI card) is
+`/dev/ttyS0` (COM1), `/dev/ttyS1` (COM2), ...  Linux creates `/dev/ttyS0`
+to `/dev/ttyS31` whether or not there is hardware behind them; a real one
+has a non-zero `type`:
+
+```sh
+grep -v '^0$' /sys/class/tty/ttyS*/type   # the real ones, e.g. ".../ttyS0/type:4"
+sudo dmesg | grep ttyS                    # e.g. "ttyS0 at I/O 0x3f8 (irq = 4) is a 16550A"
+```
+
+It is a true RS-232 port, so it needs only the null-modem cable (no dongle).
 
 **macOS**
 

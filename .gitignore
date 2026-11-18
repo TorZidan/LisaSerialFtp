@@ -1,5 +1,8 @@
 # Python bytecode caches
 __pycache__/
 
+
+lisaem.conf
+
 # server logs
 *.log

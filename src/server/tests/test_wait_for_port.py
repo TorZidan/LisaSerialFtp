@@ -11,6 +11,12 @@ of stopping with "No such file or directory".
      its banner.
   3. A path that exists but is not a serial device (a plain file) is still
      an error: the server stops at once.
+  4. --port auto: with a link to a pty in the folder it looks in
+     (LISAFTP_LINK_DIRS), the server picks that link -- a link to a pty
+     comes before LisaEm's own pty and a USB adapter -- and sends its
+     banner through it.
+  5. --port auto-pty (PseudoTTYs only) picks the same link.  (auto-serial
+     is not run here: it would open a real serial port of this computer.)
 
 Run:  python3 tests/test_wait_for_port.py
 """
@@ -102,6 +108,35 @@ def main():
     except subprocess.TimeoutExpired:
         proc.kill()
         check("plain-file-error", False, "the server kept running")
+
+    # 4. --port auto picks the link to a pty
+    os.remove(port)
+    master, slave = pty.openpty()
+    os.symlink(os.ttyname(slave), port)
+    env4 = dict(env, LISAFTP_LINK_DIRS=tmp)
+    proc = subprocess.Popen(
+        [sys.executable, SERVER, "--port", "auto", "--home_dir", tmp],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env4)
+    out = read_until(proc.stdout.fileno(), b"listening on", 5)
+    check("auto-picks-link", ("using %s " % port).encode() in out, repr(out[-160:]))
+    banner = read_until(master, b"\n", 10)
+    check("auto-banner", banner.startswith(b"Hi from"), repr(banner[:60]))
+    proc.terminate()
+    proc.wait(timeout=5)
+
+    # 5. --port auto-pty picks the same link
+    proc = subprocess.Popen(
+        [sys.executable, SERVER, "--port", "auto-pty", "--home_dir", tmp],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env4)
+    out = read_until(proc.stdout.fileno(), b"listening on", 5)
+    check("auto-pty-picks-link", ("auto-pty: using %s " % port).encode() in out,
+          repr(out[-160:]))
+    banner = read_until(master, b"\n", 10)
+    check("auto-pty-banner", b"Hi from" in banner, repr(banner[:60]))
+    proc.terminate()
+    proc.wait(timeout=5)
+    os.close(master)
+    os.close(slave)
 
     print()
     if failures:

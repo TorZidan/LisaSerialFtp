@@ -36,4 +36,10 @@ D{elete}LisaSerialFtpClientAsm.OBJ
 Y{es, delete it}
 Q{uit}
 $
+{Upload the produced LisaSerialFtpClient.OBJ executable to the server.}
+R{un}LisaSerialFtpClient.OBJ
+put LisaSerialFtpClient.OBJ LisaSerialFtpClient.obj
+quit
+$DOIT
+$
 $ENDEXEC

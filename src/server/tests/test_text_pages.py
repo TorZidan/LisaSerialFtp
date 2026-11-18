@@ -28,6 +28,11 @@ For 4000 random texts (long lines, up to 300 leading spaces, bytes over
 lisa_text(t).  If this fails after a change to one side, get -c / put -c
 would stop finding unchanged files.
 
+The client's page writer (PutLine / TxtPage / TxtEnd, TxtChunk and
+TXTPUT) is now commented out in the client: the server builds the pages
+(lisa_pages, which mirrors it).  doget and txtput are kept here as the
+reference that lisa_pages is checked against.
+
 Run:  python3 tests/test_text_pages.py
 """
 import os

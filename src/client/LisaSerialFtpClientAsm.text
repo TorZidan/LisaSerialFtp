@@ -5,8 +5,9 @@
 ; CRC-16 needs XOR, which Lisa Pascal does not have).  Declared in
 ; LisaSerialFtpClient.text as EXTERNAL; assembled to
 ; LisaSerialFtpClientAsm.OBJ and linked with the program (see lfm.text).
-; At startup the client checks them against its Pascal versions
-; (AsmSelfTest) and uses the Pascal ones if they ever disagree.
+; At startup the client checks them against known results
+; (AsmSelfTest) and stops if they are wrong.  The Pascal versions they
+; replaced are kept, commented out, in LisaSerialFtpClient.text.
 ;
 ; Calling convention (as Apple's .PROC/.FUNC routines, e.g. LIBSM's
 ; unit68k): the parameters are pushed in the order declared, so the last
@@ -185,134 +186,141 @@ DDONE   MOVE.L  46(SP),A2
         ADD.W   #28,SP                  ; remove the parameters (4+2+4+4+4+2+4+4)
         JMP     (A0)
 
-;-----------------------------------------------------------------------
-        .PROC   TXTPUT,6
-; PROCEDURE TXTPUT (SRC: byteptr; N: INTEGER; ST: byteptr; LINE: byteptr;
-;                   OB: byteptr; VAR CHARS: LONGINT); EXTERNAL;
-; text get: fold the N received bytes at SRC into Lisa text lines and
-; pages, in the output buffer OB (4 pages of 1024 bytes) -- the same rules
-; as DoGet's Pascal loop and PutLine (see there):
-;   LF, CRLF and a lone CR end a line; a line is split after 255 chars;
-;   a finished line goes into the page as: DLE + CHR(32 + n) for 2..223
-;   leading spaces, the rest of its chars, CR; if it does not fit with a
-;   NUL left at the end of the page, the page is padded with NULs and the
-;   line goes on the next one.
-; The state is kept between calls in ST, an ARRAY [0..7] OF INTEGER:
-;   0 the next byte of SRC to read     1 chars in LINE (the line so far)
-;   2 1 = a CR came, its line not ended yet
-;   3 1 = LINE holds a finished line, not yet in the page
-;   4 bytes used in OB                 5 where the current page starts in OB
-;   6 out: 0 = all of SRC used; 1 = OB is full (4 pages): the caller
-;     writes it, sets 4 and 5 to 0 and calls again (same ST)
-; CHARS is increased by the chars of each line put in a page.  With N = 0
-; and ST[3] = 1 it only places LINE (the last line of the file).
-;-----------------------------------------------------------------------
-        MOVEM.L D3-D7/A2-A4,-(SP)       ; save (32 bytes)
-        MOVE.L  54(SP),A0               ; SRC
-        MOVE.W  52(SP),D1               ; N
-        MOVE.L  48(SP),A2               ; ST
-        MOVE.L  44(SP),A3               ; LINE
-        MOVE.L  40(SP),A4               ; OB
-        MOVE.W  (A2),D0                 ; the next byte of SRC
-        MOVE.W  2(A2),D2                ; chars in LINE
-        MOVE.W  8(A2),D5                ; bytes used in OB
-        MOVE.W  10(A2),D6               ; the current page in OB
-        CLR.W   12(A2)                  ; result: all of SRC used
-TMAIN   TST.W   6(A2)
-        BEQ     TLOOP                   ; no finished line to place
-        MOVEQ   #0,D7                   ; count its leading spaces
-TSP     CMP.W   D2,D7
-        BGE     TSPX
-        CMP.B   #32,0(A3,D7.W)
-        BNE     TSPX
-        ADDQ.W  #1,D7
-        BRA     TSP
-TSPX    CMP.W   #223,D7
-        BLE     TSP1
-        MOVE.W  #223,D7                 ; at most 223 per DLE code
-TSP1    CMP.W   #2,D7
-        BGE     TSP2
-        MOVEQ   #0,D7                   ; 0 or 1 space: as it is
-TSP2    MOVE.W  D2,D3                   ; the bytes it needs:
-        SUB.W   D7,D3                   ; the chars after the spaces,
-        ADDQ.W  #1,D3                   ; the CR,
-        TST.W   D7
-        BEQ     TFIT
-        ADDQ.W  #2,D3                   ; the DLE code
-TFIT    MOVE.W  D5,D4
-        SUB.W   D6,D4
-        ADD.W   D3,D4
-        CMP.W   #1023,D4
-        BLE     TPUT                    ; it fits, with a NUL left at the end
-        MOVE.W  D6,D4
-        ADD.W   #1024,D4                ; the end of this page
-TPAD    CMP.W   D4,D5
-        BGE     TPADX
-        CLR.B   0(A4,D5.W)              ; pad the page with NULs
-        ADDQ.W  #1,D5
-        BRA     TPAD
-TPADX   MOVE.W  D5,D6                   ; the next page starts here
-        CMP.W   #4096,D5
-        BLT     TPUT                    ; an empty page: the line fits
-        MOVE.W  #1,12(A2)               ; OB is full: the caller writes it
-        BRA     TSAVE
-TPUT    TST.W   D7
-        BEQ     TCOPY
-        MOVE.B  #16,0(A4,D5.W)          ; DLE
-        ADDQ.W  #1,D5
-        MOVE.W  D7,D4
-        ADD.W   #32,D4
-        MOVE.B  D4,0(A4,D5.W)           ; CHR(32 + spaces)
-        ADDQ.W  #1,D5
-TCOPY   MOVE.W  D7,D4                   ; the chars after the spaces
-TCPY1   CMP.W   D2,D4
-        BGE     TCPYX
-        MOVE.B  0(A3,D4.W),0(A4,D5.W)
-        ADDQ.W  #1,D4
-        ADDQ.W  #1,D5
-        BRA     TCPY1
-TCPYX   MOVE.B  #13,0(A4,D5.W)          ; CR
-        ADDQ.W  #1,D5
-        MOVE.L  36(SP),A1
-        MOVEQ   #0,D4
-        MOVE.W  D2,D4
-        ADD.L   D4,(A1)                 ; CHARS
-        MOVEQ   #0,D2                   ; the line is placed
-        CLR.W   6(A2)
-TLOOP   CMP.W   D1,D0
-        BGE     TSAVE                   ; all of SRC used
-        MOVE.B  0(A0,D0.W),D4           ; the next byte
-        ADDQ.W  #1,D0
-        CMP.B   #10,D4
-        BNE     TNOTLF
-        CLR.W   4(A2)                   ; LF: the end of a line (or of a CRLF)
-        MOVE.W  #1,6(A2)
-        BRA     TMAIN
-TNOTLF  TST.W   4(A2)
-        BEQ     TNOPEND
-        SUBQ.W  #1,D0                   ; the CR before was a lone line end:
-        CLR.W   4(A2)                   ; place that line, then this byte again
-        MOVE.W  #1,6(A2)
-        BRA     TMAIN
-TNOPEND CMP.B   #13,D4
-        BNE     TCHAR
-        MOVE.W  #1,4(A2)                ; CR: it may become a CRLF
-        BRA     TLOOP
-TCHAR   CMP.W   #255,D2
-        BLT     TADD
-        SUBQ.W  #1,D0                   ; 255 chars: split the line here,
-        MOVE.W  #1,6(A2)                ; then this byte again
-        BRA     TMAIN
-TADD    MOVE.B  D4,0(A3,D2.W)           ; add the byte to the line
-        ADDQ.W  #1,D2
-        BRA     TLOOP
-TSAVE   MOVE.W  D0,(A2)
-        MOVE.W  D2,2(A2)
-        MOVE.W  D5,8(A2)
-        MOVE.W  D6,10(A2)
-        MOVEM.L (SP)+,D3-D7/A2-A4       ; restore
-        MOVE.L  (SP)+,A0                ; return address
-        ADD.W   #22,SP                  ; remove the parameters (4+2+4+4+4+4)
-        JMP     (A0)
+;=======================================================================
+; TXTPUT, not used (commented out): it folded received bytes into Lisa
+; text pages.  It was used by TxtChunk in LisaSerialFtpClient.text: by
+; get, until the server built the text pages itself (GET <name> T), and
+; then only by the hidden 'bench' command and the startup self-test
+; (AsmSelfTest).  Those uses are commented out there too.
+;=======================================================================
+; ;-----------------------------------------------------------------------
+;         .PROC   TXTPUT,6
+; ; PROCEDURE TXTPUT (SRC: byteptr; N: INTEGER; ST: byteptr; LINE: byteptr;
+; ;                   OB: byteptr; VAR CHARS: LONGINT); EXTERNAL;
+; ; text get: fold the N received bytes at SRC into Lisa text lines and
+; ; pages, in the output buffer OB (4 pages of 1024 bytes) -- the same rules
+; ; as DoGet's Pascal loop and PutLine (see there):
+; ;   LF, CRLF and a lone CR end a line; a line is split after 255 chars;
+; ;   a finished line goes into the page as: DLE + CHR(32 + n) for 2..223
+; ;   leading spaces, the rest of its chars, CR; if it does not fit with a
+; ;   NUL left at the end of the page, the page is padded with NULs and the
+; ;   line goes on the next one.
+; ; The state is kept between calls in ST, an ARRAY [0..7] OF INTEGER:
+; ;   0 the next byte of SRC to read     1 chars in LINE (the line so far)
+; ;   2 1 = a CR came, its line not ended yet
+; ;   3 1 = LINE holds a finished line, not yet in the page
+; ;   4 bytes used in OB                 5 where the current page starts in OB
+; ;   6 out: 0 = all of SRC used; 1 = OB is full (4 pages): the caller
+; ;     writes it, sets 4 and 5 to 0 and calls again (same ST)
+; ; CHARS is increased by the chars of each line put in a page.  With N = 0
+; ; and ST[3] = 1 it only places LINE (the last line of the file).
+; ;-----------------------------------------------------------------------
+;         MOVEM.L D3-D7/A2-A4,-(SP)       ; save (32 bytes)
+;         MOVE.L  54(SP),A0               ; SRC
+;         MOVE.W  52(SP),D1               ; N
+;         MOVE.L  48(SP),A2               ; ST
+;         MOVE.L  44(SP),A3               ; LINE
+;         MOVE.L  40(SP),A4               ; OB
+;         MOVE.W  (A2),D0                 ; the next byte of SRC
+;         MOVE.W  2(A2),D2                ; chars in LINE
+;         MOVE.W  8(A2),D5                ; bytes used in OB
+;         MOVE.W  10(A2),D6               ; the current page in OB
+;         CLR.W   12(A2)                  ; result: all of SRC used
+; TMAIN   TST.W   6(A2)
+;         BEQ     TLOOP                   ; no finished line to place
+;         MOVEQ   #0,D7                   ; count its leading spaces
+; TSP     CMP.W   D2,D7
+;         BGE     TSPX
+;         CMP.B   #32,0(A3,D7.W)
+;         BNE     TSPX
+;         ADDQ.W  #1,D7
+;         BRA     TSP
+; TSPX    CMP.W   #223,D7
+;         BLE     TSP1
+;         MOVE.W  #223,D7                 ; at most 223 per DLE code
+; TSP1    CMP.W   #2,D7
+;         BGE     TSP2
+;         MOVEQ   #0,D7                   ; 0 or 1 space: as it is
+; TSP2    MOVE.W  D2,D3                   ; the bytes it needs:
+;         SUB.W   D7,D3                   ; the chars after the spaces,
+;         ADDQ.W  #1,D3                   ; the CR,
+;         TST.W   D7
+;         BEQ     TFIT
+;         ADDQ.W  #2,D3                   ; the DLE code
+; TFIT    MOVE.W  D5,D4
+;         SUB.W   D6,D4
+;         ADD.W   D3,D4
+;         CMP.W   #1023,D4
+;         BLE     TPUT                    ; it fits, with a NUL left at the end
+;         MOVE.W  D6,D4
+;         ADD.W   #1024,D4                ; the end of this page
+; TPAD    CMP.W   D4,D5
+;         BGE     TPADX
+;         CLR.B   0(A4,D5.W)              ; pad the page with NULs
+;         ADDQ.W  #1,D5
+;         BRA     TPAD
+; TPADX   MOVE.W  D5,D6                   ; the next page starts here
+;         CMP.W   #4096,D5
+;         BLT     TPUT                    ; an empty page: the line fits
+;         MOVE.W  #1,12(A2)               ; OB is full: the caller writes it
+;         BRA     TSAVE
+; TPUT    TST.W   D7
+;         BEQ     TCOPY
+;         MOVE.B  #16,0(A4,D5.W)          ; DLE
+;         ADDQ.W  #1,D5
+;         MOVE.W  D7,D4
+;         ADD.W   #32,D4
+;         MOVE.B  D4,0(A4,D5.W)           ; CHR(32 + spaces)
+;         ADDQ.W  #1,D5
+; TCOPY   MOVE.W  D7,D4                   ; the chars after the spaces
+; TCPY1   CMP.W   D2,D4
+;         BGE     TCPYX
+;         MOVE.B  0(A3,D4.W),0(A4,D5.W)
+;         ADDQ.W  #1,D4
+;         ADDQ.W  #1,D5
+;         BRA     TCPY1
+; TCPYX   MOVE.B  #13,0(A4,D5.W)          ; CR
+;         ADDQ.W  #1,D5
+;         MOVE.L  36(SP),A1
+;         MOVEQ   #0,D4
+;         MOVE.W  D2,D4
+;         ADD.L   D4,(A1)                 ; CHARS
+;         MOVEQ   #0,D2                   ; the line is placed
+;         CLR.W   6(A2)
+; TLOOP   CMP.W   D1,D0
+;         BGE     TSAVE                   ; all of SRC used
+;         MOVE.B  0(A0,D0.W),D4           ; the next byte
+;         ADDQ.W  #1,D0
+;         CMP.B   #10,D4
+;         BNE     TNOTLF
+;         CLR.W   4(A2)                   ; LF: the end of a line (or of a CRLF)
+;         MOVE.W  #1,6(A2)
+;         BRA     TMAIN
+; TNOTLF  TST.W   4(A2)
+;         BEQ     TNOPEND
+;         SUBQ.W  #1,D0                   ; the CR before was a lone line end:
+;         CLR.W   4(A2)                   ; place that line, then this byte again
+;         MOVE.W  #1,6(A2)
+;         BRA     TMAIN
+; TNOPEND CMP.B   #13,D4
+;         BNE     TCHAR
+;         MOVE.W  #1,4(A2)                ; CR: it may become a CRLF
+;         BRA     TLOOP
+; TCHAR   CMP.W   #255,D2
+;         BLT     TADD
+;         SUBQ.W  #1,D0                   ; 255 chars: split the line here,
+;         MOVE.W  #1,6(A2)                ; then this byte again
+;         BRA     TMAIN
+; TADD    MOVE.B  D4,0(A3,D2.W)           ; add the byte to the line
+;         ADDQ.W  #1,D2
+;         BRA     TLOOP
+; TSAVE   MOVE.W  D0,(A2)
+;         MOVE.W  D2,2(A2)
+;         MOVE.W  D5,8(A2)
+;         MOVE.W  D6,10(A2)
+;         MOVEM.L (SP)+,D3-D7/A2-A4       ; restore
+;         MOVE.L  (SP)+,A0                ; return address
+;         ADD.W   #22,SP                  ; remove the parameters (4+2+4+4+4+4)
+;         JMP     (A0)
 
         .END

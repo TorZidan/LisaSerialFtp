@@ -187,7 +187,7 @@ its banner and carries on.
 Below is a sample client session.
 
 ```
-LisaSerialFtpClient v1.0 (build 2026-11-18 13:34)
+LisaSerialFtpClient v1.0 (build 2026-11-18 14:18)
 file transfer over RS232B at 57600 baud
 commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
           debug, repeat, help, quit
@@ -928,13 +928,12 @@ and takes it off every time it prints.  Then: sending 20 short lines
 (one `WRITE_DATA` per line or per character) and receiving 20 (`ECHO`;
 read ahead, or a `READ_DATA` per character), receiving 10 chunks
 exactly as `get` does but with no file (`FRAMES`), 10 progress marks on
-the screen alone, the CRC (Pascal,
-assembly), the byte sum (Pascal, assembly), writing a binary file (256
-bytes or 4 KB per `WRITE_DATA`) and a text file (`WRITELN`, or the
-file the way `get` wrote it before the server built the pages, with `TXTPUT` -- it then checks that the two text files are the
-same byte for byte, header included), and, with a file given, reading
-it (1 KB or 4 KB per `READ_DATA`), decoding it (for a `.TEXT` file; in
-assembly and in Pascal) and the whole `-c` check of it.  It prints bytes/s for each; the server
+the screen alone, the CRC and the byte sum (assembly), writing a binary
+file (256 bytes or 4 KB per `WRITE_DATA`) and a text file (`WRITELN`),
+and, with a file given, reading it (1 KB or 4 KB per `READ_DATA`),
+decoding it (for a `.TEXT` file, in assembly) and the whole `-c` check
+of it.  (The Pascal timings, and writing a text file the way `get` once
+did, with `TXTPUT`, are commented out in the source.)  It prints bytes/s for each; the server
 prints the times too.  Give it a small file (e.g.
 `bench LisaSerialFtpClientInclude.text`).
 
@@ -957,8 +956,9 @@ prints the times too.  Give it a small file (e.g.
   real Lisa.  The client therefore uses `CRC16A`, the same table-driven
   CRC in 68000 assembly (`LisaSerialFtpClientAsm.text`, with the byte sum
   `SUM16A` and the byte copy `MOVEB`).  At startup it checks them against
-  the Pascal versions (`AsmSelfTest`, then the CRC's standard check
-  value) and uses the Pascal ones if they ever disagree.  (A `SET OF
+  known results (`AsmSelfTest`, then the CRC's standard check value) and
+  stops if they are wrong.  The Pascal versions are kept in the source,
+  commented out.  (A `SET OF
   0..15` laid over an `integer`, where `(a + b) - (a * b)` is the XOR,
   was tried first: it failed its self-test on the Lisa.)
 * Where a real Lisa's time goes (`bench`, 10 KB each, before these
@@ -974,7 +974,8 @@ prints the times too.  Give it a small file (e.g.
   `WRITELN` per line.  Since then the server builds the pages
   (`lisa_pages`, a copy of `PutLine`; `src/server/tests/test_text_pages.py` checks
   that the two agree), and text gets run at the speed of binary ones;
-  the Lisa's own page writer is only used by `bench`.  The header page
+  the Lisa's own page writer (and `TXTPUT`) is commented out in the
+  source.  The header page
   still comes from the Pascal run-time system: `REWRITE` + `CLOSE` makes a
   text file of just that page (`OpenText`), and the pages go after it.
 * Each OS call on the serial port costs about 6 ms on a real Lisa, so

@@ -90,7 +90,7 @@ USES
     {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
 
 CONST
-  BUILD = '2026-11-18 13:34';  { printed at startup, so it is easy
+  BUILD = '2026-11-18 14:18';  { printed at startup, so it is easy
                                  to see which build runs; change it with each change }
   BAUD     = 57600;           { the maximum (Port B, the only port this client uses) }
   VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.
@@ -248,8 +248,11 @@ VAR
   opos     : integer;          { bytes used in obuf }
   pbase    : integer;          { text: where the page being built starts in obuf }
   dbuf     : ARRAY [1..DECMAX] OF ByteT;     { DECODEP's output }
+(* TXTPUT, not used: its buffers (TXTPUT was used only by TxtChunk, for
+   'bench'; the server builds the text pages of a get, GET <name> T)
   txst     : ARRAY [0..7] OF INTEGER;      { TXTPUT's state, between chunks }
   tline    : ARRAY [0..255] OF ByteT;      { TXTPUT's line so far }
+*)
   ooff     : longint;          { file offset where obuf goes }
   operr    : integer;          { the first file write error (0 = none) }
   tmode    : integer;          { what TextPass does with a decoded text byte:
@@ -267,8 +270,10 @@ VAR
   niblo    : ARRAY [0..255] OF ByteT;      { i MOD 16 }
   nibxor   : ARRAY [0..15, 0..15] OF ByteT; { a XOR b, for 4-bit a and b }
   crctab   : ARRAY [0..255] OF INTEGER;    { crchi/crclo as words, for CRC16A }
+(* PASCAL VERSION, not used: the assembly routines are always used now
   asmok    : boolean;          { the assembly routines passed AsmSelfTest: CRC16,
                                  Sum16 and MoveBytes use them }
+*)
 
 {--- byte <-> integer conversions -------------------------------------------}
 
@@ -389,24 +394,27 @@ BEGIN
 END;
 
 { The assembly byte copy (LisaSerialFtpClientAsm.text), and the copy used
-  everywhere: MOVEB if the assembly routines passed AsmSelfTest, else a
-  Pascal loop. }
+  everywhere. }
 PROCEDURE MOVEB (SRC, DST: byteptr; N: INTEGER); EXTERNAL;
 
 { Copy N bytes from SRC to DST (not overlapping). }
 PROCEDURE MoveBytes (SRC, DST: byteptr; N: INTEGER);
+BEGIN
+  MOVEB(SRC, DST, N);
+END;
+
+(* PASCAL VERSION, not used: the copy in Pascal, before MOVEB
+PROCEDURE MoveBytes (SRC, DST: byteptr; N: INTEGER);
 VAR j: INTEGER;
 BEGIN
-  IF asmok THEN
-    MOVEB(SRC, DST, N)
-  ELSE
-    FOR j := 1 TO N DO
-    BEGIN
-      DST^ := SRC^;
-      SRC := POINTER(ORD4(SRC) + 1);
-      DST := POINTER(ORD4(DST) + 1);
-    END;
+  FOR j := 1 TO N DO
+  BEGIN
+    DST^ := SRC^;
+    SRC := POINTER(ORD4(SRC) + 1);
+    DST := POINTER(ORD4(DST) + 1);
+  END;
 END;
+*)
 
 PROCEDURE PutChar (C: CHAR);
 VAR e: integer; n: longint; v: integer;
@@ -1058,6 +1066,7 @@ BEGIN
       crctab[i] := crchi[i] * 256 + crclo[i];
 END;
 
+(* PASCAL VERSION, not used: the CRC in Pascal, before CRC16A
 { CRC-16/CCITT-FALSE (poly $1021, init $FFFF, as the server) of L bytes at
   DATA, continuing from C (a signed INTEGER holding the 16-bit CRC).
   Byte-wise with the CrcInit tables, the CRC kept as two bytes hi/lo:
@@ -1091,27 +1100,29 @@ BEGIN
   ELSE
     C := u;
 END;
+*)
 
 { The assembly routines (LisaSerialFtpClientAsm.text): the same work as
-  CRC16N, Sum16P and a byte loop, ~15 times faster.  Used through CRC16,
-  Sum16 and MoveBytes, and only if AsmSelfTest passed. }
+  the Pascal versions CRC16N, Sum16P and a byte loop (kept below in
+  comments), ~15 times faster.  Used through CRC16, Sum16 and MoveBytes;
+  AsmSelfTest checks them at startup. }
 PROCEDURE CRC16A (DATA: byteptr; L: INTEGER; VAR C: INTEGER; TAB: LONGINT); EXTERNAL;
 PROCEDURE SUM16A (DATA: byteptr; L: INTEGER; VAR S: LONGINT); EXTERNAL;
 PROCEDURE DECODEP (SRC: byteptr; N: INTEGER; VAR P: INTEGER;
                    VAR ATSTART: INTEGER; DST: byteptr; DMAX: INTEGER;
                    VAR DLEN: INTEGER; VAR LINES: LONGINT); EXTERNAL;
+(* TXTPUT, not used (it was used by TxtChunk, for 'bench' only; see there)
 PROCEDURE TXTPUT (SRC: byteptr; N: INTEGER; ST: byteptr; LINE: byteptr;
                   OB: byteptr; VAR CHARS: LONGINT); EXTERNAL;
+*)
 
-{ The CRC-16 used everywhere: CRC16A if it passed AsmSelfTest, else CRC16N. }
+{ The CRC-16 used everywhere (CRC16A). }
 PROCEDURE CRC16 (DATA: byteptr; L: INTEGER; VAR C: INTEGER);
 BEGIN
-  IF asmok THEN
-    CRC16A(DATA, L, C, ORD4(@crctab))
-  ELSE
-    CRC16N(DATA, L, C);
+  CRC16A(DATA, L, C, ORD4(@crctab));
 END;
 
+(* PASCAL VERSION, not used: the byte sum in Pascal, before SUM16A
 { Add L bytes at DATA to S (the -c byte sum), kept MOD 65536. }
 PROCEDURE Sum16P (DATA: byteptr; L: INTEGER; VAR S: LONGINT);
 VAR j, v: INTEGER;
@@ -1125,18 +1136,19 @@ BEGIN
   END;
   S := S MOD 65536;
 END;
+*)
 
+{ Add L bytes at DATA to S (the -c byte sum), kept MOD 65536 (SUM16A). }
 PROCEDURE Sum16 (DATA: byteptr; L: INTEGER; VAR S: LONGINT);
 BEGIN
-  IF asmok THEN
-    SUM16A(DATA, L, S)
-  ELSE
-    Sum16P(DATA, L, S);
+  SUM16A(DATA, L, S);
 END;
 
 
-{ TRUE if the assembly routines give the same results as the Pascal ones
-  (CRC of a chunk, of one byte and of no bytes, the byte sum, a copy). }
+{ TRUE if the assembly routines give the known right results: the CRC of
+  a chunk, of one byte and of no bytes, the byte sum, a copy, and the
+  text decoding.  (The CRC and sum values are those of
+  the Pascal versions, and of LisaSerialFtpServer.py, on this data.) }
 FUNCTION AsmSelfTest: BOOLEAN;
 VAR j, c1, c2, p, at, dl: INTEGER; s1, s2, ln: LONGINT; same: BOOLEAN;
 
@@ -1149,21 +1161,18 @@ VAR j, c1, c2, p, at, dl: INTEGER; s1, s2, ln: LONGINT; same: BOOLEAN;
 BEGIN
   FOR j := 1 TO CHUNK DO
     buf[j] := ToByte(((j MOD 256) * 73 + 11) MOD 256);   { j * 73 overflows an INTEGER for j > 448 }
-  c1 := $FFFF;
-  CRC16N(@buf[1], CHUNK, c1);
+  c1 := -1081;                   { $FBC7: the CRC of these CHUNK bytes }
   c2 := $FFFF;
   CRC16A(@buf[1], CHUNK, c2, ORD4(@crctab));
   same := (c1 = c2);
-  c1 := $1234;
-  CRC16N(@buf[7], 1, c1);
+  c1 := -22727;                  { $A739: the CRC of buf[7] from $1234 }
   c2 := $1234;
   CRC16A(@buf[7], 1, c2, ORD4(@crctab));
   same := same AND (c1 = c2);
   c2 := $4321;
   CRC16A(@buf[1], 0, c2, ORD4(@crctab));
   same := same AND (c2 = $4321);
-  s1 := 100;
-  Sum16P(@buf[1], CHUNK, s1);
+  s1 := 64264;                   { 100 + the sum of these bytes, MOD 65536 }
   s2 := 100;
   SUM16A(@buf[1], CHUNK, s2);
   same := same AND (s1 = s2);
@@ -1196,6 +1205,7 @@ BEGIN
   IF dl = 4 THEN
     same := same AND (dbuf[1] = 65) AND (dbuf[2] = 0) AND (dbuf[3] = 66)
             AND (dbuf[4] = 10);
+  (* TXTPUT, not used: its self-test (TXTPUT was used by TxtChunk)
   { TXTPUT on 'ab' CR LF '   x' CR 'y' (a CRLF line, leading spaces, a
     lone CR, a last line without an ending): must give the page bytes
     'ab' CR, DLE CHR(35) 'x' CR, 'y' CR -- 7 chars of lines }
@@ -1215,6 +1225,7 @@ BEGIN
     same := same AND (big.obuf[1] = 97) AND (big.obuf[2] = 98) AND (big.obuf[3] = 13)
             AND (big.obuf[4] = 16) AND (big.obuf[5] = 35) AND (big.obuf[6] = 120)
             AND (big.obuf[7] = 13) AND (big.obuf[8] = 121) AND (big.obuf[9] = 13);
+  *)
   AsmSelfTest := same;
 END;
 
@@ -1230,27 +1241,23 @@ BEGIN
   CrcCheck := (c = $29B1);
 END;
 
-{ Build the tables, check the assembly routines and the CRC.  Without
-  working assembly routines the (slower) Pascal ones are used.  FALSE only
-  if even the Pascal CRC is wrong. }
+{ Build the tables, check the assembly routines and the CRC.  FALSE (the
+  program stops) if they are wrong: the build is broken. }
 FUNCTION CrcSelfTest: BOOLEAN;
 BEGIN
   CrcInit;
-  asmok := AsmSelfTest;
-  IF asmok THEN
-    IF NOT CrcCheck THEN asmok := FALSE;
-  IF NOT asmok THEN
-  BEGIN
-    WRITELN('note: the assembly routines failed their self-test, so the slower');
-    WRITELN('Pascal ones are used (see LisaSerialFtpClientAsm.text)');
-    IF NOT CrcCheck THEN
-    BEGIN
-      WRITELN('internal error: CRC self-test failed (expected 29B1)');
-      CrcSelfTest := FALSE;
-      EXIT(CrcSelfTest);
-    END;
-  END;
   CrcSelfTest := TRUE;
+  IF NOT AsmSelfTest THEN
+  BEGIN
+    WRITELN('internal error: the assembly routines failed their self-test');
+    WRITELN('(see LisaSerialFtpClientAsm.text)');
+    CrcSelfTest := FALSE;
+  END
+  ELSE IF NOT CrcCheck THEN
+  BEGIN
+    WRITELN('internal error: CRC self-test failed (expected 29B1)');
+    CrcSelfTest := FALSE;
+  END;
 END;
 
 {--- chunk framing ----------------------------------------------------------}
@@ -2042,24 +2049,6 @@ BEGIN
   len := 0;
 END;
 
-{ Decode the Lisa .TEXT file open as FREF into the bytes put sends: each
-  is counted (tmode 0), or collected in buf, which TxFlush sends (tmode 1)
-  or adds to the -c check (tmode 2) when it is full.  The raw pages are
-  read with READ_DATA, TBUF bytes (4 pages) at a time, NOT with the
-  Pascal text type: its READLN edits the line (a CHR(8) deletes the
-  previous character) and may stop early, so it does not return the
-  file's real contents.  The decoding is the one LisaFileSystemTool uses
-  (see LisaOsTextFileSpecification.txt):
-    * the first 1024-byte page is a header, not text: skipped;
-    * every other page holds CR-terminated lines; the first CR-NUL pair
-      ends the page (the rest is NUL padding);
-    * a DLE (16) + CHR(32 + n) at the start of a line is n spaces;
-    * CR becomes LF (the reverse of 'get'); all other bytes are sent as is.
-  Each page is decoded by DECODEP (assembly, ~15 times faster) if the
-  assembly routines passed AsmSelfTest, else by the Pascal loop below,
-  which does everything inline (no procedure call per byte: in Lisa
-  Pascal a call costs more than the rest of the work on a byte).  Counts
-  the lines in tlines.  FALSE on a read error (reported). }
 { text: N decoded bytes in dbuf (DECODEP's output) -- counted (tmode 0),
   added to the -c check (tmode 2), or cut into chunks in buf, which
   TxFlush sends (tmode 1). }
@@ -2089,10 +2078,47 @@ BEGIN
   END;
 END;
 
+{ TextPass: decode the Lisa .TEXT file open as FREF (positioned at its
+  start) into the bytes that put sends, and hand them on as tmode says:
+    tmode 0  count them in size (put's first pass: the size for PUT);
+    tmode 1  collect them in buf; TxFlush sends each full CHUNK as a
+             chunk frame (put's second pass);
+    tmode 2  add them to crc, total and bsum (the -c check, LocalSum).
+  The caller sets tmode, and, as that mode needs, size, crc, total,
+  bsum, len (0), seq and ok (TRUE).  For tmode 1 and 2 the caller calls
+  TxFlush after it for the last, short buf.  TextPass sets tlines to the
+  number of lines decoded.
+
+  The raw pages are read with READ_DATA, TBUF bytes (4 pages) at a time,
+  NOT with the Pascal text type: its READLN edits the line (a CHR(8)
+  deletes the previous character) and may stop early, so it does not
+  return the file's real contents. The text file structure is described
+  in LisaOsTextFileSpecification.txt:
+    * the first 1024-byte page is a header, not text: skipped;
+    * every other page holds CR-terminated lines; the first CR-NUL pair
+      ends the page (the rest is NUL padding);
+    * a DLE (16) + CHR(32 + n) at the start of a line is n spaces;
+    * CR becomes LF (the reverse of 'get'); all other bytes are as is.
+  Each page is decoded by DECODEP (assembly), which stops when dbuf is
+  nearly full and is then called again on the same page (p and at keep
+  its place); TxBytes passes each dbuf on.  The Pascal loop it replaced
+  (~15 times slower) is kept below in a comment.
+
+  Returns FALSE on a read error (reported, after ending the progress
+  line); TRUE at the end of the file, or when ok became FALSE (a failed
+  chunk send, tmode 1), which the caller checks.  An end-of-file error
+  code from READ_DATA (848, 881, 883, 956) is the normal end. }
 FUNCTION TextPass (fref: integer): BOOLEAN;
-VAR n, p, pe, pg, k, cnt, at, dl: integer;
+VAR n: integer;          { bytes read into pgbuf this time (up to TBUF) }
+    pg, pe: integer;     { the current page is pgbuf[pg+1 .. pe] }
+    p, at: integer;      { DECODEP's place in the page, and 1 = at the
+                           start of a line (its state between calls) }
+    dl: integer;         { bytes DECODEP put in dbuf }
+    first: boolean;      { the next page is the header page }
+    done: boolean;       { the end of the file was reached }
+    k, cnt: integer;     { used only by the Pascal loop (commented out) }
     v: ByteT;
-    first, atstart, done, pad, counting: boolean;
+    atstart, pad, counting: boolean;
 BEGIN
   TextPass := FALSE;
   tlines := 0;
@@ -2124,7 +2150,7 @@ BEGIN
       IF pe > n THEN pe := n;
       IF first THEN
         first := FALSE           { the header page: not text }
-      ELSE IF asmok THEN
+      ELSE
       BEGIN
         { the page in assembly (DECODEP), a dbuf full at a time }
         p := 0;
@@ -2134,7 +2160,8 @@ BEGIN
           DECODEP(@big.pgbuf[pg + 1], pe - pg, p, at, @dbuf[1], DECMAX, dl, tlines);
           IF dl > 0 THEN TxBytes(dl);
         UNTIL (p >= pe - pg) OR NOT ok;
-      END
+      END;
+      (* PASCAL VERSION, not used: the page in Pascal, before DECODEP
       ELSE
       BEGIN
         p := pg + 1;
@@ -2215,6 +2242,7 @@ BEGIN
         END;
         {$R+}
       END;
+      *)
       pg := pg + TPAGE;
     END;
   UNTIL done OR NOT ok;
@@ -2299,7 +2327,12 @@ BEGIN
   opos := 0;
 END;
 
-{ The Lisa's own text page writer (TxtPage, TxtEnd, TxtChunk, PutLine):
+(* TXTPUT, not used: the text page writer TxtPage, TxtEnd and TxtChunk
+   (TXTPUT in assembly).  get used it until the server built the pages
+   itself (GET <name> T); after that only 'bench' used it, to time writing
+   a text file the old way and to check the pages against the Pascal
+   run-time's (see DoBench).
+{ The Lisa's own text page writer (TxtPage, TxtEnd, TxtChunk):
   get used it until the server built the pages (GET <name> T,
   lisa_pages in LisaSerialFtpServer.py, which mirrors it exactly); now
   only 'bench' uses it, to compare.  tests/test_text_pages.py checks that
@@ -2350,7 +2383,9 @@ BEGIN
     END;
   UNTIL txst[6] = 0;
 END;
+*)
 
+(* PASCAL VERSION, not used: the line writer in Pascal, before TXTPUT
 { add a line (the first N chars of S) to the text page being
   built in obuf, in the Lisa text format: leading spaces as DLE +
   CHR(32 + n) (2 or more of them, at most 223 per code), the chars, a CR.
@@ -2396,9 +2431,10 @@ BEGIN
   big.obuf[opos] := 13;              { CR }
   {$R+}
 END;
+*)
 
 { Create the Lisa text file NAME, open as FREF for writing its pages with
-  PutLine/TxtPage.  The header page comes from the Pascal run-time
+  TxtChunk/TxtPage.  The header page comes from the Pascal run-time
   system: REWRITE + CLOSE makes a text file of just its 1024-byte header
   (see LisaOsTextFileSpecification.txt); the pages go after it.  FALSE
   (said why) if that is not what it made. }
@@ -3700,10 +3736,7 @@ VAR k, j, c1, c2, fref, fref2, d, n1, n2, want: integer;
 BEGIN
   IF NOT Ready THEN EXIT(DoBench);
   WRITELN('bench: timing the client''s work (the server is the clock)');
-  IF asmok THEN
-    WRITELN('  in use: the assembly routines (CRC16A, SUM16A, MOVEB)')
-  ELSE
-    WRITELN('  in use: the Pascal routines (the assembly ones failed their self-test)');
+  WRITELN('  in use: the assembly routines (CRC16A, SUM16A, MOVEB)');
   FOR j := 1 TO CHUNK DO
     buf[j] := ToByte(((j MOD 256) * 37) MOD 256);        { j * 37 overflows an INTEGER for j > 885 }
   nbytes := NB;
@@ -3771,42 +3804,38 @@ BEGIN
   BenchMark('10 progress marks on the screen alone', 0);
   ProgEnd;
 
+  (* PASCAL VERSION, not used: the CRC and byte sum in Pascal, to compare
   BenchStart;
   c1 := $FFFF;
   FOR k := 1 TO NB DO
     CRC16N(@buf[1], CHUNK, c1);
   BenchMark('crc, Pascal (CRC16N)', nbytes);
-  IF asmok THEN
-  BEGIN
-    BenchStart;
-    c2 := $FFFF;
-    FOR k := 1 TO NB DO
-      CRC16A(@buf[1], CHUNK, c2, ORD4(@crctab));
-    BenchMark('crc, assembly (CRC16A)', nbytes);
-    IF c1 <> c2 THEN
-      WRITELN('  *** the two CRCs differ! ***');
-  END;
+  *)
+  BenchStart;
+  c2 := $FFFF;
+  FOR k := 1 TO NB DO
+    CRC16A(@buf[1], CHUNK, c2, ORD4(@crctab));
+  BenchMark('crc, assembly (CRC16A)', nbytes);
 
+  (*
   BenchStart;
   bsum := 0;
   FOR k := 1 TO NB DO
     Sum16P(@buf[1], CHUNK, bsum);
   BenchMark('byte sum, Pascal (Sum16P)', nbytes);
-  IF asmok THEN
-  BEGIN
-    BenchStart;
-    bsum := 0;
-    FOR k := 1 TO NB DO
-      SUM16A(@buf[1], CHUNK, bsum);
-    BenchMark('byte sum, assembly (SUM16A)', nbytes);
-  END;
+  *)
+  BenchStart;
+  bsum := 0;
+  FOR k := 1 TO NB DO
+    SUM16A(@buf[1], CHUNK, bsum);
+  BenchMark('byte sum, assembly (SUM16A)', nbytes);
 
   bname := 'LisaSerialFtpBench.BIN';
   WriteBin(256, 'write a binary file, 256 bytes per WRITE_DATA (before)');
   WriteBin(WBLOCK, 'write a binary file, 4 KB per WRITE_DATA (now)');
 
-  { a text file of 80 lines of 126 chars: with WRITELN (as get did
-    before), and in pages built by PutLine (as get does now) }
+  { a text file of 80 lines of 126 chars, with WRITELN (as get did
+    before) }
   line := '';
   FOR j := 1 TO 126 DO
     line := concat(line, 'x');   { 126 chars + CR = 127 bytes per line: 8 per CHUNK }
@@ -3828,9 +3857,12 @@ BEGIN
     CLOSE(tf, lock);
     BenchMark('write a text file with WRITELN (before)', nbytes);
   END;
+  (* TXTPUT, not used: the same file written by TxtChunk (TXTPUT), the
+     way get wrote text files before the server built the pages, and a
+     byte-for-byte comparison of the two files
   { the same file the way get writes it: chunks of CHUNK received bytes
-    (lines of 126 x's + LF), folded into pages by TxtChunk (assembly)
-    or PutLine (Pascal), 4 pages per WRITE_DATA }
+    (lines of 126 x's + LF), folded into pages by TxtChunk (assembly),
+    4 pages per WRITE_DATA }
   FOR k := 0 TO CHUNK DIV 127 - 1 DO
   BEGIN
     FOR j := 1 TO 126 DO
@@ -3841,28 +3873,23 @@ BEGIN
   IF OpenText(bname2, fref) THEN
   BEGIN
     got := 0;
-    IF asmok THEN
-    BEGIN
-      FOR j := 0 TO 7 DO
-        txst[j] := 0;
-      FOR k := 1 TO NB DO
-        TxtChunk(fref, CHUNK, got);
-    END
-    ELSE
-      FOR k := 1 TO NB * (CHUNK DIV 127) DO
-        PutLine(line, 126, fref);
+    FOR j := 0 TO 7 DO
+      txst[j] := 0;
+    FOR k := 1 TO NB DO
+      TxtChunk(fref, CHUNK, got);
+    { PASCAL VERSION, not used: the lines in Pascal, before TXTPUT
+    FOR k := 1 TO NB * (CHUNK DIV 127) DO
+      PutLine(line, 126, fref);
+    }
     TxtEnd(fref);
     ecode := 0;
     CLOSE_OBJECT(ecode, fref);
-    IF asmok THEN
-      BenchMark('write it the way get does, in assembly (TXTPUT; now)', nbytes)
-    ELSE
-      BenchMark('write it the way get does, in Pascal (PutLine)', nbytes);
+    BenchMark('write it the way get does, in assembly (TXTPUT; now)', nbytes);
     IF operr > 0 THEN
       WRITELN('  *** write error ', operr, ' ***');
   END;
   { The two text files must be byte for byte the same, header included:
-    else the pages PutLine builds are not what the Pascal run-time makes. }
+    else the pages TxtChunk builds are not what the Pascal run-time makes. }
   ecode := 0;
   OPEN(ecode, bname, fref, [dread]);
   j := 0;
@@ -3902,9 +3929,10 @@ BEGIN
   ecode := 0;
   CLOSE_OBJECT(ecode, fref2);
   ecode := 0;
-  KILL_OBJECT(ecode, bname);
-  ecode := 0;
   KILL_OBJECT(ecode, bname2);
+  *)
+  ecode := 0;
+  KILL_OBJECT(ecode, bname);
 
   IF fname <> '' THEN
   BEGIN
@@ -3921,14 +3949,11 @@ BEGIN
         size := 0;
         ok := TRUE;
         IF TextPass(fref) THEN ;
-        IF asmok THEN
-          BenchMark('read + decode it, assembly (DECODEP; now)', size)
-        ELSE
-          BenchMark('read + decode it, Pascal', size);
+        BenchMark('read + decode it, assembly (DECODEP; now)', size);
         ecode := 0;
         CLOSE_OBJECT(ecode, fref);
       END;
-      IF asmok THEN              { the same with the Pascal loop (before) }
+      (* PASCAL VERSION, not used: the same with the Pascal loop (before)
       BEGIN
         ecode := 0;
         OPEN(ecode, fname, fref, [dread]);
@@ -3946,6 +3971,7 @@ BEGIN
           CLOSE_OBJECT(ecode, fref);
         END;
       END;
+      *)
     END;
     BenchStart;
     IF LocalSum(fname, NOT IsTextName(fname), FALSE) THEN ;

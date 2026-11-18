@@ -187,7 +187,7 @@ its banner and carries on.
 Below is a sample client session.
 
 ```
-LisaSerialFtpClient v1.0 (build 2026-11-15 15:45)
+LisaSerialFtpClient v1.0 (build 2026-11-18 13:34)
 file transfer over RS232B at 57600 baud
 commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
           debug, repeat, help, quit
@@ -401,7 +401,7 @@ At the end, upon success, it will just exit to the Workshop main menu.
 | `src/client/LisaSerialFtpClientAsm.text` | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy, the text decoder and page writer, 10-15 times faster than Pascal; built with it (see `LisaSerialFtpClientMake.text`) |
 | `src/client/LisaSerialFtpClientMake.text` | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
 | `src/server/tests/*.py` | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
-| `src/client/tests/LisaSerialFtpTestMacro.text` | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/server`) |
+| `src/client/tests/LisaSerialFtpTestMacro.text` | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
 
 ## How the Lisa sees the serial ports
 
@@ -617,7 +617,7 @@ command loop (worst case ~90 s for a GET, ~30 s for a PUT, immediate if
 the server was waiting for a command).  If the Lisa restarts quickly and
 its `HELLO` arrives while the server is still in the binary phase, the
 server detects it — a `HELLO` where a chunk header or an `A`/`N` reply is
-expected — removes any partial `PUT` file, and answers the `HELLO` with a
+expected — discards a partial `PUT` (its `.part` file), and answers the `HELLO` with a
 fresh banner, so the new session continues without relaunching the
 server.  A `HELLO` buried inside a chunk payload is not detected and
 costs one chunk timeout before recovery.
@@ -640,7 +640,7 @@ Note: these are the commands that the client and server exchange as part of the 
 | `HELLO` | re-send banner | banner |
 | `LIST [dir]` | list a directory | `OK`, then one line per entry `<F\|D> <size> <name>`, then `DONE`; in pages of at most 384 bytes, each but the last ending with `MORE`, which the client answers with `NEXT` (see below) |
 | `GET <name> [T]` | download; `T`: as Lisa text pages (see below) | `OK <size>`; the client sends `GO` once its file is open (or `FAIL <why>`: the get ends), then chunks, then client sends `DONE <bytes> <crc>`, server answers `OK`/`BAD <bytes> <crc>` |
-| `PUT <name> <size>` | upload | `OK`, then client sends chunks, then server sends `DONE <bytes> <crc>`, client answers `OK`/`BAD <bytes> <crc>`; a size other than `<size>`: `ERR 5`, file deleted; a name the OS refuses: `ERR 13`, before the `OK` |
+| `PUT <name> <size>` | upload | `OK`, then client sends chunks, then server sends `DONE <bytes> <crc>`, client answers `OK`/`BAD <bytes> <crc>`; a size other than `<size>`: `ERR 5`, discarded; a name the OS refuses: `ERR 13`, before the `OK` (below) |
 | `DELETE <name>` | delete a file (the client's `delete`) | `OK deleted`; `ERR 11` no such file, `ERR 12` a folder (never deleted), `ERR 13` the OS refused, `ERR 20` with `--read-only` |
 | `SUM <name> T\|B` | size and checksums of a file, for `get -c` / `put -c` | `OK <size> <crc16> <sum16>` (hex), see below |
 | `CAL` | timeout-factor calibration | `CAL 2000`, sent exactly 2 real seconds after the request |
@@ -650,6 +650,14 @@ Note: these are the commands that the client and server exchange as part of the 
 | `MARK <label>` | hidden, for the client's `bench`: the server is the stopwatch | `OK <ms>`, the milliseconds since the previous `MARK` (0 for the first) |
 | `ECHO <n>` | hidden, for `bench`: n short lines to time reading them | n lines `A 12345` (1..100), nothing else |
 | `FRAMES <n>` | hidden, for `bench`: chunks to time receiving them | n chunks of 1016 made-up bytes and the empty end-of-file chunk, as `GET` sends them (1..400), no `OK` before or `DONE` after |
+
+`PUT`: the server receives the file into a temporary `<name>.part` in
+the same folder, and renames it to `<name>` only after the client's `OK`
+verdict.  Until then an older file of that name stays as it is; a failed
+`PUT` (a bad verdict, too many errors, a client that restarts or goes
+away) removes the `.part` file and leaves the older file untouched.
+`LIST` shows a `.part` file like any other file (one is left behind only
+if the server itself is stopped in the middle of a `PUT`).
 
 `GET <name> T`: the server sends the text pages of the Lisa `.TEXT` file
 the client stores, without its header page (`lisa_pages`): the lines of
@@ -884,31 +892,32 @@ verification (a client that answers BAD, or reports a wrong CRC).
 
 `src/client/tests/LisaSerialFtpTestMacro.text` is a Workshop exec file
 that tests the client on the Lisa itself.  `LisaSerialFtpClientMake.text`
-fetches it onto the Lisa.  It gets and puts files in `src/server/tests`,
-so start the server sharing `src/server` for it, e.g. in the repository
-folder:
+fetches it onto the Lisa.  It gets the client's sources and puts a file
+in `src/client/tests`, so start the server sharing `src/client` for it
+(as for `LisaSerialFtpClientMake.text`), e.g. in the repository folder:
 
 ```sh
-python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/server
+python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/client
 ```
 
 and run it from the Workshop.  It:
 
-1. deletes `LisaFtpClientTestFile1.text`, `LisaFtpClientTestFile2.text`
-   and `LisaFtpClientTestFile3.text` left from an earlier run;
-2. gets `tests/test_lisaftp.py` into `LisaFtpClientTestFile1.text` and
+1. deletes `LisaSerialFtpClientTest1.text`, `LisaSerialFtpClientTest2.text`
+   and `LisaSerialFtpClientTest3.text` left from an earlier run;
+2. gets `LisaSerialFtpClient.text` into `LisaSerialFtpClientTest1.text` and
    checks it exists;
-3. puts `LisaFtpClientTestFile1.text` back as
-   `tests/lisatest-upload1.txt`, gets that into
-   `LisaFtpClientTestFile2.text`, checks it exists, and removes the
-   uploaded copy with the hidden client command `delete-test-files`.
+3. puts `LisaSerialFtpClientTest1.text` back as
+   `tests/LisaSerialTest-upload1.txt`, gets that into
+   `LisaSerialFtpClientTest2.text`, checks it exists, and removes the
+   uploaded copy with `delete tests/LisaSerialTest-upload1.txt` (answering its Y/N question).
    On the way it tries `get -c` and `put -c`: of the files it just
    transferred (each must say `unchanged`), with no local copy
-   (`LisaFtpClientTestFile3.text`: transferred) and of a different file
-   over that one (transferred).  The macro cannot see these messages, so
+   (`LisaSerialFtpClientInclude.text` into `LisaSerialFtpClientTest3.text`:
+   transferred) and of a different file over that one
+   (`LisaSerialFtpClientAsm.text`: transferred).  The macro cannot see these messages, so
    it prints what to expect and you check them on the screen;
-4. runs `DIFF` on `LisaFtpClientTestFile1.text` and
-   `LisaFtpClientTestFile2.text`: no differences means
+4. runs `DIFF` on `LisaSerialFtpClientTest1.text` and
+   `LisaSerialFtpClientTest2.text`: no differences means
    the round trip (text conversion both ways) is exact.
 
 `bench [file]` (not listed in `help`) times the client's own work on the
@@ -928,10 +937,6 @@ it (1 KB or 4 KB per `READ_DATA`), decoding it (for a `.TEXT` file; in
 assembly and in Pascal) and the whole `-c` check of it.  It prints bytes/s for each; the server
 prints the times too.  Give it a small file (e.g.
 `bench LisaSerialFtpClientInclude.text`).
-
-`delete-test-files` (not listed in `help`) sends `DELTESTS`; the server
-then deletes only plain files directly in `<home_dir>/tests` whose names
-start with `lisatest-`, nothing else (refused with `--read-only`).
 
 ## Design notes / limitations
 

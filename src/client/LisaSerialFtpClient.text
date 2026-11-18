@@ -90,7 +90,7 @@ USES
     {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
 
 CONST
-  BUILD = '2026-11-15 15:45';  { printed at startup, so it is easy
+  BUILD = '2026-11-18 13:34';  { printed at startup, so it is easy
                                  to see which build runs; change it with each change }
   BAUD     = 57600;           { the maximum (Port B, the only port this client uses) }
   VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.
@@ -3529,12 +3529,9 @@ BEGIN
     WRITELN('debug output ', st, ' here only');
 END;
 
-{ 'delete-test-files' (hidden: not in help): ask the server to delete the
-  files the test macro (tests/LisaSerialFtpTestMacro.text) uploaded.  The
-  server (DELTESTS) deletes only plain files directly in its tests folder
-  whose names start with 'lisatest-', nothing else. }
-{ Ask question Q and wait for Y or N (from the keyboard itself, no echo;
-  other keys are ignored).  TRUE for Y. }
+{ Ask question Q and wait for Y or N (read from kbd, no echo; other keys
+  are ignored).  TRUE for Y.  In a Workshop exec file the answer comes
+  from the file (the test macro answers 'Y' on the next line). }
 FUNCTION AskYes (Q: string255): BOOLEAN;
 VAR ch: CHAR;
 BEGIN
@@ -3593,17 +3590,6 @@ BEGIN
     WRITELN('cannot delete ', name, ': error ', ecode)
   ELSE
     WRITELN('deleted ', name);
-END;
-
-PROCEDURE DoDelTests;
-BEGIN
-  IF NOT Ready THEN EXIT(DoDelTests);
-  SendLine('DELTESTS');
-  IF GetResponse(l) THEN
-    IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
-      WRITELN('server: ', COPY(l, 4, LENGTH(l) - 3), ' test file(s)')
-    ELSE
-      WRITELN('server: ', l);
 END;
 
 {--- bench: time the client's own work --------------------------------------}
@@ -4147,8 +4133,6 @@ BEGIN
         DoTFactor(arga)
       ELSE IF cmd = 'DEBUG' THEN
         DoDebug(arga)
-      ELSE IF cmd = 'DELETE-TEST-FILES' THEN
-        DoDelTests                       { hidden: for the test macro }
       ELSE IF cmd = 'BENCH' THEN
         DoBench(arga)                    { hidden: time the client's work }
       ELSE IF (cmd = 'HELP') OR (cmd = 'H') OR (cmd = '?') THEN

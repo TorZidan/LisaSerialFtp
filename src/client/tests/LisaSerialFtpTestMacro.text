@@ -1,11 +1,11 @@
 $EXEC
 ${Round-trip test of LisaSerialFtpClient, run on the Lisa.}
-${Needs: LisaSerialFtpServer.py running with --home_dir at the project}
-${folder (the one holding the tests folder), and LisaSerialFtpClient.OBJ}
-${on the Lisa.  Files it makes on the Lisa: LisaFtpClientTestFile1.text,}
-${LisaFtpClientTestFile2.text and LisaFtpClientTestFile3.text.}
-${On the server it uploads tests/lisatest-upload1.txt and deletes it}
-${again at the end (the hidden delete-test-files command).}
+${Needs: LisaSerialFtpServer.py running with --home_dir set to the src/client}
+${folder, and LisaSerialFtpClient.OBJ on the Lisa side.}
+${Files it creates on the Lisa: LisaSerialFtpClientTest1.text,}
+${LisaSerialFtpClientTest2.text and LisaSerialFtpClientTest3.text.}
+${On the server it uploads tests/LisaSerialTest-upload1.text and deletes it}
+${again at the end (delete, answering its Y/N question with Y).}
 $
 ${Note: EXISTS is evaluated when the exec processor TRANSLATES the file,}
 ${and it translates ahead of what has run; $DOIT runs everything}
@@ -14,35 +14,34 @@ ${A $DOIT right after each quit also makes the client's 'Press SPACE'}
 ${(after a failed transfer) read the real keyboard, not this file.}
 $
 ${1. Remove the files of an earlier run (else EXISTS would see them)}
-$IF EXISTS('LisaFtpClientTestFile1.text') THEN
-F{ile-Mgr}D{elete}LisaFtpClientTestFile1.text
+$IF EXISTS('LisaSerialFtpClientTest1.text') THEN
+F{ile-Mgr}D{elete}LisaSerialFtpClientTest1.text
 Y{es, delete it}
 Q{uit}
 $ENDIF
-$IF EXISTS('LisaFtpClientTestFile2.text') THEN
-F{ile-Mgr}D{elete}LisaFtpClientTestFile2.text
+$IF EXISTS('LisaSerialFtpClientTest2.text') THEN
+F{ile-Mgr}D{elete}LisaSerialFtpClientTest2.text
 Y{es, delete it}
 Q{uit}
 $ENDIF
-$IF EXISTS('LisaFtpClientTestFile3.text') THEN
-F{ile-Mgr}D{elete}LisaFtpClientTestFile3.text
+$IF EXISTS('LisaSerialFtpClientTest3.text') THEN
+F{ile-Mgr}D{elete}LisaSerialFtpClientTest3.text
 Y{es, delete it}
 Q{uit}
 $ENDIF
 $
-${2. Download a text file: the .text local name makes it a Lisa text file}
+${2. Download a text file (we chose to use LisaSerialFtpClient.text for this test)}
 R{un}LisaSerialFtpClient.OBJ
-timeout-factor 5
 timeout-factor auto
 debug on
-get tests/test_lisaftp.py LisaFtpClientTestFile1.text
+get LisaSerialFtpClient.text LisaSerialFtpClientTest1.text
 quit
 $DOIT
 $
-$IF NOT (EXISTS('LisaFtpClientTestFile1.text')) THEN
-$  WRITELN 'TEST FAILED: get tests/test_lisaftp.py did not create LisaFtpClientTestFile1.text'
+$IF NOT (EXISTS('LisaSerialFtpClientTest1.text')) THEN
+$  WRITELN 'TEST FAILED: get LisaSerialFtpClient.text did not create LisaSerialFtpClientTest1.text'
 $ELSE
-$  WRITELN 'test 1 passed: LisaFtpClientTestFile1.text received'
+$  WRITELN 'test 1 passed: LisaSerialFtpClientTest1.text received'
 $
 ${3. Upload it as text, download the uploaded copy under another name,}
 ${   then delete the uploaded copy on the server.  On the way, the -c}
@@ -56,26 +55,27 @@ R{un}LisaSerialFtpClient.OBJ
 timeout-factor 5
 timeout-factor auto
 debug on
-put LisaFtpClientTestFile1.text tests/lisatest-upload1.txt
-put -c LisaFtpClientTestFile1.text tests/lisatest-upload1.txt
-get tests/lisatest-upload1.txt LisaFtpClientTestFile2.text
-get -c tests/lisatest-upload1.txt LisaFtpClientTestFile2.text
-get -c tests/test_lisaftp.py LisaFtpClientTestFile1.text
-get -c tests/test_sum.py LisaFtpClientTestFile3.text
-get -c tests/test_lisaftp.py LisaFtpClientTestFile3.text
-delete-test-files
+put LisaSerialFtpClientTest1.text tests/LisaSerialTest-upload1.text
+put -c LisaSerialFtpClientTest1.text tests/LisaSerialTest-upload1.text
+get tests/LisaSerialTest-upload1.text LisaSerialFtpClientTest2.text
+get -c tests/LisaSerialTest-upload1.text LisaSerialFtpClientTest2.text
+get -c LisaSerialFtpClient.text LisaSerialFtpClientTest1.text
+get -c LisaSerialFtpClientInclude.text LisaSerialFtpClientTest3.text
+get -c LisaSerialFtpClientAsm.text LisaSerialFtpClientTest3.text
+delete tests/LisaSerialTest-upload1.text
+Y{es, delete it}
 quit
 $DOIT
 $
-$  IF NOT (EXISTS('LisaFtpClientTestFile2.text')) THEN
-$    WRITELN 'TEST FAILED: the round trip did not create LisaFtpClientTestFile2.text'
+$  IF NOT (EXISTS('LisaSerialFtpClientTest2.text')) THEN
+$    WRITELN 'TEST FAILED: the round trip did not create LisaSerialFtpClientTest2.text'
 $  ELSE
-$    WRITELN 'test 2 passed: LisaFtpClientTestFile2.text received (uploaded and downloaded)'
+$    WRITELN 'test 2 passed: LisaSerialFtpClientTest2.text received (uploaded and downloaded)'
 $
 ${4. Compare the two files: DIFF must report no differences}
 R{un}DIFF
-LisaFtpClientTestFile1.text
-LisaFtpClientTestFile2.text
+LisaSerialFtpClientTest1.text
+LisaSerialFtpClientTest2.text
 {no output file - this comment-only line is the [RETURN] answer}
 ${The next line is a single ESC character (0x1B, invisible in most}
 ${editors): it answers DIFF's prompt for another comparison, so DIFF quits}

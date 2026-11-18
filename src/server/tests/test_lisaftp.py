@@ -12,10 +12,12 @@ a Python stand-in for the Lisa client on the master end.
     start of a GET, a client that restarts in the middle of a transfer;
   * names: a path outside --home_dir refused, long names, non-ASCII names
     (Mac Roman on the wire, percent-encoding for the rest);
+  * PUT into a <name>.part file, renamed only once verified (an older
+    file stays until then, and after a failure);
   * GET name T (the server builds the Lisa text pages);
   * stray bytes with no line end dropped after LINE_GAP;
-  * DELETE, DELTESTS, DEBUG ON/OFF, unknown and removed commands (STAT,
-    MKDIR, DEL, PWD) answered ERR 99, and QUIT (the server waits for the
+  * DELETE, DEBUG ON/OFF, unknown and removed commands (STAT, MKDIR,
+    DEL, PWD, DELTESTS) answered ERR 99, and QUIT (the server waits for the
     next client).
 
 Run:  python3 src/server/tests/test_lisaftp.py
@@ -319,6 +321,41 @@ def main():
         time.sleep(0.3)
         with open(os.path.join(root, "upload.dat"), "rb") as f:
             check("put-bytes", f.read() == data)
+        check("put-no-part",
+              not os.path.exists(os.path.join(root, "upload.dat.part")))
+
+        # 6b. a PUT goes into '<name>.part' and replaces the file only once
+        #     verified: while it runs, and after it fails, the older
+        #     upload.dat is untouched; LIST shows a .part file like any other
+        part = os.path.join(root, "upload.dat.part")
+        lisa.send_line("PUT upload.dat 1000")
+        check("put2-ok", lisa.read_line() == "OK")
+        check("put2-ack", lisa.send_chunk(0, os.urandom(256)) == "A 0")
+        check("put2-in-part", os.path.exists(part))
+        with open(os.path.join(root, "upload.dat"), "rb") as f:
+            check("put2-old-kept-meanwhile", f.read() == data)
+        lisa.send_line("HELLO")                # the client restarts: PUT fails
+        check("put2-failed", is_banner(lisa.read_line()))
+        check("put2-part-removed", not os.path.exists(part))
+        with open(os.path.join(root, "upload.dat"), "rb") as f:
+            check("put2-old-kept", f.read() == data)
+        with open(os.path.join(root, "stale.bin.part"), "w") as f:
+            f.write("x")                       # from a server that was killed
+        lisa.send_line("LIST")
+        listed = []
+        while True:
+            l = lisa.read_line()
+            if l == "MORE":
+                lisa.send_line("NEXT")
+                continue
+            listed.append(l)
+            if l == "DONE" or l is None:
+                break
+        check("list-shows-part",
+              any((l or "").endswith(" stale.bin.part") for l in listed)
+              and any((l or "").endswith(" upload.dat") for l in listed),
+              repr(listed[-3:]))
+        os.remove(os.path.join(root, "stale.bin.part"))
 
         # 7. NAK handling: send a chunk with a corrupt CRC, expect the
         #    server to NAK it, then retransmit it correctly.
@@ -354,7 +391,8 @@ def main():
             check("nak-bytes", f.read() == data2)
 
         # 8. removed commands are rejected as unknown
-        for gone in ("STAT upload.dat", "MKDIR newdir", "DEL nakt.dat", "PWD"):
+        for gone in ("STAT upload.dat", "MKDIR newdir", "DEL nakt.dat", "PWD",
+                     "DELTESTS"):
             lisa.send_line(gone)
             check("gone-%s" % gone.split()[0],
                   lisa.read_line().startswith("ERR 99"))
@@ -518,27 +556,7 @@ def main():
         with open(os.path.join(root, "eof.dat"), "rb") as f:
             check("eof-put-kept", f.read() == data5)
 
-        # 13g. DELTESTS (hidden, for the Lisa test macro): no tests folder
-        #      -> ERR; then it deletes only <root>/tests/lisatest-* files
-        check("deltests-nodir", lisa.command("DELTESTS").startswith("ERR"))
-        td = os.path.join(root, "tests")
-        os.mkdir(td)
-        for name in ("lisatest-up1.txt", "LISATEST-UP2.TXT", "test_keep.py"):
-            with open(os.path.join(td, name), "w") as f:
-                f.write("x")
-        os.mkdir(os.path.join(td, "lisatest-dir"))           # a folder: kept
-        with open(os.path.join(root, "lisatest-top.txt"), "w") as f:
-            f.write("x")                                      # not in tests/
-        r = lisa.command("DELTESTS")
-        check("deltests-ok", r == "OK 2 deleted", r)
-        check("deltests-kept",
-              sorted(os.listdir(td)) == ["lisatest-dir", "test_keep.py"]
-              and os.path.exists(os.path.join(root, "lisatest-top.txt")),
-              repr(sorted(os.listdir(td))))
-        r = lisa.command("DELTESTS")
-        check("deltests-none", r == "OK 0 deleted", r)
-
-        # 13h. DELETE (the client's 'delete'): a file goes; a missing file,
+        # 13g. DELETE (the client's 'delete'): a file goes; a missing file,
         #      a folder, a name outside the root and bad usage are refused
         with open(os.path.join(root, "gone.txt"), "w") as f:
             f.write("x")
@@ -555,7 +573,7 @@ def main():
         r = lisa.command("DELETE")
         check("delete-usage", r is not None and r.startswith("ERR 1 "), repr(r))
 
-        # 13h2. no 32-character limit of the server's own: a 40-character
+        # 13g2. no 32-character limit of the server's own: a 40-character
         #       name can be put and got; a name the OS refuses (over 255
         #       bytes) is refused before the OK, with nothing created
         longname = "a-server-file-name-of-40-characters.bin"[:40]
@@ -584,7 +602,7 @@ def main():
         check("toolong-refused", r is not None and r.startswith("ERR 13 ")
               and not os.path.exists(os.path.join(root, toolong[:255])), repr(r)[:70])
 
-        # 13h3. non-ASCII names: the wire is Mac Roman, the Lisa's
+        # 13g3. non-ASCII names: the wire is Mac Roman, the Lisa's
         #       character set.  LIST shows a character the Lisa has as
         #       itself (e-acute = 0x8E on the wire), one it lacks and a name
         #       that is not UTF-8 percent-encoded (UTF-8 / raw bytes); every

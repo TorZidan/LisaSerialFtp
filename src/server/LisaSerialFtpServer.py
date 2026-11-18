@@ -42,8 +42,7 @@ ending in CRLF; the command word in any case):
   CAL                "CAL <ms>" after exactly CAL_SECONDS: the client's
                      timeout-factor auto
   QUIT               the client is leaving; back to the startup --baud
-  hidden: MARK, ECHO, FRAMES (the client's 'bench' command) and DELTESTS
-  (deletes the Lisa test macro's uploads: <home_dir>/tests/lisatest-*)
+  hidden: MARK, ECHO, FRAMES (the client's 'bench' command)
 PUT and DELETE are refused with --read-only.  Errors are "ERR <n> <text>".
 
 Chunks (GET and PUT): 'T' + seq (2 bytes) + length (2) + data + CRC-16 (2),
@@ -54,7 +53,10 @@ data ends the file.  Stop-and-wait: the sender waits for the reply to each
 chunk, so the Lisa is never sent more than it can hold (no XON/XOFF, no
 hardware handshake).  The receiver then sends "DONE <bytes> <crc>" for the
 whole file, and the sender answers "OK ..." or "BAD ..." with its own
-numbers; the file is kept only if they agree.
+numbers; the file is kept only if they agree.  A PUT is received into
+'<name>.part' and renamed to <name> only then, so an
+older file of that name stays as it is until the new one is verified, and
+a failed PUT leaves nothing behind.
 
 Loss recovery: a lost byte leaves the receiver short and its read times
 out; it throws away the rest of the frame and NAKs.  A lost reply makes the
@@ -62,7 +64,7 @@ sender time out and send the chunk again, which the receiver ACKs again.
 Replies carry the chunk number, so a stale one is skipped.  After
 MAX_RETRIES failed tries on one chunk either side gives up ("FAIL <why>",
 answered "OK").  A HELLO in the middle of a transfer means the client
-restarted: the transfer is abandoned (a partial PUT file deleted) and the
+restarted: the transfer is abandoned (a partial PUT discarded) and the
 new session gets a banner.
 
 Names: '/' separates folders, always under --home_dir.  The wire is Mac
@@ -1131,11 +1133,19 @@ class LisaFtpServer(Console):
         self.port.flush_input()
         self.send_banner()
 
-    def drop_partial(self, p):
-        """Remove the truncated file left behind by an interrupted PUT."""
+    PART = ".part"      # PUT: '<name>.part' holds the upload until it is verified
+
+    @classmethod
+    def part_path(cls, p):
+        """The temporary file a PUT to p writes into: '<name>.part' in the
+        same folder (so the final rename stays on one file system)."""
+        return p + cls.PART
+
+    def drop_partial(self, tmp):
+        """Remove the temporary file of a PUT that did not complete."""
         try:
-            os.remove(p)
-            self.dlog("removed partial file: %s" % p)
+            os.remove(tmp)
+            self.dlog("removed partial upload: %s" % tmp)
         except OSError:
             pass
 
@@ -1213,31 +1223,6 @@ class LisaFtpServer(Console):
         self.debug_on = self.debug_default     # a new session
         self.send_banner()
         self.say("  ok: banner sent")
-
-    TEST_DIR = "tests"          # DELTESTS: the folder (under home_dir) ...
-    TEST_PREFIX = "lisatest-"   # ... and the name prefix it may delete
-
-    def cmd_deltests(self, args):
-        """Hidden command used by the Lisa test macro (the client's
-        'delete-test-files'): delete the files it uploaded.  Deliberately
-        narrow -- only plain files directly in <home_dir>/tests whose names
-        start with 'lisatest-' (any case); never a folder, never anything
-        outside tests/, so the test scripts there cannot be touched."""
-        if self.readonly:
-            raise ProtocolError(20, "server is read-only")
-        d = os.path.join(self.home_dir, self.TEST_DIR)
-        if not os.path.isdir(d):
-            raise ProtocolError(10, "no tests folder on the server")
-        n = 0
-        for entry in sorted(os.listdir(d)):
-            full = os.path.join(d, entry)
-            if (entry.lower().startswith(self.TEST_PREFIX)
-                    and os.path.isfile(full) and not os.path.islink(full)):
-                os.remove(full)
-                self.dlog("deleted %s" % full)
-                n += 1
-        self.send_line("OK %d deleted" % n)
-        self.say("  ok: %d test file%s deleted" % (n, "" if n == 1 else "s"))
 
     BAUD_TRIAL = 10.0   # BAUD: seconds the client has to send a command at the new rate
 
@@ -1697,13 +1682,32 @@ class LisaFtpServer(Console):
         d = os.path.dirname(p)
         if not os.path.isdir(d):
             raise ProtocolError(10, "no such directory")
-        # create the file before the OK: a name the OS refuses (too long,
-        # a character it does not allow) is then an error reply, not a
-        # failure in the middle of the transfer
+        if os.path.isdir(p):
+            raise ProtocolError(13, "cannot create %s: it is a folder" % p)
+        # The upload goes into a temporary file, '<name>.part', renamed to
+        # the name only once the client has verified it: until then an
+        # older file of that name is untouched, and a failed upload leaves
+        # nothing behind.  It is created before the OK, so a name the OS
+        # refuses (a character it does not allow) is an error reply, not a
+        # failure in the middle of the transfer.
+        tmp = self.part_path(p)
         try:
-            f = open(p, "wb")
+            f = open(tmp, "wb")
         except OSError as e:
             raise ProtocolError(13, "cannot create %s: %s" % (p, e.strerror))
+        kept = False
+        try:
+            kept = self._put_into(f, tmp, p, size, args[0])
+        finally:
+            f.close()
+            if not kept:
+                self.drop_partial(tmp)
+
+    def _put_into(self, f, tmp, p, size, name):
+        """PUT, after the temporary file tmp (open as f) is made: receive
+        the chunks into it, check them with the client, and on success
+        rename it to p.  Returns True if the file was kept (renamed);
+        otherwise the caller removes tmp."""
         self.progress_start(size)
         self.timing_reset()
         self.send_line("OK")
@@ -1723,8 +1727,7 @@ class LisaFtpServer(Console):
                         # partial file
                         self.say("  FAILED: the client aborted: %s" % got[1])
                         self.port.write(b"OK\r\n")
-                        self.drop_partial(p)
-                        return
+                        return False
                     if kind == "dup":
                         # already accepted (our A was lost, so the peer
                         # retransmitted it): ACK it again and wait for the
@@ -1773,16 +1776,11 @@ class LisaFtpServer(Console):
                     total += got_len
                     seq += 1
         except PeerRestarted:
-            self.drop_partial(p)
             self.peer_restarted()
-            return
-        except TimeoutError:
-            self.drop_partial(p)
-            raise
+            return False
         if giveup:
-            self.drop_partial(p)
             self.abort("too many chunk errors")
-            return
+            return False
         done = "DONE %d %04x" % (total, crc)
         if total != size:
             # a short (or long) file must not pass as verified: the CRC only
@@ -1802,8 +1800,16 @@ class LisaFtpServer(Console):
             except ValueError:
                 good = False
         if good and total == size:
+            f.close()                   # (Windows cannot rename an open file)
+            try:
+                self._keep_mode(p, tmp)
+                os.replace(tmp, p)
+            except OSError as e:
+                self.say("  FAILED: cannot rename %s to %s: %s"
+                         % (tmp, p, e.strerror))
+                return False
             self.say("  ok: received %d bytes into %s, verified (crc %04x)%s"
-                     % (total, name_from_wire(args[0]), crc,
+                     % (total, name_from_wire(name), crc,
                         self.rate(total)))
             tl = self.timing_line([("lisa", "the Lisa until its next frame"
                                             " starts"),
@@ -1811,15 +1817,23 @@ class LisaFtpServer(Console):
                                    ("server", "the server")])
             if tl:
                 self.say(tl)
-        elif good:
-            self.say("  file deleted (size mismatch)")
-            self.drop_partial(p)
+            return True
+        if good:
+            self.say("  upload discarded (size mismatch)")
         else:
             self.say("  FAILED: verify: the client said %r, we received %d %04x;"
-                     " file deleted" % (verdict, total, crc))
-            self.drop_partial(p)
+                     " upload discarded" % (verdict, total, crc))
             if verdict == "HELLO":
                 self.peer_restarted()
+        return False
+
+    @staticmethod
+    def _keep_mode(p, tmp):
+        """A PUT over an existing file keeps that file's permissions."""
+        try:
+            os.chmod(tmp, os.stat(p).st_mode & 0o7777)
+        except OSError:
+            pass                        # no older file (or no permission)
 
     def _recv_chunk(self, seq):
         """PUT: read one framed chunk, the one numbered SEQ, and check it.
@@ -1937,9 +1951,8 @@ class LisaFtpServer(Console):
         "HELLO": cmd_hello, "LIST": cmd_list, "GET": cmd_get, "PUT": cmd_put,
         "SUM": cmd_sum, "DELETE": cmd_delete, "BAUD": cmd_baud,
         "DEBUG": cmd_debug, "CAL": cmd_cal, "QUIT": cmd_quit,
-        # hidden: the client's 'bench' command, and the Lisa test macro
+        # hidden: the client's 'bench' command
         "MARK": cmd_mark, "ECHO": cmd_echo, "FRAMES": cmd_frames,
-        "DELTESTS": cmd_deltests,
     }
     # every line a client sends: a command, or a protocol reply (which is
     # answered ERR 99 where no command is expected).  Any other line is

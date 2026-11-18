@@ -15,15 +15,18 @@ PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
 {                                                                          }
 { Commands (typed at the console prompt):                                  }
 {   list [dir]         list files on the server                            }
-{   get [-c] <remote> [local]   download a file: as text (CRLF/LF -> CR)   }
-{                          if the local or the remote name ends in .TEXT   }
-{                          (any case), else byte-exact (no changes)        }
-{   put [-c] <local> [remote]   upload a file: a name ending in .TEXT (any }
-{                          case) is sent as text (decoded; CR -> LF), any  }
-{                          other file byte-exact (no changes)              }
+{   get [-c] [-b | -t] <remote> [local]   download a file: as text         }
+{                          (CRLF/LF -> CR) if the local or the remote name }
+{                          ends in .TEXT (any case), else byte-exact       }
+{   put [-c] [-b | -t] <local> [remote]   upload a file: a name ending in  }
+{                          .TEXT (any case) is sent as text (decoded;      }
+{                          CR -> LF), any other file byte-exact            }
 {                      -c: first compare size, CRC-16 and byte sum with    }
 {                      the other side's copy; skip it if they all match    }
+{                      -b: byte-exact, -t: as text, whatever the names     }
+{   delete <remote>    delete a file on the server (asks Y/N); also del    }
 {   !list [name]       list all files on the Lisa's default volume         }
+{   !delete <local>    delete a file on the Lisa (asks Y/N); also !del     }
 {   baud [rate]        show or change the serial baud rate (server must    }
 {                      match)                                              }
 {   hello              (re-)send HELLO, wait for the server's banner       }
@@ -39,7 +42,7 @@ PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
 { Notes:                                                                   }
 {   * The server must already be running at the same baud rate             }
 {     (default 57600, 8N1).                                                }
-{   * Remote names use '/' as the path separator, as on the server (the   }
+{   * Remote names use '/' as the path separator, as on the server (the    }
 {     Lisa itself does not: there '/' is just a character in a name).      }
 {   * get as text writes a proper Lisa text file (CRLF/LF line-endings     }
 {     become Lisa text lines): the server sends the finished text pages    }
@@ -47,7 +50,7 @@ PROGRAM LisaSerialFtpClient;   { only the first 8 characters count }
 {     makes itself; get as binary writes a byte-exact copy.  Both store    }
 {     the bytes as they come, verified by the DONE byte/CRC check.         }
 {   * get receives into a temp file beside the target                      }
-{     (LisaSerialFtpClientTemp.TEXT / .BIN) and rename it to the           }
+{     (LisaSerialFtpClientTemp.TEXT / .BIN) and renames it to the          }
 {     target only when the transfer is whole; an existing target is        }
 {     replaced, a failed get leaves it untouched.                          }
 {   * Files are streamed in CHUNK-byte chunks, so a file does not need     }
@@ -90,7 +93,7 @@ USES
     {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
 
 CONST
-  BUILD = '2026-11-18 14:18';  { printed at startup, so it is easy
+  BUILD = '2026-11-18 15:47';  { printed at startup, so it is easy
                                  to see which build runs; change it with each change }
   BAUD     = 57600;           { the maximum (Port B, the only port this client uses) }
   VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.
@@ -133,7 +136,16 @@ CONST
   CALSECS  = 2;               { the server answers CAL after this many real seconds }
   CALMAX   = 400;             { give up CAL after this many 1-s timeouts (factor 200) }
   MAXTFACT = 1000;            { upper limit for 'timeout-factor <n>' }
-  MAXFRAME = 1023;            { a whole chunk frame: 5 + CHUNK + 2 bytes (keep = CHUNK + 7) }
+  { A chunk frame: 'T', seq (2 bytes), len (2 bytes), len data bytes, CRC
+    (2 bytes).  Plain numbers: Lisa Pascal has no expressions in CONST. }
+  FRMSTART = 84;              { 'T': the first byte of a chunk frame }
+  FRMHDR   = 5;               { the header: 'T' + seq + len }
+  FRMREST  = 6;               { a frame's bytes besides its data, after the 'T' }
+  FRMOVH   = 7;               { a frame's bytes besides its data: FRMHDR + 2 }
+  MAXFRAME = 1023;            { a whole chunk frame: FRMOVH + CHUNK }
+  MAXSTALE = 4;               { put: stale replies skipped per try of a chunk }
+  MAXABORT = 20;              { AbortTransfer: lines read while waiting for the
+                                peer's FAIL / OK }
   { WaitChar / WaitLine results }
   W_OK     = 0;               { got it }
   W_TMO    = 1;               { timed out (no server, or the link is dead) }
@@ -150,7 +162,8 @@ CONST
   WBLOCK   = 4096;            { bytes per WRITE_DATA when writing a file (a binary
                                 block, or 4 text pages) }
   DECMAX   = 2048;            { DECODEP's output buffer (dbuf) }
-  RXQLEN   = 1040;            { the read-ahead queue: a whole chunk frame (CHUNK + 6) }
+  RXQLEN   = 1040;            { the read-ahead queue: at least a whole chunk
+                                frame after its 'T' (FRMREST + CHUNK = 1022) }
 
 TYPE
   string255 = string[255];
@@ -170,13 +183,29 @@ VAR
   cparm    : dctype;
   finfo    : fs_info;
   actual   : longint;
-  size     : longint;
-  total    : longint;
-  crc      : integer;
-  seq      : longint;          { chunk sequence number, 0..65535 (wraps) }
-  len      : integer;
+  { The transfer under way (get, put, and the -c check): set up by DoGet,
+    DoPut and LocalSum, and shared with the routines they call (RecvChunk
+    and SendChunk get theirs as parameters; TextPass, TxBytes and TxFlush
+    use these).  The code kept in (* *) comments still has the old names
+    of these globals: ok, seq, size, total, crc, bsum, len, tmode and
+    tlines (and l for reply). }
+  xf       : RECORD
+               ok    : boolean;   { no error so far (FALSE stops it) }
+               seq   : longint;   { the chunk number to send / expect next,
+                                    0..65535 (wraps) }
+               size  : longint;   { the size announced: OK <size> (get), or
+                                    counted by TextPass (put of text) }
+               total : longint;   { bytes sent / received / checked so far }
+               crc   : integer;   { the CRC-16 of those bytes }
+               bsum  : longint;   { -c: their byte sum MOD 65536 }
+               len   : integer;   { bytes collected in buf }
+               mode  : integer;   { what TextPass does with a decoded text
+                                    byte: 0 = count it in size, 1 = send it,
+                                    2 = add it to the -c check (crc, total,
+                                    bsum) }
+               lines : longint;   { text: lines decoded by TextPass }
+             END;
   linkdead : boolean;
-  ok       : boolean;
   curbaud  : longint;         { current serial baud rate (up to 57600: needs longint) }
   atend    : boolean;          { binary put: the last (empty) chunk was read }
   i        : integer;
@@ -186,13 +215,11 @@ VAR
   cmd      : string255;
   arga     : string255;
   argb     : string255;
-  local    : pathname;
-  remote   : string255;
-  l        : string255;
-  tname    : string255;
-  sname    : string255;          { suggested target name for the get error }
+  reply    : string255;        { the last reply line read from the server }
   buf      : bytebuf;
+(* not used: PutChar's buffer (PutChar is commented out)
   txb      : ARRAY [0..1] OF ByteT;   { one-byte buffer for PutChar }
+*)
   txline   : ARRAY [1..257] OF ByteT; { SendRaw: a line + CR LF, sent with one
                                  WRITE_DATA; GLOBAL, as txframe, so it stays
                                  put while the driver sends it }
@@ -203,10 +230,12 @@ VAR
   rxqp     : integer;          { the next byte to take from rxq }
   benchoh  : longint;          { bench: the cost of a measurement, in ms }
   benchms  : longint;          { bench: the last measurement, in ms }
-  rxb      : ARRAY [0..1] OF ByteT;   { one-byte buffer for GetChar }
+  rxb      : ARRAY [0..1] OF ByteT;   { TryGetChar / WaitChar: the byte read;
+                                 RecvChunk: a chunk's 2 CRC bytes }
   tfactor  : longint;          { timeout-factor: emulated seconds per real second (1 = real Lisa) }
   curtmo   : longint;          { input timeout now set in the driver (DCp 14), -1 = unknown }
-  connected: boolean;          { TRUE after a banner; FALSE after a failed HELLO or a reply timeout }
+  connected: boolean;          { TRUE after a banner; FALSE after a failed
+                                 HELLO or a reply timeout }
   aborted  : boolean;          { Apple-period seen during this command (sticky until the prompt) }
   dirty    : boolean;          { a wait was cut short: stale bytes may be on the line }
   kbd      : TEXT;             { '-KEYBOARD': reads keys without echo (paging) }
@@ -230,8 +259,8 @@ VAR
   { The big buffers share 8 KB (a variant record): the global data of the
     program and its units must stay under 32 KB (A5-relative, 16-bit
     offsets; the 1 KB-chunk build without this crashed at launch with an
-    OOB exception), and
-    a listing (lbuf) is never shown during a transfer (pgbuf, obuf). }
+    OOB exception), and a listing (lbuf) is never shown during a transfer
+    (pgbuf, obuf). }
   big      : RECORD CASE integer OF
                0: (lbuf  : ARRAY [1..LISTBUF] OF ByteT);  { a remote listing:
                                  length byte + text per line (DoList only) }
@@ -246,7 +275,9 @@ VAR
   ackdue   : boolean;          { an ACK is held: chunk ackno }
   ackno    : longint;
   opos     : integer;          { bytes used in obuf }
+(* not used since TxtPage / TxtChunk were commented out (TXTPUT)
   pbase    : integer;          { text: where the page being built starts in obuf }
+*)
   dbuf     : ARRAY [1..DECMAX] OF ByteT;     { DECODEP's output }
 (* TXTPUT, not used: its buffers (TXTPUT was used only by TxtChunk, for
    'bench'; the server builds the text pages of a get, GET <name> T)
@@ -255,21 +286,13 @@ VAR
 *)
   ooff     : longint;          { file offset where obuf goes }
   operr    : integer;          { the first file write error (0 = none) }
-  tmode    : integer;          { what TextPass does with a decoded text byte:
-                                 0 = count it, 1 = send it, 2 = add it to the
-                                 -c check (crc, total, bsum) }
-  tlines   : longint;          { text: lines decoded by TextPass }
-  bsum     : longint;          { -c check: sum of the bytes MOD 65536 }
   cflag    : boolean;          { get/put -c: skip it if unchanged }
   bflag    : boolean;          { get/put -b: binary (byte-exact), whatever the names }
   tflag    : boolean;          { get/put -t: text, whatever the names }
-  { CRC-16 lookup tables, built once by CrcInit (see CRC16).  ~1.25 KB. }
-  crchi    : ARRAY [0..255] OF INTEGER;    { high byte of the CRC of byte i }
-  crclo    : ARRAY [0..255] OF INTEGER;    { low byte of the CRC of byte i }
-  nibhi    : ARRAY [0..255] OF ByteT;      { i DIV 16 }
-  niblo    : ARRAY [0..255] OF ByteT;      { i MOD 16 }
-  nibxor   : ARRAY [0..15, 0..15] OF ByteT; { a XOR b, for 4-bit a and b }
-  crctab   : ARRAY [0..255] OF INTEGER;    { crchi/crclo as words, for CRC16A }
+  { The CRC-16 lookup table, built once by CrcInit (see CRC16), 512 bytes.
+    The tables it is built from are CrcInit's locals (on the stack, not
+    in the global data). }
+  crctab   : ARRAY [0..255] OF INTEGER;    { the CRC of byte i, for CRC16A }
 (* PASCAL VERSION, not used: the assembly routines are always used now
   asmok    : boolean;          { the assembly routines passed AsmSelfTest: CRC16,
                                  Sum16 and MoveBytes use them }
@@ -416,6 +439,9 @@ BEGIN
 END;
 *)
 
+(* not used: a WRITE_DATA per character.  The client sends a whole line
+   (SendRaw) or frame (PutBlock) with one WRITE_DATA; PutChar was only
+   used by 'bench', to time the old way (see DoBench).
 PROCEDURE PutChar (C: CHAR);
 VAR e: integer; n: longint; v: integer;
 BEGIN
@@ -432,6 +458,7 @@ BEGIN
     HALT;
   END;
 END;
+*)
 
 PROCEDURE PutBlock (DATA: byteptr; L: INTEGER);
 VAR e: integer;
@@ -661,7 +688,7 @@ PROCEDURE DiscardUntilQuiet;
 VAR ch: CHAR; n: integer;
 BEGIN
   n := 0;
-  WHILE (n < 2 * (CHUNK + 7)) AND TryGetChar(ch, T_QUIET) DO
+  WHILE (n < 2 * MAXFRAME) AND TryGetChar(ch, T_QUIET) DO
     n := n + 1;
   FlushTypeahead;                      { the line is quiet: reset the driver's count }
 END;
@@ -1004,6 +1031,11 @@ END;
   steps: no visible pause at startup.  CrcSelfTest checks the result. }
 PROCEDURE CrcInit;
 VAR i, a, b, k, r, bit, x, y, top: INTEGER;
+    crchi: ARRAY [0..255] OF INTEGER;     { high byte of the CRC of byte i }
+    crclo: ARRAY [0..255] OF INTEGER;     { low byte of the CRC of byte i }
+    nibhi: ARRAY [0..255] OF ByteT;       { i DIV 16 }
+    niblo: ARRAY [0..255] OF ByteT;       { i MOD 16 }
+    nibxor: ARRAY [0..15, 0..15] OF ByteT; { a XOR b, for 4-bit a and b }
 
   PROCEDURE One (n, h, lo: INTEGER);       { table[n] := h * 256 + lo }
   BEGIN
@@ -1066,7 +1098,9 @@ BEGIN
       crctab[i] := crchi[i] * 256 + crclo[i];
 END;
 
-(* PASCAL VERSION, not used: the CRC in Pascal, before CRC16A
+(* PASCAL VERSION, not used: the CRC in Pascal, before CRC16A.  To use
+   it again, crchi, crclo, nibhi, niblo and nibxor must be globals again
+   (they are now CrcInit's locals).
 { CRC-16/CCITT-FALSE (poly $1021, init $FFFF, as the server) of L bytes at
   DATA, continuing from C (a signed INTEGER holding the 16-bit CRC).
   Byte-wise with the CrcInit tables, the CRC kept as two bytes hi/lo:
@@ -1329,7 +1363,7 @@ BEGIN
   r := '';
   FOR attempt := 1 TO MAXRETRY DO
   BEGIN
-    txframe[1] := 84;                      { 'T' }
+    txframe[1] := FRMSTART;                { 'T' }
     txframe[2] := ToByte(S DIV 256);       { S is 0..65535 }
     txframe[3] := ToByte(S MOD 256);
     txframe[4] := ToByte(L DIV 256);       { L is 0..CHUNK }
@@ -1343,9 +1377,9 @@ BEGIN
       rounds toward zero, giving a wrong high byte for half of all CRCs. }
     cu := c;
     IF cu < 0 THEN cu := cu + 65536;
-    txframe[5 + L + 1] := ToByte(cu DIV 256);
-    txframe[5 + L + 2] := ToByte(cu MOD 256);
-    { Transmit the whole frame (CHUNK + 7 bytes at most) with ONE
+    txframe[FRMHDR + L + 1] := ToByte(cu DIV 256);
+    txframe[FRMHDR + L + 2] := ToByte(cu MOD 256);
+    { Transmit the whole frame (MAXFRAME bytes at most) with ONE
       WRITE_DATA.  Every WRITE_DATA goes through the file system and the
       driver, so sending byte by byte made 'put' several times slower
       than 'get'.  The frame is a GLOBAL (txframe), not a local on the
@@ -1354,7 +1388,7 @@ BEGIN
       was the suspected cause of garbage sent by an earlier whole-frame
       write.  A frame corrupted anyway is rejected by the server's CRC
       check and sent again. }
-    PutBlock(@txframe[1], 7 + L);
+    PutBlock(@txframe[1], FRMOVH + L);
     { Wait for the A/N reply with a timeout: if it (or the whole chunk)
       was lost, no reply arrives and we retransmit the same chunk.  The
       receiver re-ACKs a duplicate, so a retransmit is always safe.
@@ -1381,7 +1415,7 @@ BEGIN
         IF debugon THEN
           WRITELN('    chunk ', S:1, ': stale reply [', r, '] (about an earlier chunk) skipped');
       END;
-    UNTIL (NOT stale) OR (nstale >= 4);
+    UNTIL (NOT stale) OR (nstale >= MAXSTALE);
     { 'A <S>': accepted.  'N <S+1>': the server asks for the NEXT chunk,
       so it has this one (its ACK was lost and its wait for the next
       chunk ran out first): also accepted.  Anything else -- 'N <S>',
@@ -1506,7 +1540,7 @@ END;
   After MAXRETRY attempts that do not advance SEQ we give up. }
 FUNCTION RecvChunk (VAR S: LONGINT; VAR L: INTEGER; DATA: byteptr;
                     want: INTEGER): BOOLEAN;
-VAR hdr: ARRAY [1..5] OF ByteT;
+VAR hdr: ARRAY [1..FRMHDR] OF ByteT;
     c, rlen: integer;
     rseq: LONGINT;             { 0..65535: does not fit an INTEGER }
     cu, ccrc: LONGINT;         { unsigned 16-bit CRCs (LONGINT: no overflow) }
@@ -1600,7 +1634,7 @@ BEGIN
       BEGIN
         rxqp := 1;
         rxqn := 0;
-        rxqn := TryGetBlock(@rxq[1], want + 6, FrameTmo(want + 6));
+        rxqn := TryGetBlock(@rxq[1], want + FRMREST, FrameTmo(want + FRMREST));
       END;
       { the rest of the header (4 bytes), short timeout }
       got := TryGetBlock(@hdr[2], 4, T_BLOCK);
@@ -1615,7 +1649,7 @@ BEGIN
       END
       ELSE
       BEGIN
-        hdr[1] := 84;          { 'T', already read as ch }
+        hdr[1] := FRMSTART;    { 'T', already read as ch }
         rseq := ByteVal(hdr[2]);
         rseq := rseq * 256 + ByteVal(hdr[3]);
         rlen := ByteVal(hdr[4]) * 256 + ByteVal(hdr[5]);
@@ -1751,19 +1785,19 @@ BEGIN
     SendLine(concat('FAIL ', what));
     done := FALSE;
     j := 0;
-    WHILE (NOT done) AND (j < 20) DO
+    WHILE (NOT done) AND (j < MAXABORT) DO
     BEGIN
       j := j + 1;
-      w := WaitLine(l, T_REPLY, FALSE);
-      IF w = W_OK THEN ShowRx(l);
+      w := WaitLine(reply, T_REPLY, FALSE);
+      IF w = W_OK THEN ShowRx(reply);
       IF w <> W_OK THEN
         j := 20                          { nothing more: give up waiting }
-      ELSE IF (LENGTH(l) >= 4) AND (COPY(l, 1, 4) = 'FAIL') THEN
+      ELSE IF (LENGTH(reply) >= 4) AND (COPY(reply, 1, 4) = 'FAIL') THEN
       BEGIN
         SendLine('OK');                  { acknowledge the peer's FAIL }
         done := TRUE;
       END
-      ELSE IF l = 'OK' THEN
+      ELSE IF reply = 'OK' THEN
         done := TRUE;                    { the peer acknowledged ours }
     END;
     IF NOT done THEN
@@ -1831,10 +1865,10 @@ BEGIN
     SendLine('LIST')
   ELSE
     SendLine(concat('LIST ', dir));
-  IF NOT GetResponse(l) THEN EXIT(DoList);
-  IF (LENGTH(l) = 0) OR (l[1] <> 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(DoList);
+  IF (LENGTH(reply) = 0) OR (reply[1] <> 'O') THEN
   BEGIN
-    WRITELN(l);
+    WRITELN(reply);
     EXIT(DoList);
   END;
   lbused := 0;
@@ -1843,12 +1877,12 @@ BEGIN
   full := FALSE;
   logrx := FALSE;                { no time to print while it streams in }
   REPEAT
-    IF NOT GetLine(l) THEN
+    IF NOT GetLine(reply) THEN
     BEGIN
       logrx := TRUE;
       EXIT(DoList);
     END;
-    IF l = 'MORE' THEN
+    IF reply = 'MORE' THEN
     BEGIN
       SendRaw('NEXT');           { this page is read: send the next one }
       np := np + 1;
@@ -1860,21 +1894,21 @@ BEGIN
         WRITE('.');
       END;
     END
-    ELSE IF l <> 'DONE' THEN
-      IF lbused + LENGTH(l) + 1 <= LISTBUF THEN
+    ELSE IF reply <> 'DONE' THEN
+      IF lbused + LENGTH(reply) + 1 <= LISTBUF THEN
       BEGIN
         nl := nl + 1;
         lbused := lbused + 1;
-        big.lbuf[lbused] := ToByte(LENGTH(l));
-        FOR j := 1 TO LENGTH(l) DO
+        big.lbuf[lbused] := ToByte(LENGTH(reply));
+        FOR j := 1 TO LENGTH(reply) DO
         BEGIN
           lbused := lbused + 1;
-          big.lbuf[lbused] := ToByte(ORD(l[j]));
+          big.lbuf[lbused] := ToByte(ORD(reply[j]));
         END;
       END
       ELSE
         full := TRUE;
-  UNTIL l = 'DONE';
+  UNTIL reply = 'DONE';
   logrx := TRUE;
   IF (np > 1) AND NOT debugon THEN
     WRITELN(' ', np:1, ' pages');
@@ -1888,12 +1922,12 @@ BEGIN
     n := ByteVal(big.lbuf[k]);
     {$R-}        { l[j] is written past the current length }
     FOR j := 1 TO n DO
-      l[j] := CHR(ByteVal(big.lbuf[k + j]));
-    l[0] := CHR(n);
+      reply[j] := CHR(ByteVal(big.lbuf[k + j]));
+    reply[0] := CHR(n);
     {$R+}
     k := k + n;
     IF NOT PageMore THEN EXIT(DoList);
-    WRITELN(l);
+    WRITELN(reply);
   END;
   IF full THEN
     IF PageMore THEN
@@ -2013,7 +2047,8 @@ BEGIN
     IF (got = 6) AND (rs = E) AND (h[3] = 0) AND (h[4] = 0) AND (cu = cr) THEN
     BEGIN
       IF debugon THEN
-        WRITELN('    chunk ', E:1, ': end-of-file chunk received again (our ACK or DONE was lost) -> ACK and DONE again');
+        WRITELN('    chunk ', E:1, ': end-of-file chunk received again',
+                ' (our ACK or DONE was lost) -> ACK and DONE again');
       SendACK(E);
       SendLine(D);
     END
@@ -2029,65 +2064,65 @@ END;
 
 {--- text decoding, the -c check, file writing ---------------------------}
 
-{ text: the LEN bytes collected in buf are full (or the last ones).
-  tmode 1: send them as one chunk; tmode 2: add them to the -c check.
-  Both add them to crc and total. }
+{ text: the xf.len bytes collected in buf are full (or the last ones).
+  xf.mode 1: send them as one chunk; xf.mode 2: add them to the -c check.
+  Both add them to xf.crc and xf.total. }
 PROCEDURE TxFlush;
 BEGIN
-  IF ok AND (len > 0) THEN
+  IF xf.ok AND (xf.len > 0) THEN
   BEGIN
-    CRC16(@buf[1], len, crc);
-    total := total + len;
-    IF tmode = 2 THEN
-      Sum16(@buf[1], len, bsum)
+    CRC16(@buf[1], xf.len, xf.crc);
+    xf.total := xf.total + xf.len;
+    IF xf.mode = 2 THEN
+      Sum16(@buf[1], xf.len, xf.bsum)
     ELSE
     BEGIN
-      ok := SendChunk(seq, @buf, len);
-      IF ok THEN NextSeq(seq);
+      xf.ok := SendChunk(xf.seq, @buf, xf.len);
+      IF xf.ok THEN NextSeq(xf.seq);
     END;
   END;
-  len := 0;
+  xf.len := 0;
 END;
 
-{ text: N decoded bytes in dbuf (DECODEP's output) -- counted (tmode 0),
-  added to the -c check (tmode 2), or cut into chunks in buf, which
-  TxFlush sends (tmode 1). }
+{ text: N decoded bytes in dbuf (DECODEP's output) -- counted (xf.mode 0),
+  added to the -c check (xf.mode 2), or cut into chunks in buf, which
+  TxFlush sends (xf.mode 1). }
 PROCEDURE TxBytes (n: integer);
 VAR k, m: integer;
 BEGIN
-  IF tmode = 0 THEN
-    size := size + n
-  ELSE IF tmode = 2 THEN
+  IF xf.mode = 0 THEN
+    xf.size := xf.size + n
+  ELSE IF xf.mode = 2 THEN
   BEGIN
-    CRC16(@dbuf[1], n, crc);
-    Sum16(@dbuf[1], n, bsum);
-    total := total + n;
+    CRC16(@dbuf[1], n, xf.crc);
+    Sum16(@dbuf[1], n, xf.bsum);
+    xf.total := xf.total + n;
   END
   ELSE
   BEGIN
     k := 0;
-    WHILE ok AND (k < n) DO
+    WHILE xf.ok AND (k < n) DO
     BEGIN
-      m := CHUNK - len;
+      m := CHUNK - xf.len;
       IF m > n - k THEN m := n - k;
-      MoveBytes(@dbuf[k + 1], @buf[len + 1], m);
-      len := len + m;
+      MoveBytes(@dbuf[k + 1], @buf[xf.len + 1], m);
+      xf.len := xf.len + m;
       k := k + m;
-      IF len = CHUNK THEN TxFlush;
+      IF xf.len = CHUNK THEN TxFlush;
     END;
   END;
 END;
 
 { TextPass: decode the Lisa .TEXT file open as FREF (positioned at its
-  start) into the bytes that put sends, and hand them on as tmode says:
-    tmode 0  count them in size (put's first pass: the size for PUT);
-    tmode 1  collect them in buf; TxFlush sends each full CHUNK as a
-             chunk frame (put's second pass);
-    tmode 2  add them to crc, total and bsum (the -c check, LocalSum).
-  The caller sets tmode, and, as that mode needs, size, crc, total,
-  bsum, len (0), seq and ok (TRUE).  For tmode 1 and 2 the caller calls
-  TxFlush after it for the last, short buf.  TextPass sets tlines to the
-  number of lines decoded.
+  start) into the bytes that put sends, and hand them on as xf.mode says:
+    0  count them in xf.size (put's first pass: the size for PUT);
+    1  collect them in buf; TxFlush sends each full CHUNK as a chunk
+       frame (put's second pass);
+    2  add them to xf.crc, xf.total and xf.bsum (the -c check, LocalSum).
+  The caller sets xf.mode and, as that mode needs, xf.size, xf.crc,
+  xf.total, xf.bsum, xf.len (0), xf.seq and xf.ok (TRUE).  For modes 1
+  and 2 the caller calls TxFlush after it for the last, short buf.
+  TextPass sets xf.lines to the number of lines decoded.
 
   The raw pages are read with READ_DATA, TBUF bytes (4 pages) at a time,
   NOT with the Pascal text type: its READLN edits the line (a CHR(8)
@@ -2105,8 +2140,8 @@ END;
   (~15 times slower) is kept below in a comment.
 
   Returns FALSE on a read error (reported, after ending the progress
-  line); TRUE at the end of the file, or when ok became FALSE (a failed
-  chunk send, tmode 1), which the caller checks.  An end-of-file error
+  line); TRUE at the end of the file, or when xf.ok became FALSE (a
+  failed chunk send, xf.mode 1), which the caller checks.  An end-of-file error
   code from READ_DATA (848, 881, 883, 956) is the normal end. }
 FUNCTION TextPass (fref: integer): BOOLEAN;
 VAR n: integer;          { bytes read into pgbuf this time (up to TBUF) }
@@ -2121,10 +2156,10 @@ VAR n: integer;          { bytes read into pgbuf this time (up to TBUF) }
     atstart, pad, counting: boolean;
 BEGIN
   TextPass := FALSE;
-  tlines := 0;
+  xf.lines := 0;
   first := TRUE;
   done := FALSE;
-  counting := (tmode = 0);
+  counting := (xf.mode = 0);
   REPEAT
     ecode := 0;
     actual := 0;
@@ -2144,7 +2179,7 @@ BEGIN
     n := actual;
     IF n = 0 THEN done := TRUE;
     pg := 0;                     { the current page is pgbuf[pg+1 .. pe] }
-    WHILE ok AND (pg < n) DO
+    WHILE xf.ok AND (pg < n) DO
     BEGIN
       pe := pg + TPAGE;
       IF pe > n THEN pe := n;
@@ -2157,9 +2192,9 @@ BEGIN
         at := 1;
         REPEAT
           dl := 0;
-          DECODEP(@big.pgbuf[pg + 1], pe - pg, p, at, @dbuf[1], DECMAX, dl, tlines);
+          DECODEP(@big.pgbuf[pg + 1], pe - pg, p, at, @dbuf[1], DECMAX, dl, xf.lines);
           IF dl > 0 THEN TxBytes(dl);
-        UNTIL (p >= pe - pg) OR NOT ok;
+        UNTIL (p >= pe - pg) OR NOT xf.ok;
       END;
       (* PASCAL VERSION, not used: the page in Pascal, before DECODEP
       ELSE
@@ -2245,7 +2280,7 @@ BEGIN
       *)
       pg := pg + TPAGE;
     END;
-  UNTIL done OR NOT ok;
+  UNTIL done OR NOT xf.ok;
   TextPass := TRUE;
 END;
 
@@ -2257,12 +2292,12 @@ FUNCTION LocalSum (lname: pathname; binary, isget: boolean): BOOLEAN;
 VAR fref: integer; done: boolean;
 BEGIN
   LocalSum := FALSE;
-  crc := $FFFF;
-  total := 0;
-  bsum := 0;
-  len := 0;
-  ok := TRUE;
-  tmode := 2;
+  xf.crc := $FFFF;
+  xf.total := 0;
+  xf.bsum := 0;
+  xf.len := 0;
+  xf.ok := TRUE;
+  xf.mode := 2;
   ecode := 0;
   OPEN(ecode, lname, fref, [dread]);
   IF ecode > 0 THEN
@@ -2288,28 +2323,28 @@ BEGIN
       IF ecode > 0 THEN
       BEGIN
         WRITELN('file read error: ', ecode);
-        ok := FALSE;
+        xf.ok := FALSE;
       END
       ELSE
       BEGIN
         IF actual = 0 THEN done := TRUE;
         IF actual > 0 THEN
         BEGIN
-          CRC16(@big.pgbuf[1], actual, crc);
-          Sum16(@big.pgbuf[1], actual, bsum);
-          total := total + actual;
+          CRC16(@big.pgbuf[1], actual, xf.crc);
+          Sum16(@big.pgbuf[1], actual, xf.bsum);
+          xf.total := xf.total + actual;
         END;
       END;
-    UNTIL done OR NOT ok;
+    UNTIL done OR NOT xf.ok;
   END
   ELSE
   BEGIN
-    IF NOT TextPass(fref) THEN ok := FALSE;
+    IF NOT TextPass(fref) THEN xf.ok := FALSE;
     TxFlush;                     { the last, short part }
   END;
   ecode := 0;
   CLOSE_OBJECT(ecode, fref);
-  LocalSum := ok;
+  LocalSum := xf.ok;
 END;
 
 { Write obuf[1..opos] to the file FREF at offset ooff (one WRITE_DATA:
@@ -2433,8 +2468,9 @@ BEGIN
 END;
 *)
 
-{ Create the Lisa text file NAME, open as FREF for writing its pages with
-  TxtChunk/TxtPage.  The header page comes from the Pascal run-time
+{ Create the Lisa text file NAME, open as FREF for writing its pages
+  (get: the pages the server sends, GET <name> T, collected in obuf and
+  written by OutFlush).  The header page comes from the Pascal run-time
   system: REWRITE + CLOSE makes a text file of just its 1024-byte header
   (see LisaOsTextFileSpecification.txt); the pages go after it.  FALSE
   (said why) if that is not what it made. }
@@ -2471,7 +2507,7 @@ BEGIN
     EXIT(OpenText);
   END;
   opos := 0;
-  pbase := 0;
+  (* pbase := 0;   not used since TxtPage / TxtChunk were commented out *)
   ooff := TPAGE;                 { the pages go after the header }
   operr := 0;
   OpenText := TRUE;
@@ -2485,8 +2521,9 @@ END;
   LisaSerialFtpServer.py).  Two different files pass all three only in
   rare cases (see README).  FALSE on any difference or problem: the
   caller then transfers the file as usual (a missing file on either side
-  is reported by that transfer).  isget: called by get (see LocalSum).  If the server does not answer,
-  'connected' is FALSE afterwards (or 'aborted' TRUE). }
+  is reported by that transfer).  isget: called by get (see LocalSum).
+  If the server does not answer, 'connected' is FALSE afterwards (or
+  'aborted' TRUE). }
 FUNCTION SameFile (rname: string255; lname: pathname; binary, isget: boolean): BOOLEAN;
 VAR t1, t2, t3, want: string255; si: integer;
 BEGIN
@@ -2499,10 +2536,10 @@ BEGIN
     SendLine(concat('SUM ', rname, ' B'))
   ELSE
     SendLine(concat('SUM ', rname, ' T'));
-  IF NOT GetResponse(l) THEN EXIT(SameFile);   { it said why }
-  IF (LENGTH(l) = 0) OR (l[1] <> 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(SameFile);   { it said why }
+  IF (LENGTH(reply) = 0) OR (reply[1] <> 'O') THEN
   BEGIN
-    IF POS('ERR 11 ', l) = 1 THEN  { no such file on the server }
+    IF POS('ERR 11 ', reply) = 1 THEN  { no such file on the server }
     BEGIN
       IF isget THEN
         WRITELN('no copy on the server')        { the get then says so too }
@@ -2510,19 +2547,19 @@ BEGIN
         WRITELN('no copy on the server, so sending the file');
     END
     ELSE
-      WRITELN('server: ', l);
+      WRITELN('server: ', reply);
     EXIT(SameFile);
   END;
-  IntToStr(total, t1);
-  IntToHex(crc, t2);
-  IF bsum >= 32768 THEN          { unsigned -> signed, for IntToHex }
-    si := bsum - 65536
+  IntToStr(xf.total, t1);
+  IntToHex(xf.crc, t2);
+  IF xf.bsum >= 32768 THEN          { unsigned -> signed, for IntToHex }
+    si := xf.bsum - 65536
   ELSE
-    si := bsum;
+    si := xf.bsum;
   IntToHex(si, t3);
   want := concat('OK ', t1, ' ', t2, ' ', t3);
-  UpperStr(l);
-  IF l = want THEN
+  UpperStr(reply);
+  IF reply = want THEN
   BEGIN
     SameFile := TRUE;
     IF isget THEN
@@ -2534,7 +2571,7 @@ BEGIN
   BEGIN
     WRITELN('the two copies differ: transferring it');
     IF debugon THEN
-      WRITELN('    local: ', want, '  server: ', l);
+      WRITELN('    local: ', want, '  server: ', reply);
   END;
 END;
 
@@ -2553,7 +2590,8 @@ BEGIN
   IF binary THEN
     WRITELN('get ', rname, ' -> ', lname, '  (saving it as-is, byte-exact)')
   ELSE
-    WRITELN('get ', rname, ' -> ', lname, '  (saving it as text file, converting line endings to \r)');
+    WRITELN('get ', rname, ' -> ', lname,
+            '  (saving it as text file, converting line endings to \r)');
   IF skipsame THEN
   BEGIN
     IF SameFile(rname, lname, binary, TRUE) THEN
@@ -2570,14 +2608,15 @@ BEGIN
     SendLine(concat('GET ', rname))
   ELSE
     SendLine(concat('GET ', rname, ' T'));
-  IF NOT GetResponse(l) THEN EXIT(DoGet);
-  IF (LENGTH(l) > 0) AND (l[1] <> 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(DoGet);
+  IF (LENGTH(reply) > 0) AND (reply[1] <> 'O') THEN
   BEGIN
-    WRITELN(l);
+    WRITELN(reply);
     EXIT(DoGet);
   END;
-  size := StrToInt(COPY(l, 4, LENGTH(l) - 3));   { "OK <size>" -> digits from pos 4 to end }
-  ProgStart(size);
+  { "OK <size>": the digits from position 4 to the end }
+  xf.size := StrToInt(COPY(reply, 4, LENGTH(reply) - 3));
+  ProgStart(xf.size);
   { Receive into a temp file beside the target and rename it only when the
     transfer is whole, so a failed get never leaves a truncated target. }
   TmpNameOf(lname, binary, tmpname);
@@ -2616,9 +2655,9 @@ BEGIN
       EXIT(DoGet);
     END;
   END;
-  seq := 0;
-  crc := $FFFF;
-  total := 0;
+  xf.seq := 0;
+  xf.crc := $FFFF;
+  xf.total := 0;
   linkdead := FALSE;
   holdack := TRUE;          { the ACK after the disk write (AckNow below), so
                               nothing arrives during a disk write.  ACKing at
@@ -2639,81 +2678,79 @@ BEGIN
     { RecvChunk handles loss recovery internally: it NAKs a bad/partial
       chunk (the server retransmits), re-ACKs a duplicate, and retries up
       to MAXRETRY times before giving up.  So one call per chunk here. }
-    eofseq := seq;
-    { trace (debug on), used to find where a hang happened -- to restore it,
-      delete these two lines and the closing brace below:
+    eofseq := xf.seq;
+    (* trace (debug on), used to find where a hang happened:
     IF debugon THEN
       WRITELN('    chunk ', seq:1, ': waiting for it...');
-    }
-    IF size - total >= CHUNK THEN  { the length of the chunk to come }
+    *)
+    IF xf.size - xf.total >= CHUNK THEN  { the length of the chunk to come }
       want := CHUNK
-    ELSE IF size - total > 0 THEN
-      want := size - total
+    ELSE IF xf.size - xf.total > 0 THEN
+      want := xf.size - xf.total
     ELSE
       want := 0;
-    ok := RecvChunk(seq, len, @buf[1], want);
-    IF ok THEN
+    xf.ok := RecvChunk(xf.seq, xf.len, @buf[1], want);
+    IF xf.ok THEN
     BEGIN
       { Any disk write this chunk needs, then the ACK (RecvChunk held it),
         then file the chunk in obuf (no disk).  So the next frame never
         arrives during a disk write (see holdack above).  Binary and text
         alike: a text get receives the finished pages (GET <name> T). }
-      IF len > 0 THEN
-        IF opos + len > WBLOCK THEN OutFlush(fref);
+      IF xf.len > 0 THEN
+        IF opos + xf.len > WBLOCK THEN OutFlush(fref);
       AckNow;
-      IF len > 0 THEN
+      IF xf.len > 0 THEN
       BEGIN
         { collect the chunks in obuf, written 4 KB at a time (above,
           before the ACK of the chunk that does not fit any more) }
-        MoveBytes(@buf[1], @big.obuf[opos + 1], len);
-        opos := opos + len;
+        MoveBytes(@buf[1], @big.obuf[opos + 1], xf.len);
+        opos := opos + xf.len;
         IF operr > 0 THEN
         BEGIN
           ProgEnd;
           WRITELN('file write error: ', operr);
-          ok := FALSE;
+          xf.ok := FALSE;
         END;
-        IF ok THEN
+        IF xf.ok THEN
         BEGIN
           { total/crc are over the RECEIVED bytes (for text, the pages),
             checked against the server's in the DONE exchange }
-          CRC16(@buf[1], len, crc);
-          total := total + len;
+          CRC16(@buf[1], xf.len, xf.crc);
+          xf.total := xf.total + xf.len;
         END;
-        { trace (debug on), used to find where a hang happened -- to restore it,
-      delete these two lines and the closing brace below:
+        (* trace (debug on), used to find where a hang happened:
         IF debugon THEN
           WRITELN('    chunk ', eofseq:1, ': written');
-        }
+        *)
       END;
     END;
-  UNTIL (NOT ok) OR (len = 0);
+  UNTIL (NOT xf.ok) OR (xf.len = 0);
   holdack := FALSE;
   ackdue := FALSE;
   ProgEnd;                  { end the line of progress marks }
   { write what is still in obuf: the last block }
-  IF ok THEN
+  IF xf.ok THEN
   BEGIN
     OutFlush(fref);
     IF operr > 0 THEN
     BEGIN
       WRITELN('file write error: ', operr);
-      ok := FALSE;
+      xf.ok := FALSE;
     END;
   END;
-  IF ok THEN
+  IF xf.ok THEN
   BEGIN
-    IntToStr(total, t1);
-    IntToHex(crc, t2);
+    IntToStr(xf.total, t1);
+    IntToHex(xf.crc, t2);
     dline := concat('DONE ', t1, ' ', t2);
     SendLine(dline);
     vok := FALSE;                     { the server's verdict: OK/BAD <bytes> <crc> }
-    IF GetVerdict(eofseq, dline, l) THEN
+    IF GetVerdict(eofseq, dline, reply) THEN
     BEGIN
-      vok := Matches(l, 'OK', total, crc);
+      vok := Matches(reply, 'OK', xf.total, xf.crc);
       IF NOT vok THEN
-        WRITELN('VERIFY FAILED: received ', total, ' bytes, CRC ', t2,
-                '; the server says: ', l);
+        WRITELN('VERIFY FAILED: received ', xf.total, ' bytes, CRC ', t2,
+                '; the server says: ', reply);
     END;
     ecode := 0;
     CLOSE_OBJECT(ecode, fref);
@@ -2741,16 +2778,16 @@ BEGIN
     LeafNameOf(lname, leaf);
     RENAME_ENTRY(ecode, tmpname, leaf);
     IF ecode > 0 THEN
-      WRITELN('received ', total, ' bytes, but rename to ', lname,
+      WRITELN('received ', xf.total, ' bytes, but rename to ', lname,
               ' failed: ', ecode, ' -- data is in ', tmpname)
     ELSE
     BEGIN
       xferfail := FALSE;               { the only way a get succeeds }
       IF binary THEN
-        WRITELN('received ', total, ' of ', size, ' bytes into ', lname,
+        WRITELN('received ', xf.total, ' of ', xf.size, ' bytes into ', lname,
                 ', verified (CRC ', t2, ')')
       ELSE
-        WRITELN('received ', total DIV TPAGE, ' pages of Lisa text into ', lname,
+        WRITELN('received ', xf.total DIV TPAGE, ' pages of Lisa text into ', lname,
                 ', verified (CRC ', t2, ')');
     END;
   END
@@ -2770,8 +2807,8 @@ END;
 
 { Upload lname as rname.  binary: the file's bytes as they are (READ_DATA).
   Text (a Lisa .TEXT file): decoded by TextPass (see there).  PUT needs the
-  byte count first, so the file is decoded twice: once to count (tmode 0),
-  once to send (tmode 1).  skipsame (put -c): first ask the server whether
+  byte count first, so the file is decoded twice: once to count (xf.mode
+  0), once to send (xf.mode 1).  skipsame (put -c): first ask the server whether
   its copy is the same (SameFile); if so, nothing is sent. }
 { put -t: does the file look like a Lisa text file?  Its size is a
   whole number of 1024-byte pages, at least the header page; and its
@@ -2855,7 +2892,8 @@ BEGIN
   IF binary THEN
     WRITELN('put ', lname, ' -> ', rname, '  (sending it as-is, byte-exact)')
   ELSE
-    WRITELN('put ', lname, ' -> ', rname, '  (sending it as text file, converting line endings to \n)');
+    WRITELN('put ', lname, ' -> ', rname,
+            '  (sending it as text file, converting line endings to \n)');
   IF skipsame THEN
   BEGIN
     IF SameFile(rname, lname, binary, FALSE) THEN
@@ -2865,7 +2903,7 @@ BEGIN
     END;
     IF aborted OR NOT connected THEN EXIT(DoPut);   { the check found no server }
   END;
-  ok := TRUE;
+  xf.ok := TRUE;
   ecode := 0;
   IF binary THEN
   BEGIN
@@ -2875,7 +2913,7 @@ BEGIN
       WRITELN('cannot stat ', lname, ': ', ecode);
       EXIT(DoPut);
     END;
-    size := finfo.size;
+    xf.size := finfo.size;
   END
   ELSE
   BEGIN
@@ -2885,20 +2923,20 @@ BEGIN
       WRITELN('cannot open ', lname, ': ', ecode);
       EXIT(DoPut);
     END;
-    tmode := 0;                    { pass 1: count the bytes to send }
-    size := 0;
+    xf.mode := 0;                    { pass 1: count the bytes to send }
+    xf.size := 0;
     vok := TextPass(fref);
     ecode := 0;
     CLOSE_OBJECT(ecode, fref);
     IF NOT vok THEN EXIT(DoPut);
   END;
-  IntToStr(size, t1);
-  ProgStart(size);
+  IntToStr(xf.size, t1);
+  ProgStart(xf.size);
   SendLine(concat('PUT ', rname, ' ', t1));
-  IF NOT GetResponse(l) THEN EXIT(DoPut);
-  IF (LENGTH(l) > 0) AND (l[1] <> 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(DoPut);
+  IF (LENGTH(reply) > 0) AND (reply[1] <> 'O') THEN
   BEGIN
-    WRITELN(l);
+    WRITELN(reply);
     EXIT(DoPut);
   END;
   ecode := 0;
@@ -2909,12 +2947,12 @@ BEGIN
     AbortTransfer('put aborted');  { the server already said OK }
     EXIT(DoPut);
   END;
-  seq := 0;
+  xf.seq := 0;
   linkdead := FALSE;
   eofdone := FALSE;
-  ok := TRUE;
-  crc := $FFFF;                    { CRC-16 and count of everything sent, }
-  total := 0;                      { for the end-of-transfer verification }
+  xf.ok := TRUE;
+  xf.crc := $FFFF;                    { CRC-16 and count of everything sent, }
+  xf.total := 0;                      { for the end-of-transfer verification }
   IF binary THEN
   BEGIN
     { 4 * CHUNK bytes per READ_DATA (each call costs a disk access), sent as
@@ -2944,35 +2982,35 @@ BEGIN
       BEGIN
         ProgEnd;
         WRITELN('file read error: ', ecode);
-        ok := FALSE
+        xf.ok := FALSE
       END
       ELSE
       BEGIN
         got := actual;
         IF got = 0 THEN atend := TRUE;
         k := 0;
-        WHILE ok AND (k < got) DO
+        WHILE xf.ok AND (k < got) DO
         BEGIN
-          len := got - k;
-          IF len > CHUNK THEN len := CHUNK;
-          CRC16(@big.pgbuf[k + 1], len, crc);
-          total := total + len;
-          ok := SendChunk(seq, @big.pgbuf[k + 1], len);
-          IF ok THEN NextSeq(seq);
-          k := k + len;
+          xf.len := got - k;
+          IF xf.len > CHUNK THEN xf.len := CHUNK;
+          CRC16(@big.pgbuf[k + 1], xf.len, xf.crc);
+          xf.total := xf.total + xf.len;
+          xf.ok := SendChunk(xf.seq, @big.pgbuf[k + 1], xf.len);
+          IF xf.ok THEN NextSeq(xf.seq);
+          k := k + xf.len;
         END;
       END;
-    UNTIL (NOT ok) OR atend;
-    IF ok AND (total <> size) THEN { never end a file that came out short }
+    UNTIL (NOT xf.ok) OR atend;
+    IF xf.ok AND (xf.total <> xf.size) THEN { never end a file that came out short }
     BEGIN
       ProgEnd;
-      WRITELN('read ', total, ' bytes of ', lname, ', but its size is ', size);
-      ok := FALSE;
+      WRITELN('read ', xf.total, ' bytes of ', lname, ', but its size is ', xf.size);
+      xf.ok := FALSE;
     END;
-    IF ok THEN                     { the empty chunk: end of file }
+    IF xf.ok THEN                     { the empty chunk: end of file }
     BEGIN
-      ok := SendChunk(seq, @buf, 0);
-      IF ok THEN NextSeq(seq);
+      xf.ok := SendChunk(xf.seq, @buf, 0);
+      IF xf.ok THEN NextSeq(xf.seq);
     END;
   END
   ELSE
@@ -2980,34 +3018,34 @@ BEGIN
     { text: pass 2, decode again and send; a line may straddle two
       chunks.  The end is marked, as for binary, by an empty chunk after
       the last short (or full) one. }
-    tmode := 1;
-    len := 0;
-    IF NOT TextPass(fref) THEN ok := FALSE;
+    xf.mode := 1;
+    xf.len := 0;
+    IF NOT TextPass(fref) THEN xf.ok := FALSE;
     TxFlush;                       { the last, short chunk }
-    IF ok THEN                     { the empty chunk: end of file }
+    IF xf.ok THEN                     { the empty chunk: end of file }
     BEGIN
-      ok := SendChunk(seq, @buf, 0);
-      IF ok THEN NextSeq(seq);
+      xf.ok := SendChunk(xf.seq, @buf, 0);
+      IF xf.ok THEN NextSeq(xf.seq);
     END;
   END;
   ProgEnd;                         { end the line of progress marks }
-  IF ok THEN
+  IF xf.ok THEN
   BEGIN
     { DONE <bytes> <crc>: what the server got (already in donel if it
       came in place of the end-of-file chunk's ACK) }
     IF eofdone THEN              { (no OR: Lisa Pascal may evaluate both sides) }
     BEGIN
-      l := donel;
-      ShowRx(l);
+      reply := donel;
+      ShowRx(reply);
       gotl := TRUE;
     END
     ELSE
-      gotl := GetLine(l);
+      gotl := GetLine(reply);
     IF gotl THEN
     BEGIN
-      vok := Matches(l, 'DONE', total, crc);
-      IntToStr(total, t1);
-      IntToHex(crc, t2);
+      vok := Matches(reply, 'DONE', xf.total, xf.crc);
+      IntToStr(xf.total, t1);
+      IntToHex(xf.crc, t2);
       IF vok THEN                  { verdict, with our numbers }
         SendLine(concat('OK ', t1, ' ', t2))
       ELSE
@@ -3016,15 +3054,15 @@ BEGIN
       BEGIN
         xferfail := FALSE;             { the only way a put succeeds }
         IF binary THEN
-          WRITELN('sent ', total, ' bytes from ', lname, ', verified (CRC ', t2, ')')
+          WRITELN('sent ', xf.total, ' bytes from ', lname, ', verified (CRC ', t2, ')')
         ELSE
-          WRITELN('sent ', tlines, ' lines (', total, ' bytes) from ', lname,
+          WRITELN('sent ', xf.lines, ' lines (', xf.total, ' bytes) from ', lname,
                   ', verified (CRC ', t2, ')');
       END
       ELSE
       BEGIN
-        WRITELN('VERIFY FAILED: sent ', total, ' bytes, CRC ', t2,
-                '; the server says: ', l);
+        WRITELN('VERIFY FAILED: sent ', xf.total, ' bytes, CRC ', t2,
+                '; the server says: ', reply);
         WRITELN('put failed: the server deletes its copy');
       END;
     END;
@@ -3197,11 +3235,11 @@ BEGIN
     SendLine('DEBUG ON')
   ELSE
     SendLine('DEBUG OFF');
-  IF NOT GetResponse(l) THEN EXIT(SyncDebug);
-  IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(SyncDebug);
+  IF (LENGTH(reply) > 0) AND (reply[1] = 'O') THEN
     SyncDebug := TRUE
   ELSE IF debugon THEN
-    WRITELN('the server does not know DEBUG (old LisaSerialFtpServer.py?): ', l);
+    WRITELN('the server does not know DEBUG (old LisaSerialFtpServer.py?): ', reply);
 END;
 
 { Send HELLO and wait for the server's banner line (starts with 'H');
@@ -3268,17 +3306,17 @@ BEGIN
   SendLine('HELLO');
   FOR j := 1 TO 10 DO
   BEGIN
-    w := WaitLine(l, T_HELLO, TRUE);
+    w := WaitLine(reply, T_HELLO, TRUE);
     IF w <> W_OK THEN
     BEGIN
       NoServer(w);
       EXIT(DoHello);
     END;
-    IF (LENGTH(l) = 0) OR (l[1] <> 'H') THEN
-      WRITELN('server line: [', l, ']')     { not the banner (e.g. a stale line) }
+    IF (LENGTH(reply) = 0) OR (reply[1] <> 'H') THEN
+      WRITELN('server line: [', reply, ']')     { not the banner (e.g. a stale line) }
     ELSE
     BEGIN
-      banner := l;
+      banner := reply;
       connected := TRUE;
       SetTmo(0);                       { back to no timeout }
       { HELLO resets the server's debug output to its startup setting
@@ -3309,9 +3347,11 @@ BEGIN
         IF sch <> CHUNK THEN
         BEGIN
           IF sch < 0 THEN
-            WRITELN('WARNING: the server does not name its chunk size; this client''s is ', CHUNK, '.')
+            WRITELN('WARNING: the server does not name its chunk size;',
+                    ' this client''s is ', CHUNK, '.')
           ELSE
-            WRITELN('WARNING: the server''s chunk size is ', sch, ', this client''s is ', CHUNK, '.');
+            WRITELN('WARNING: the server''s chunk size is ', sch,
+                    ', this client''s is ', CHUNK, '.');
           WRITELN('get and put will fail: use LisaSerialFtpServer.py and');
           WRITELN('LisaSerialFtpClient.text with the same chunk size.');
         END;
@@ -3350,9 +3390,9 @@ BEGIN
   SendLine('HELLO');
   FOR j := 1 TO 3 DO
   BEGIN
-    w := WaitLine(l, T_HELLO, TRUE);
+    w := WaitLine(reply, T_HELLO, TRUE);
     IF w <> W_OK THEN EXIT(BannerAt);
-    IF (LENGTH(l) > 0) AND (l[1] = 'H') THEN
+    IF (LENGTH(reply) > 0) AND (reply[1] = 'H') THEN
     BEGIN
       BannerAt := TRUE;
       EXIT(BannerAt);
@@ -3418,10 +3458,10 @@ BEGIN
   DrainInput;
   IntToStr(nb, t);
   SendLine(concat('BAUD ', t));
-  IF NOT GetResponse(l) THEN EXIT(DoBaud);      { it said why }
-  IF l <> concat('OK ', t) THEN
+  IF NOT GetResponse(reply) THEN EXIT(DoBaud);      { it said why }
+  IF reply <> concat('OK ', t) THEN
   BEGIN
-    WRITELN('server: ', l);
+    WRITELN('server: ', reply);
     WRITELN('baud rate unchanged: ', curbaud);
     EXIT(DoBaud);
   END;
@@ -3596,11 +3636,11 @@ BEGIN
   END;
   IF NOT Ready THEN EXIT(DoDelRemote);
   SendLine(concat('DELETE ', name));
-  IF GetResponse(l) THEN
-    IF (LENGTH(l) > 0) AND (l[1] = 'O') THEN
+  IF GetResponse(reply) THEN
+    IF (LENGTH(reply) > 0) AND (reply[1] = 'O') THEN
       WRITELN('deleted ', name, ' on the server')
     ELSE
-      WRITELN('server: ', l);
+      WRITELN('server: ', reply);
 END;
 
 { '!delete <local>' / '!del': delete a file on the Lisa (KILL_OBJECT),
@@ -3638,20 +3678,20 @@ END;
 PROCEDURE BenchStart;
 BEGIN
   SendRaw('MARK -');
-  IF GetResponse(l) THEN ;
+  IF GetResponse(reply) THEN ;
 END;
 
 PROCEDURE BenchMark (what: string255; n: longint);
 VAR ms: longint;
 BEGIN
   SendRaw(concat('MARK ', what));
-  IF NOT GetResponse(l) THEN EXIT(BenchMark);
-  IF (LENGTH(l) < 4) OR (l[1] <> 'O') THEN
+  IF NOT GetResponse(reply) THEN EXIT(BenchMark);
+  IF (LENGTH(reply) < 4) OR (reply[1] <> 'O') THEN
   BEGIN
-    WRITELN('server: ', l);
+    WRITELN('server: ', reply);
     EXIT(BenchMark);
   END;
-  benchms := StrToInt(COPY(l, 4, LENGTH(l) - 3));
+  benchms := StrToInt(COPY(reply, 4, LENGTH(reply) - 3));
   ms := benchms - benchoh;       { without the cost of the measurement itself }
   IF ms < 0 THEN ms := 0;
   WRITE('  ', what, ': ');
@@ -3756,6 +3796,7 @@ BEGIN
   FOR k := 1 TO 20 DO
     SendRaw('NEXT');             { the server ignores a NEXT out of a listing }
   BenchMark('send 20 short lines, one WRITE_DATA each (now)', 120);
+  (* not used: the same with a WRITE_DATA per char (before; PutChar)
   BenchStart;
   FOR k := 1 TO 20 DO
   BEGIN
@@ -3767,6 +3808,7 @@ BEGIN
     PutChar(CHR(10));
   END;
   BenchMark('send 20 short lines, a WRITE_DATA per char (before)', 120);
+  *)
   BenchStart;
   SendRaw('ECHO 20');            { 20 lines 'A 12345' back }
   FOR k := 1 TO 20 DO
@@ -3786,16 +3828,16 @@ BEGIN
   ProgStart(nbytes);
   BenchStart;
   SendRaw('FRAMES 10');
-  seq := 0;
+  xf.seq := 0;
   k := 0;
   REPEAT
     IF k < NB THEN want := CHUNK ELSE want := 0;
-    ok := RecvChunk(seq, len, @buf[1], want);
+    xf.ok := RecvChunk(xf.seq, xf.len, @buf[1], want);
     k := k + 1;
-  UNTIL (NOT ok) OR (len = 0);
+  UNTIL (NOT xf.ok) OR (xf.len = 0);
   BenchMark('receive 10 chunks as a get does, no file (FRAMES)', nbytes);
   ProgEnd;
-  IF NOT ok THEN
+  IF NOT xf.ok THEN
     WRITELN('  (the chunks did not all come)');
   ProgStart(nbytes);
   BenchStart;
@@ -3825,9 +3867,9 @@ BEGIN
   BenchMark('byte sum, Pascal (Sum16P)', nbytes);
   *)
   BenchStart;
-  bsum := 0;
+  xf.bsum := 0;
   FOR k := 1 TO NB DO
-    SUM16A(@buf[1], CHUNK, bsum);
+    SUM16A(@buf[1], CHUNK, xf.bsum);
   BenchMark('byte sum, assembly (SUM16A)', nbytes);
 
   bname := 'LisaSerialFtpBench.BIN';
@@ -3945,11 +3987,11 @@ BEGIN
       IF ecode <= 0 THEN
       BEGIN
         BenchStart;
-        tmode := 0;
-        size := 0;
-        ok := TRUE;
+        xf.mode := 0;
+        xf.size := 0;
+        xf.ok := TRUE;
         IF TextPass(fref) THEN ;
-        BenchMark('read + decode it, assembly (DECODEP; now)', size);
+        BenchMark('read + decode it, assembly (DECODEP; now)', xf.size);
         ecode := 0;
         CLOSE_OBJECT(ecode, fref);
       END;
@@ -3975,9 +4017,128 @@ BEGIN
     END;
     BenchStart;
     IF LocalSum(fname, NOT IsTextName(fname), FALSE) THEN ;
-    BenchMark('the whole -c check of it (read, decode, CRC, sum)', total);
+    BenchMark('the whole -c check of it (read, decode, CRC, sum)', xf.total);
   END;
   WRITELN('bench done');
+END;
+
+{ The 'get' command: get [-c] [-b | -t] <remote> [local] (A and B are
+  the words after it).  Checks the names -- a '-' in a remote name used
+  as the local one, a Lisa name over MAXNAME characters, a text file
+  without a .TEXT name -- and says what to type instead; else DoGet.
+  xferfail stays TRUE unless DoGet verifies the file. }
+PROCEDURE GetCmd (a, b: string255);
+VAR local: pathname;
+    remote: string255;
+    tname: string255;
+    sname: string255;     { the suggested local name, for an error }
+    j: integer;
+BEGIN
+  xferfail := TRUE;                { until DoGet says it was verified }
+  IF NOT TakeFlags(a, b) THEN
+    WRITELN('get: -b (binary) and -t (text) cannot both be given')
+  ELSE IF a = '' THEN
+  BEGIN
+    WRITELN('usage: get [-c] [-b | -t] <remote> [local]');
+    WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+  END
+  ELSE
+  BEGIN
+    remote := a;
+    local := b;                 { pathname is string[255]; assign directly }
+    IF local = '' THEN
+    BEGIN
+      BaseName(remote, tname);
+      local := tname;
+    END;
+    { With no local name, the file would be saved under the remote
+      file name; on the Lisa a '-' separates the parts of a path
+      (-volume-name), so a remote name with '-' would not be the
+      name stored.  Refused, with a suggestion ('-' as '_'). }
+    IF (b = '') AND (POS('-', local) > 0) THEN
+    BEGIN
+      sname := local;
+      FOR j := 1 TO LENGTH(sname) DO
+        IF sname[j] = '-' THEN sname[j] := '_';
+      WRITELN('error: ', local, ' has a ''-'', which the Lisa reads as a path separator');
+      WRITELN('(-volume-name): give a local name without one, e.g.');
+      WRITELN('get ', remote, ' ', sname);
+    END
+    ELSE
+    { -t: text; -b: binary.  Else text if the local name was given
+      and ends in .TEXT, or if the remote name ends in .TEXT (any
+      case); otherwise binary.  A text download must be saved under a
+      .TEXT name (a Lisa text file): refused, with a suggestion, if
+      the local name does not end in .TEXT.  A Lisa file name has at
+      most MAXNAME characters: a longer one is refused first. }
+    IF LeafLen(local) > MAXNAME THEN
+    BEGIN
+      WRITELN('error: the Lisa file name is ', LeafLen(local), ' characters long; at most ',
+              MAXNAME, ' are allowed:');
+      WRITELN('  ', local);
+      WRITELN('give a shorter local name, e.g. get ', remote, ' <name>');
+    END
+    ELSE IF tflag OR ((NOT bflag) AND (IsTextName(local) OR IsTextName(remote))) THEN
+    BEGIN
+      IF NOT IsTextName(local) THEN
+      BEGIN
+        StripExt(local, sname);
+        IF tflag THEN
+        BEGIN
+          WRITELN('error: get -t saves a Lisa text file: give it a name ending in .TEXT,');
+          WRITELN('e.g. get -t ', remote, ' ', sname, '.TEXT');
+        END
+        ELSE
+        BEGIN
+          WRITELN('error: ', remote, ' is a text file: save it under a name ending in .TEXT,');
+          WRITELN('e.g. get ', remote, ' ', sname, '.TEXT  (or get -b to keep its bytes)');
+        END;
+      END
+      ELSE IF Ready THEN
+        DoGet(remote, local, FALSE, cflag);
+    END
+    ELSE IF Ready THEN
+      DoGet(remote, local, TRUE, cflag);
+  END;
+END;
+
+{ The 'put' command: put [-c] [-b | -t] <local> [remote] (A and B are
+  the words after it); DoPut, as text or byte-exact.  xferfail stays TRUE
+  unless DoPut verifies the file. }
+PROCEDURE PutCmd (a, b: string255);
+VAR local: pathname;
+    remote: string255;
+BEGIN
+  xferfail := TRUE;                { until DoPut says it was verified }
+  IF NOT TakeFlags(a, b) THEN
+    WRITELN('put: -b (binary) and -t (text) cannot both be given')
+  ELSE IF a = '' THEN
+  BEGIN
+    WRITELN('usage: put [-c] [-b | -t] <local> [remote]');
+    WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+  END
+  ELSE
+  BEGIN
+    local := a;                 { pathname is string[255]; assign directly }
+    remote := b;
+    IF remote = '' THEN
+      BaseName(local, remote);
+    { -b: byte-exact; -t: as text, if the file looks like a Lisa
+      text file (LooksText; else refused).  Else a name ending in
+      .TEXT (any case) is a Lisa text file: sent as text; anything
+      else byte-exact. }
+    IF bflag THEN
+    BEGIN
+      IF Ready THEN DoPut(local, remote, TRUE, cflag);
+    END
+    ELSE IF tflag THEN
+    BEGIN
+      IF LooksText(local) THEN
+        IF Ready THEN DoPut(local, remote, FALSE, cflag);
+    END
+    ELSE IF Ready THEN
+      DoPut(local, remote, NOT IsTextName(local), cflag);
+  END;
 END;
 
 PROCEDURE Connect;
@@ -4044,107 +4205,9 @@ BEGIN
         IF Ready THEN DoList(arga);
       END
       ELSE IF cmd = 'GET' THEN
-      BEGIN
-        xferfail := TRUE;                { until DoGet says it was verified }
-        IF NOT TakeFlags(arga, argb) THEN
-          WRITELN('get: -b (binary) and -t (text) cannot both be given')
-        ELSE IF arga = '' THEN
-        BEGIN
-          WRITELN('usage: get [-c] [-b | -t] <remote> [local]');
-          WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
-        END
-        ELSE
-        BEGIN
-          remote := arga;
-          local := argb;                 { pathname is string[255]; assign directly }
-          IF local = '' THEN
-          BEGIN
-            BaseName(remote, tname);
-            local := tname;
-          END;
-          { With no local name, the file would be saved under the remote
-            file name; on the Lisa a '-' separates the parts of a path
-            (-volume-name), so a remote name with '-' would not be the
-            name stored.  Refused, with a suggestion ('-' as '_'). }
-          IF (argb = '') AND (POS('-', local) > 0) THEN
-          BEGIN
-            sname := local;
-            FOR i := 1 TO LENGTH(sname) DO
-              IF sname[i] = '-' THEN sname[i] := '_';
-            WRITELN('error: ', local, ' has a ''-'', which the Lisa reads as a path separator');
-            WRITELN('(-volume-name): give a local name without one, e.g.');
-            WRITELN('get ', remote, ' ', sname);
-          END
-          ELSE
-          { -t: text; -b: binary.  Else text if the local name was given
-            and ends in .TEXT, or if the remote name ends in .TEXT (any
-            case); otherwise binary.  A text download must be saved under a
-            .TEXT name (a Lisa text file): refused, with a suggestion, if
-            the local name does not end in .TEXT.  A Lisa file name has at
-            most MAXNAME characters: a longer one is refused first. }
-          IF LeafLen(local) > MAXNAME THEN
-          BEGIN
-            WRITELN('error: the Lisa file name is ', LeafLen(local), ' characters long; at most ',
-                    MAXNAME, ' are allowed:');
-            WRITELN('  ', local);
-            WRITELN('give a shorter local name, e.g. get ', remote, ' <name>');
-          END
-          ELSE IF tflag OR ((NOT bflag) AND (IsTextName(local) OR IsTextName(remote))) THEN
-          BEGIN
-            IF NOT IsTextName(local) THEN
-            BEGIN
-              StripExt(local, sname);
-              IF tflag THEN
-              BEGIN
-                WRITELN('error: get -t saves a Lisa text file: give it a name ending in .TEXT,');
-                WRITELN('e.g. get -t ', remote, ' ', sname, '.TEXT');
-              END
-              ELSE
-              BEGIN
-                WRITELN('error: ', remote, ' is a text file: save it under a name ending in .TEXT,');
-                WRITELN('e.g. get ', remote, ' ', sname, '.TEXT  (or get -b to keep its bytes)');
-              END;
-            END
-            ELSE IF Ready THEN
-              DoGet(remote, local, FALSE, cflag);
-          END
-          ELSE IF Ready THEN
-            DoGet(remote, local, TRUE, cflag);
-        END;
-      END
+        GetCmd(arga, argb)
       ELSE IF cmd = 'PUT' THEN
-      BEGIN
-        xferfail := TRUE;                { until DoPut says it was verified }
-        IF NOT TakeFlags(arga, argb) THEN
-          WRITELN('put: -b (binary) and -t (text) cannot both be given')
-        ELSE IF arga = '' THEN
-        BEGIN
-          WRITELN('usage: put [-c] [-b | -t] <local> [remote]');
-          WRITELN('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
-        END
-        ELSE
-        BEGIN
-          local := arga;                 { pathname is string[255]; assign directly }
-          remote := argb;
-          IF remote = '' THEN
-            BaseName(local, remote);
-          { -b: byte-exact; -t: as text, if the file looks like a Lisa
-            text file (LooksText; else refused).  Else a name ending in
-            .TEXT (any case) is a Lisa text file: sent as text; anything
-            else byte-exact. }
-          IF bflag THEN
-          BEGIN
-            IF Ready THEN DoPut(local, remote, TRUE, cflag);
-          END
-          ELSE IF tflag THEN
-          BEGIN
-            IF LooksText(local) THEN
-              IF Ready THEN DoPut(local, remote, FALSE, cflag);
-          END
-          ELSE IF Ready THEN
-            DoPut(local, remote, NOT IsTextName(local), cflag);
-        END;
-      END
+        PutCmd(arga, argb)
       ELSE IF cmd = '!LIST' THEN
         DoListVol(arga)
       ELSE IF (cmd = 'DELETE') OR (cmd = 'DEL') THEN
@@ -4154,7 +4217,11 @@ BEGIN
       ELSE IF cmd = 'BAUD' THEN
         DoBaud(arga)
       ELSE IF cmd = 'HELLO' THEN
-        ok := DoHello   { Lisa Pascal: a function call cannot be a statement by itself }
+      BEGIN
+        { Lisa Pascal: a function call cannot be a statement by itself.
+          BEGIN..END: an IF here without it would take the ELSE below. }
+        IF DoHello THEN ;
+      END
       ELSE IF cmd = 'TIMEOUT-FACTOR' THEN
         DoTFactor(arga)
       ELSE IF cmd = 'DEBUG' THEN
@@ -4172,9 +4239,10 @@ BEGIN
       IF cmdknown THEN lastcmd := cmdline;
     END;
   UNTIL cmd = 'QUIT';
-  { If the last get/put failed, say so and wait for SPACE (from the
-    keyboard itself, not from INPUT: in an exec file this stops the
-    macro here, so the failure is not missed). }
+  { If the last get/put failed, say so and wait for SPACE (read from kbd,
+    without echo).  In an exec file kbd reads the file too, so a macro
+    puts a $DOIT right after its quit: the key then comes from the real
+    keyboard, and the macro stops here, so the failure is not missed. }
   IF xferfail THEN
   BEGIN
     WRITE('The last transfer failed! Press SPACE to quit.');

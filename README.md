@@ -187,7 +187,7 @@ its banner and carries on.
 Below is a sample client session.
 
 ```
-LisaSerialFtpClient v1.0 (build 2026-11-18 14:18)
+LisaSerialFtpClient v1.0 (build 2026-11-18 15:47)
 file transfer over RS232B at 57600 baud
 commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
           debug, repeat, help, quit
@@ -925,7 +925,7 @@ Lisa, with the server as the clock (`MARK`), 10 KB per test, each the
 way it is done now and the way it was done before.  It first measures
 the cost of a measurement itself (the `MARK` line out, its `OK` back)
 and takes it off every time it prints.  Then: sending 20 short lines
-(one `WRITE_DATA` per line or per character) and receiving 20 (`ECHO`;
+(one `WRITE_DATA` per line) and receiving 20 (`ECHO`;
 read ahead, or a `READ_DATA` per character), receiving 10 chunks
 exactly as `get` does but with no file (`FRAMES`), 10 progress marks on
 the screen alone, the CRC and the byte sum (assembly), writing a binary
@@ -933,7 +933,8 @@ file (256 bytes or 4 KB per `WRITE_DATA`) and a text file (`WRITELN`),
 and, with a file given, reading it (1 KB or 4 KB per `READ_DATA`),
 decoding it (for a `.TEXT` file, in assembly) and the whole `-c` check
 of it.  (The Pascal timings, and writing a text file the way `get` once
-did, with `TXTPUT`, are commented out in the source.)  It prints bytes/s for each; the server
+did, with `TXTPUT`, and sending a `WRITE_DATA` per character, are
+commented out in the source.)  It prints bytes/s for each; the server
 prints the times too.  Give it a small file (e.g.
 `bench LisaSerialFtpClientInclude.text`).
 

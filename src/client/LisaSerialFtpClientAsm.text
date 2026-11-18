@@ -4,7 +4,8 @@
 ; The per-byte loops that compiled Lisa Pascal does very slowly (the
 ; CRC-16 needs XOR, which Lisa Pascal does not have).  Declared in
 ; LisaSerialFtpClient.text as EXTERNAL; assembled to
-; LisaSerialFtpClientAsm.OBJ and linked with the program (see lfm.text).
+; LisaSerialFtpClientAsm.OBJ and linked with the program (see
+; LisaSerialFtpClientMake.text).
 ; At startup the client checks them against known results
 ; (AsmSelfTest) and stops if they are wrong.  The Pascal versions they
 ; replaced are kept, commented out, in LisaSerialFtpClient.text.

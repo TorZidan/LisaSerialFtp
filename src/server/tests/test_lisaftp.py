@@ -13,6 +13,7 @@ a Python stand-in for the Lisa client on the master end.
   * names: a path outside --home_dir refused, long names, non-ASCII names
     (Mac Roman on the wire, percent-encoding for the rest);
   * GET name T (the server builds the Lisa text pages);
+  * stray bytes with no line end dropped after LINE_GAP;
   * DELETE, DELTESTS, DEBUG ON/OFF, unknown and removed commands (STAT,
     MKDIR, DEL, PWD) answered ERR 99, and QUIT (the server waits for the
     next client).
@@ -651,6 +652,12 @@ def main():
               repr(got[:12]))
         r = lisa.command("GET notes.txt X")
         check("gett-usage", r is not None and r.startswith("ERR 1 "), repr(r))
+
+        # 13b. stray bytes with no line end (noise) are dropped after
+        # LINE_GAP (5 s) and do not spoil the next command
+        os.write(master, b"x\x07y")
+        time.sleep(6.0)
+        check("stray-bytes-dropped", is_banner(lisa.command("HELLO")))
 
         # 14. DEBUG ON / OFF (the client's 'debug' command)
         check("debug-on", lisa.command("DEBUG ON") == "OK debug on")

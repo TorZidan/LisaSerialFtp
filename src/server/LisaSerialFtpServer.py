@@ -10,9 +10,8 @@ RS232B to #10#1 / #10#2) and speaks the LISA-SERIAL-FTP/v1.0 line
 protocol implemented here, so it can LIST, GET and PUT files on this
 machine.
 
-Linux and macOS: the standard library only (termios).  Windows: needs
-pyserial for the serial port (pip install pyserial); --port is then a
-COM port such as COM3.
+On Linux and macOS: needs just the standard library only (termios).
+On Windows: needs pyserial for the serial port (pip install pyserial).
 
 Protocol summary (full spec in README.md):
   * ASCII command lines, CRLF terminated, case-insensitive.
@@ -176,6 +175,12 @@ T_FRAME  = 15.0         # first byte of a chunk (receiver); > T_REPLY so a
 T_BLOCK  = 1.0          # mid-chunk bytes (receiver)
 T_QUIET  = 0.3          # discard-until-quiet (receiver)
 T_REPLY  = 10.0         # wait for the A/N reply (sender)
+LINE_GAP = 5.0          # command line: the longest gap between two of its
+                        # bytes.  The Lisa sends a line in one go, so bytes
+                        # left without a line end for this long (noise, e.g.
+                        # when a cable is plugged in) are dropped, and do not
+                        # spoil the next command.  With no bytes at all the
+                        # server just keeps waiting, for ever.
 MAX_RETRIES = 10        # failed tries on one chunk before aborting.  Fixed:
                         # equals MAXRETRY in LisaSerialFtpClient.text (each side counts
                         # its own failures; the first to reach it aborts)
@@ -1037,7 +1042,9 @@ class LisaFtpServer:
         self.dlog("sent: " + line)
 
     def read_line(self, timeout, quiet=False):
-        """Read one CRLF-terminated line.  Returns '' on idle timeout.
+        """Read one CRLF-terminated line.  Returns None if no byte came
+        within TIMEOUT, '' if a partial line was dropped (no byte for TIMEOUT
+        after it) or the line was too long.
         quiet: do not log it (the caller reports what it meant)."""
         buf = b""
         while True:
@@ -1965,7 +1972,7 @@ class LisaFtpServer:
                                      "a garbled line: the client is at another rate")
                     continue
             elif line is None:
-                line = self.read_line(self.args.idle_timeout, quiet=True)
+                line = self.read_line(LINE_GAP, quiet=True)
             if line is None or line == "":
                 if line == "" and self.port.baud != self.start_baud:
                     self.revert_baud(self.start_baud, "a garbled line")
@@ -2109,8 +2116,6 @@ command then changes it on both sides (BAUD), and QUIT goes back to it.""")
                     help="timeout in seconds for command/abort replies "
                          "(default 15); the per-chunk loss-recovery "
                          "timeouts are fixed (see T_FRAME/T_BLOCK/T_REPLY)")
-    ap.add_argument("--idle-timeout", type=float, default=3600.0,
-                    help="idle timeout on the command line, seconds (default 3600)")
     ap.add_argument("--read-only", action="store_true",
                     help="refuse PUT and DELETE")
     ap.add_argument("--monkey_wrench", action="store_true",

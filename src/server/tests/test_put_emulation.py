@@ -69,7 +69,7 @@ def main():
     master, slave = pty.openpty()
     env = dict(os.environ, LISAFTP_FD=str(slave))
     proc = subprocess.Popen(
-        # --port is required; LISAFTP_FD makes the server use the pty instead
+        # LISAFTP_FD makes the server use the pty, whatever --port says
         [sys.executable, os.path.join(TOP, "LisaSerialFtpServer.py"), "--port", "ignored",
          "--home_dir", root,
          "--timeout", "5"],

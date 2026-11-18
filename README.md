@@ -30,14 +30,14 @@ executable file `LisaSerialFtpClient.obj`. Boot into Lisa Workshop, then insert 
 disk image, e.g. using a FloppyEmu or ESFloppy floppy disk hardware
 emulator on a real Lisa, or in the LisaEm emulator, from the File -> Insert Diskette menu item.
 Once in Workshop, you will have to copy it to your ProFile hard
-drive, this way: Press F to get into the File Manager submenu, then press C for
+drive, this way: Press `f` to get into the File Manager submenu, then press `c` for
 "copy", then enter source filename `-UPPER-LisaSerialFtpClient.obj`, enter,
 then the target filename `-LOWER-LisaSerialFtpClient.obj`, and follow the
 prompts to complete the copying. Here we assume that you are using a Lisa 2/5
 whose boot menu has the floppy disk above the hard disk (hence we use "UPPER"
 in the source filename). On a Lisa 2/10 the boot menu looks different: your
 floppy disk drive is named "LOWER", and the hard disk is "UPPER" in Workshop.
-Press Q to exit to the main Workshop menu.
+Press `q` to exit to the main Workshop menu.
 
 * Option 2: Most people use a ProFile hardware emulator on their Lisa-s such as ESProfile (the most popular one) and others; the hard disk image files sit on an micro-SD card.
 Plug the SD card in your PC, and use my "copy" tool at https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files
@@ -54,15 +54,15 @@ to copy file [LisaSerialFtpClient.obj](./LisaSerialFtpClient.obj) onto your desi
 Note: once you have `LisaSerialFtpClient.obj` on your ProFile hard drive, you can get newer versions of this tool (if any) by running this tool.
 
 ### Ensure Serial Port B is set to "Serial Cable" in the Workshop Preferences
-In Workshop, press S for Sys-Manager submenu, then P to run the Preferences app.
+In Workshop, press `s` for Sys-Manager submenu, then `p` to run the Preferences app.
 In it: check the "Connect Devices" checkbox and make sure that "Serial B Connector"
 is set to "Serial Cable, like so:
 
 ![thisishowyoudoitbabe](assets/screenshots/workshop-prefrences-app.png)
 
-### Running the "client" app in Lisa Workshop
+### Running the client app in Lisa Workshop
 
-To run the app: in the main workshop menu, press R (for "run"), then type the
+To run the app: in the main Workshop menu, press `r` (for "run"), then type the
 program name `LisaSerialFtpClient` (there is no need to type the file
 extension), enter. The program will start, it will attempt to connect to the
 server, and will give you a `>` command prompt. Type `hello` and `help` to see what's there.
@@ -387,7 +387,7 @@ python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/cli
 ```
 
 How to run the `LisaSerialFtpClientMake.text` macro: in the main workshop menu
-press R ("run"), type `<LisaSerialFtpClientMake` and enter to run it. Note the
+press `r` ("run"), type `<LisaSerialFtpClientMake` and enter to run it. Note the
 `<` in front: it tells Workshop to run this as a macro. Observe its progress.
 At the end, upon success, it will just exit to the Workshop main menu.
 

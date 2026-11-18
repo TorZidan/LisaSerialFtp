@@ -2,105 +2,72 @@
 """
 LisaSerialFtpServer.py -- serial file server for the Apple Lisa RS-232 driver.
 
-Runs on the modern side of an RS-232 link (USB-serial adapter or real
-serial port).  The Lisa side opens its built-in serial device RS232B,
-Port B, the only port the client supports (see
-LISA_OS/OS/source-fsui1.text.unix.txt: the Alias procedure maps RS232A /
-RS232B to #10#1 / #10#2) and speaks the LISA-SERIAL-FTP/v1.0 line
-protocol implemented here, so it can LIST, GET and PUT files on this
-machine.
+Runs on a modern computer at the other end of a serial cable (a USB serial
+adapter, a built-in serial port, or LisaEm's PseudoTTY) and serves one
+folder (--home_dir) to LisaSerialFtpClient on the Lisa, which uses the
+Lisa's Port B (RS232B) only.  It speaks the LISA-SERIAL-FTP/v1.0 protocol;
+README.md has the full specification.
 
-On Linux and macOS: needs just the standard library only (termios).
-On Windows: needs pyserial for the serial port (pip install pyserial).
+Needs Python 3.5 or newer.  Linux and macOS: the standard library only
+(termios).  Windows: also pyserial for the serial port (pip install pyserial).
 
-Protocol summary (full spec in README.md):
-  * ASCII command lines, CRLF terminated, case-insensitive.
-  * Lines are at most 255 chars (Lisa Pascal's max string length,
-    string[255]); the server truncates any longer line it would send.
-  * Commands: HELLO, LIST [dir], GET name, PUT name size, SUM name T|B,
-    CAL, DEBUG on|off, QUIT, and DELTESTS (hidden; for the test macro on
-    the Lisa).
-  * SUM name T|B (for the client's get -c / put -c) answers
-    "OK <size> <crc16hex> <sum16hex>": size, CRC-16 and byte sum (MOD
-    65536) of the file -- B: its bytes as they are; T: the bytes the Lisa
-    would send back after a text get (see lisa_text) -- so the client can
-    compare them with its own copy and skip an unchanged file.
-  * LIST answers OK, one line per entry and DONE, in pages of at most
-    LIST_PAGE (384) bytes: each page but the last ends with MORE, and the
-    client answers NEXT when it is ready for the next one (the Lisa's
-    serial input buffer holds only 512 bytes; see LIST_PAGE).
-  * MARK <label> (hidden; for the client's 'bench' command) answers
-    "OK <ms>": the milliseconds since the previous MARK (0 for the
-    first), so the server is the stopwatch for timing the Lisa's work.
-  * ECHO <n> (hidden; for 'bench') sends n lines "A 12345" back to back
-    (1..100) and nothing else, so the client can time reading short
-    lines like the ACKs.
-  * FRAMES <n> (hidden; for 'bench') sends n chunks of 1016 made-up bytes
-    and the empty end-of-file chunk, exactly as a GET does (ACKs,
-    retries), but with no OK before and no DONE after, so the client can
-    time receiving chunks without a file.
-  * BAUD <rate> answers "OK <rate>" at the old rate and switches; the new
-    rate is kept only if a valid line arrives at it within 10 s, else
-    (silence, or a garbled line) the server goes back to the old rate.
-    QUIT, and a garbled line at another rate, go back to --baud.
-  * DELETE <name> deletes one file (the client's 'delete', after it has
-    asked the user): "OK deleted", or ERR 11 (no such file), 12 (a folder:
-    never deleted), 13 (the OS refused); refused with --read-only.
-  * DELTESTS deletes the files the Lisa test macro uploaded: only plain
-    files directly in <home_dir>/tests whose names start with "lisatest-"
-    (any case), nothing else.  Answers "OK <n> deleted".
-  * DEBUG ON / DEBUG OFF (answered "OK debug on|off") switches the
-    server's console output, like the client's own 'debug' command.  Off:
-    each command, a progress bar ('.' per chunk that got through, 'x' per
-    failed try) and the outcome.  On: a line per protocol line and per
-    chunk, with what happened to it.  HELLO resets it to the startup
-    setting (--debug = on).
-  * CAL (speed calibration): the server answers "CAL <ms>" exactly
-    CAL_SECONDS of real time after the request.  The client counts its
-    1-second (emulated) timeouts meanwhile, which gives the emulator's
-    timeout-factor; it multiplies all its timeouts by it.  The client
-    sends CAL only when its user types 'timeout-factor auto'.
-  * Status lines: "OK ...", "ERR <n> <text>", "DONE <bytes> <crc16hex>",
-    "FAIL <text>" (peer must answer "OK" to a FAIL).
-  * Binary phase: chunks framed as
-        'T' + seq(2B big-endian) + len(2B big-endian) + payload + crc16(2B BE)
-    where crc16 is CRC-16/CCITT-FALSE over seq..payload.  Receiver answers
-    "A <seq>" or "N <expected_seq>".  A zero-length chunk ends the
-    transfer.  seq wraps from 65535 to 0, so there is no size limit.
-  * Verification: after the last chunk the receiver sends
-    "DONE <bytes> <crc16hex>" (CRC over the whole file); the sender
-    compares and answers "OK <bytes> <crc16hex>" or "BAD <bytes> <crc16hex>"
-    with its own numbers.  The receiver keeps the file only on OK with
-    numbers equal to its own (the Lisa for GET, this server for PUT).
-  * Loss recovery (stop-and-wait): the sender is quiet while it waits for
-    a reply, so a byte lost in a chunk leaves the receiver short of bytes
-    and its read times out (~1 s mid-chunk, ~15 s for a chunk start).  The
-    receiver discards the partial block, waits for the line to go quiet,
-    and NAKs; the sender retransmits the same chunk.  A lost reply makes
-    the sender time out (~10 s) and retransmit anyway; the receiver
-    recognises the repeated sequence number and re-ACKs it.  Replies carry
-    the chunk number, so a stale one (about an earlier chunk, e.g. the
-    re-ACK of a duplicate) is skipped and the replies can never fall out
-    of step with the chunks.  A garbled reply also makes the sender
-    retransmit, and "N <seq+1>" (a NAK for the next chunk: the receiver's
-    ACK was lost and its own wait ran out first) counts as an ACK.  After ~10 failed tries on one chunk either
-    side gives up and aborts (FAIL/OK).
-  * Crash recovery: a "HELLO" arriving where a chunk header or an A/N
-    reply is expected means the peer crashed and restarted; the server
-    abandons the transfer (removing any partial PUT file) and answers
-    with a fresh banner, so the new session can continue.
-  * Path separator in names is '/', under the shared folder (--home_dir)
-    (':' is just a character).
+Usage:
+    python3 LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir ~/lisa-share
 
-Example:
-    python3 LisaSerialFtpServer.py --port /dev/ttyUSB0 --baud 57600 \
-        --home_dir /home/my_username/lisa-share
-
-Without --port (or with --port auto) the server finds the port itself:
-the only one there is, else a link to a pty, then LisaEm's pty, then a
-USB serial adapter, then a built-in serial port (auto_port).  --port
-auto-pty picks among the PseudoTTYs only (LisaEm), --port auto-serial
+Without --port (or with --port auto) the server finds the port itself: the
+only one there is, else a link to a pty first, then LisaEm's own pty, then
+a USB serial adapter, then a built-in serial port (auto_port).  --port
+auto-pty chooses among the PseudoTTYs only (LisaEm), --port auto-serial
 among the USB adapters and built-in ports only (a real Lisa).
+
+Commands (lines of at most 255 characters, Lisa Pascal's string[255],
+ending in CRLF; the command word in any case):
+  HELLO              the banner: "Hi from ... LISA-SERIAL-FTP/v1.0 ...
+                     chunk_size=1016"
+  LIST [dir]         "OK", one line per entry, "DONE"; in pages of at most
+                     LIST_PAGE bytes, each but the last ending with MORE,
+                     answered NEXT by the client (see LIST_PAGE)
+  GET name [T]       "OK <size>", then (after the client's GO) the file in
+                     chunks; T: as the pages of a Lisa .TEXT file (lisa_pages)
+  PUT name size      "OK", then the client sends the file in chunks
+  SUM name T|B       "OK <size> <crc16> <sum16>" of the file as it is (B) or
+                     as the Lisa would send it back after a text get (T), for
+                     the client's get -c / put -c
+  DELETE name        "OK deleted"; ERR 11 no such file, 12 a folder (never
+                     deleted), 13 the OS refused
+  BAUD rate          "OK <rate>" at the old rate, then switch; the new rate
+                     is kept only if a valid line arrives at it within
+                     BAUD_TRIAL seconds, else back to the old one
+  DEBUG ON|OFF       the server's detailed console output
+  CAL                "CAL <ms>" after exactly CAL_SECONDS: the client's
+                     timeout-factor auto
+  QUIT               the client is leaving; back to the startup --baud
+  hidden: MARK, ECHO, FRAMES (the client's 'bench' command) and DELTESTS
+  (deletes the Lisa test macro's uploads: <home_dir>/tests/lisatest-*)
+PUT and DELETE are refused with --read-only.  Errors are "ERR <n> <text>".
+
+Chunks (GET and PUT): 'T' + seq (2 bytes) + length (2) + data + CRC-16 (2),
+big-endian, the CRC (CCITT-FALSE) over seq..data; at most CHUNK bytes of
+data, so a frame fits the Lisa's 1024-byte input buffer.  The receiver
+answers "A <seq>" (ACK) or "N <seq>" (NAK, send it again); a chunk with no
+data ends the file.  Stop-and-wait: the sender waits for the reply to each
+chunk, so the Lisa is never sent more than it can hold (no XON/XOFF, no
+hardware handshake).  The receiver then sends "DONE <bytes> <crc>" for the
+whole file, and the sender answers "OK ..." or "BAD ..." with its own
+numbers; the file is kept only if they agree.
+
+Loss recovery: a lost byte leaves the receiver short and its read times
+out; it throws away the rest of the frame and NAKs.  A lost reply makes the
+sender time out and send the chunk again, which the receiver ACKs again.
+Replies carry the chunk number, so a stale one is skipped.  After
+MAX_RETRIES failed tries on one chunk either side gives up ("FAIL <why>",
+answered "OK").  A HELLO in the middle of a transfer means the client
+restarted: the transfer is abandoned (a partial PUT file deleted) and the
+new session gets a banner.
+
+Names: '/' separates folders, always under --home_dir.  The wire is Mac
+Roman; characters the Lisa lacks are percent-encoded (see name_to_wire /
+name_from_wire).
 """
 
 import argparse
@@ -123,6 +90,11 @@ try:
     POSIX = True
 except ImportError:
     POSIX = False
+
+
+# --------------------------------------------------------------------------
+# Protocol constants
+# --------------------------------------------------------------------------
 
 VERSION = "v1.0"            # the server's version; the 1 is the MAJOR
                             # version: the client warns when its own major
@@ -192,12 +164,17 @@ CHUNK = 1016            # bytes of file data per chunk.  Fixed: must equal
                         # buffer: at 57600 baud a real Lisa empties it more
                         # slowly than a frame fills it, and 1024-byte chunks
                         # (1031) worked at 19200 but never at 57600.
+MAX_FILE = 64 * 1024 * 1024    # the largest file PUT accepts, and the largest
+                        # GET T / SUM T read whole into memory
+MAX_IN_LINE = 1024      # a longer line from the client is garbage: dropped
+FRAME_HEAD = 5          # bytes before a chunk's data: 'T', seq (2), length (2)
+DUMP_BYTES = False      # True: --debug also prints EVERY byte received, one per
+                        # line, as <RX x> (printable ASCII as is, else \xNN).
+                        # Very verbose -- a chunk is 1023 lines -- but it
+                        # shows exactly what arrived, below the protocol
+WRENCH_ODDS = 0.20      # --monkey_wrench: the chance a chunk gets a byte flipped
 CAL_SECONDS = 2.0       # CAL reply delay, real seconds (must match CALSECS
                         # in LisaSerialFtpClient.text)
-
-SAFE_CHARS = set(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-~"
-)
 
 # The rates the Lisa can use too: 57600 is the most its serial driver can
 # set (at 115200 its baud-rate generator time constant would be -1; see
@@ -225,6 +202,10 @@ def crc16(data, crc=0xFFFF):
         crc = ((crc << 8) & 0xFFFF) ^ _CRC_TABLE[((crc >> 8) ^ b) & 0xFF]
     return crc
 
+
+# --------------------------------------------------------------------------
+# Lisa text files (GET T, SUM T)
+# --------------------------------------------------------------------------
 
 def lisa_text(data):
     """The bytes a text file comes back as after a round trip through the
@@ -301,18 +282,28 @@ def lisa_pages(data):
     return bytes(out)
 
 
+# --------------------------------------------------------------------------
+# Names on the wire
+# --------------------------------------------------------------------------
+
 # Lines on the wire are Mac Roman, the Lisa's character set (as in
 # LisaFileSystemTool): a byte 0x8E is 'e-acute' on the Lisa and here.
 WIRE = "mac_roman"
 
+# the characters a name keeps as they are on the wire (see name_to_wire)
+SAFE_CHARS = set(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-~"
+)
 
-def enc(name):
+
+def name_to_wire(name):
     """A server file name as the Lisa sees it (LIST): letters, digits and
     ._-~ as they are; a character the Lisa has (Mac Roman 0x80..0xFF, e.g.
     e-acute) as itself, so the Lisa shows it; everything else (spaces,
     other ASCII punctuation, characters the Lisa lacks, bytes that are not
-    UTF-8) percent-encoded as UTF-8 bytes, e.g. %20 or %E4%B8%AD.  dec()
-    reverses it, so any name LIST shows can be typed back."""
+    UTF-8) percent-encoded as UTF-8 bytes, e.g. %20 or %E4%B8%AD.
+    name_from_wire() reverses it, so any name LIST shows can be typed
+    back."""
     out = []
     for c in name:
         if c in SAFE_CHARS:
@@ -329,12 +320,16 @@ def enc(name):
     return "".join(out)
 
 
-def dec(s):
+def name_from_wire(s):
     """A name from the wire (already Mac Roman -> text): %XX escapes are
     UTF-8 bytes; bytes that are not UTF-8 stay as they are on disk
     (surrogateescape, as os.listdir gives them)."""
     return urllib.parse.unquote(s, errors="surrogateescape")
 
+
+# --------------------------------------------------------------------------
+# Exceptions
+# --------------------------------------------------------------------------
 
 class ProtocolError(Exception):
     def __init__(self, code, text):
@@ -355,12 +350,14 @@ class PeerRestarted(Exception):
 
 
 # --------------------------------------------------------------------------
-# Serial port (POSIX, termios, raw mode)
+# Port discovery: --port auto, and when the --port device is not there, the
+# list of the serial ports and PseudoTTYs that ARE there, to help pick one.
 # --------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Port discovery: when the --port device is not there, list the USB serial
-# adapters and PseudoTTYs that ARE there, to help pick the right name.
+def note(msg):
+    """A message about the port, on the console with the server's own (stderr)."""
+    print(msg, file=sys.stderr, flush=True)
+
 
 USB_GLOBS = ("/dev/ttyUSB*", "/dev/ttyACM*",              # Linux
              "/dev/cu.usbserial*", "/dev/cu.usbmodem*",   # macOS
@@ -422,12 +419,10 @@ def _is_pty(path):
     return path.startswith("/dev/pts/") or path.startswith("/dev/ttys")
 
 
-def _pseudo_ttys():
-    """[(device, description)] of the PseudoTTYs an emulator may be using:
-      * Linux: the pty of each running LisaEm (it holds the master end,
-        /dev/ptmx; /proc/<pid>/fdinfo gives the pty number);
-      * symbolic links to a pty (as made for LisaEm, e.g. /tmp/lisaem-port-b
-        -> /dev/pts/3) in PTY_LINK_FOLDERS, whatever --port says."""
+def _lisaem_ptys():
+    """[(device, description)] of the pty of each running LisaEm (Linux
+    only): LisaEm holds the master end, /dev/ptmx, and
+    /proc/<pid>/fdinfo/<fd> gives the pty's number (tty-index)."""
     found = set()
     for pid in (os.listdir("/proc") if os.path.isdir("/proc") else ()):
         if not pid.isdigit():
@@ -447,12 +442,21 @@ def _pseudo_ttys():
                                        "%s, pid %s" % (comm, pid)))
         except OSError:
             continue                # gone meanwhile, or not ours to read
-    own = set()                     # the terminal the server runs in: not a port
+    return sorted(found)
+
+
+def _pty_links():
+    """[(link, description)] of the symbolic links to a pty in
+    PTY_LINK_FOLDERS (as made for LisaEm, e.g. /tmp/lisaem-port-b ->
+    /dev/pts/3), whatever --port says.  Not /dev/stdin and the like, nor
+    any link to the terminal the server itself runs in."""
+    own = set()
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             own.add(os.ttyname(stream.fileno()))
         except (OSError, AttributeError, ValueError):
             pass
+    found = set()
     for d in PTY_LINK_FOLDERS:
         try:
             entries = os.listdir(d)
@@ -477,14 +481,11 @@ LINK, LISAEM, USB, BUILTIN = 0, 1, 2, 3
 
 def port_entries():
     """[(kind, device, description)] of the ports there are now, best
-    kind first (see LINK, LISAEM, USB)."""
+    kind first (see LINK, LISAEM, USB, BUILTIN)."""
     found = []
-    for dev, desc in _pseudo_ttys():
-        found.append((LINK if desc.startswith("-> ") else LISAEM, dev, desc))
-    for dev, desc in _usb_ports():
-        found.append((USB, dev, desc))
-    for dev, desc in _builtin_ports():
-        found.append((BUILTIN, dev, desc))
+    for kind, finder in ((LINK, _pty_links), (LISAEM, _lisaem_ptys),
+                         (USB, _usb_ports), (BUILTIN, _builtin_ports)):
+        found.extend((kind, dev, desc) for dev, desc in finder())
     return sorted(found)
 
 
@@ -524,20 +525,19 @@ def auto_port(mode="auto", poll=1.0):
         except Exception as e:      # discovery failed: say so, keep trying
             entries = []
             if not said:
-                print("--port %s: could not list the ports: %s" % (mode, e),
-                      flush=True)
+                note("--port %s: could not list the ports: %s" % (mode, e))
         if entries:
             chosen = entries[0]
             if len(entries) > 1:
-                print("--port %s: ports found on this computer:" % mode, flush=True)
+                note("--port %s: ports found on this computer:" % mode)
                 for e in entries:
-                    print(port_line(e), flush=True)
-            print("--port %s: using %s (give --port to use another one)"
-                  % (mode, chosen[1]), flush=True)
+                    note(port_line(e))
+            note("--port %s: using %s (give --port to use another one)"
+                 % (mode, chosen[1]))
             return chosen[1]
         if not said:
-            print("--port %s: no %s found; waiting for one.  Ctrl-C to stop."
-                  % (mode, what), flush=True)
+            note("--port %s: no %s found; waiting for one.  Ctrl-C to stop."
+                 % (mode, what))
             said = True
         time.sleep(poll)
 
@@ -551,18 +551,58 @@ def report_ports(before):
         now = ["  (could not list the ports: %s)" % e]
     if now != before:
         if before is None:
-            print("ports found on this computer:" if now else
-                  "no serial ports or PseudoTTYs found on this computer",
-                  flush=True)
+            note("ports found on this computer:" if now else
+                 "no serial ports or PseudoTTYs found on this computer")
         else:
-            print("the ports changed; now:" if now else
-                  "the ports changed; now there are none", flush=True)
+            note("the ports changed; now:" if now else
+                 "the ports changed; now there are none")
         for line in now:
-            print(line, flush=True)
+            note(line)
     return now
 
 
-class PosixSerialPort:
+# --------------------------------------------------------------------------
+# Serial ports: termios on Linux / macOS, pyserial on Windows
+# --------------------------------------------------------------------------
+
+class _SerialPort:
+    """What the two serial port classes share: waiting for a port that is
+    not there yet.  A subclass has _open(), OPEN_ERRORS (what _open raises)
+    and _not_there(e) (the reason if E means the port is not there, else
+    None); a real error is raised as _fatal(e)."""
+
+    def _fatal(self, e):
+        return e
+
+    def _open_wait(self, poll=1.0):
+        """Open the port; if it is not there yet (e.g. LisaEm, which
+        creates its virtual port, is not running, or the adapter is not
+        plugged in), say so ONCE, list the ports that are there, and check
+        again every POLL seconds until it appears (listing the ports again
+        if they change).  Any other error (no permission, not a serial
+        device, ...) is raised."""
+        said = False
+        ports = None                # the ports last listed
+        while True:
+            try:
+                self._open()
+            except self.OPEN_ERRORS as e:
+                why = self._not_there(e)
+                if why is None:
+                    raise self._fatal(e)
+                if not said:
+                    note("serial port %s is not there%s; waiting for it.  "
+                         "Ctrl-C to stop." % (self.path, " (%s)" % why if why else ""))
+                    said = True
+                ports = report_ports(ports)
+                time.sleep(poll)
+                continue
+            if said:
+                note("serial port %s: found it" % self.path)
+            return
+
+
+class PosixSerialPort(_SerialPort):
     """The serial port on Linux / macOS (termios, non-blocking reads with
     select).  PySerialPort is the same for Windows."""
 
@@ -570,7 +610,8 @@ class PosixSerialPort:
         self.port = port
         self.path = port            # reopened by this path (see wait_back)
         self.baud = baud
-        self.debug = debug          # --debug (used only by the byte dump in read)
+        self.debug = debug          # --debug (used only by the byte dump in read:
+                                    # see DUMP_BYTES)
         self.pending = b""          # bytes read by wait_back's probe, not yet consumed
         # Allow tests to hand us an already-open fd (pty pair).
         env_fd = os.environ.get("LISAFTP_FD")
@@ -586,30 +627,12 @@ class PosixSerialPort:
     # does not exist (or is a dangling link -- a virtual port whose
     # emulator is not running), or no device is behind it
     NOT_THERE = (errno.ENOENT, errno.ENXIO, errno.ENODEV)
+    OPEN_ERRORS = (OSError,)
 
-    def _open_wait(self, poll=1.0):
-        """Open the port; if it is not there yet (e.g. LisaEm, which
-        creates its virtual port, is not running), say so ONCE and check
-        again every POLL seconds until it appears.  Any other error (no
-        permission, not a serial device, ...) is raised as before."""
-        said = False
-        ports = None                # the ports last listed
-        while True:
-            try:
-                self._open()
-                if said:
-                    print("serial port %s: found it" % self.path, flush=True)
-                return
-            except OSError as e:
-                if e.errno not in self.NOT_THERE:
-                    raise
-                if not said:
-                    print("serial port %s is not there (%s); waiting for it.  "
-                          "Ctrl-C to stop."
-                          % (self.path, e.strerror), flush=True)
-                    said = True
-                ports = report_ports(ports)
-                time.sleep(poll)
+    def _not_there(self, e):
+        """For _open_wait: the reason if OSError E means the port is not
+        there (yet), else None (a real error)."""
+        return e.strerror if e.errno in self.NOT_THERE else None
 
     def _open(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -693,18 +716,10 @@ class PosixSerialPort:
                     raise ClientGone("port error: %s" % e.strerror)
                 if not chunk:
                     raise ClientGone("port closed")
-                if self.debug:
-                    pass
-                    # Byte dump, disabled.  If uncommented (and the 'pass'
-                    # above removed), --debug also prints EVERY byte received
-                    # on the serial line to stderr, one per line, as <RX x>
-                    # (printable ASCII as is, anything else as \xNN, e.g.
-                    # <RX \x0d>).  Very verbose -- a 1016-byte chunk is 1023
-                    # lines -- but it shows exactly what arrived, below the
-                    # protocol level (e.g. NAK replies, lost or garbled bytes).
-                    # for b in chunk:
-                    #     ch = chr(b) if 32 <= b < 127 else "\\x%02x" % b
-                    #     print("  <RX %s>" % ch, file=sys.stderr)
+                if self.debug and DUMP_BYTES:
+                    for b in chunk:
+                        ch = chr(b) if 32 <= b < 127 else "\\x%02x" % b
+                        print("  <RX %s>" % ch, file=sys.stderr)
                 buf += chunk
         return buf
 
@@ -760,7 +775,7 @@ class PosixSerialPort:
             pass
 
 
-class PySerialPort:
+class PySerialPort(_SerialPort):
     """The serial port on Windows, through pyserial (pip install pyserial):
     the same methods as PosixSerialPort, so the server does not see the
     difference.  --port is a COM port name, e.g. COM3."""
@@ -772,6 +787,7 @@ class PySerialPort:
             sys.exit("On Windows the server needs pyserial for the serial "
                      "port: pip install pyserial")
         self.serial = serial
+        self.OPEN_ERRORS = (serial.SerialException,)
         self.port = port
         self.path = port
         self.baud = baud
@@ -789,37 +805,21 @@ class PySerialPort:
             timeout=0, write_timeout=60.0)
 
     def _not_there(self, e):
-        """True if the SerialException means the port does not exist
-        (yet): e.g. the adapter is not plugged in."""
+        """For _open_wait: "" if the SerialException means the port does
+        not exist (yet), e.g. the adapter is not plugged in; else None."""
         # pyserial: on Linux / macOS the OS errno; on Windows a message
         # like "could not open port 'COM3': FileNotFoundError(2, 'The
         # system cannot find the file specified.', ...)"
-        if getattr(e, "errno", None) in (errno.ENOENT, errno.ENXIO, errno.ENODEV):
-            return True
+        if getattr(e, "errno", None) in PosixSerialPort.NOT_THERE:
+            return ""
         text = str(e)
-        return ("FileNotFoundError" in text or "No such file" in text
-                or "cannot find the file" in text)
+        if ("FileNotFoundError" in text or "No such file" in text
+                or "cannot find the file" in text):
+            return ""
+        return None
 
-    def _open_wait(self, poll=1.0):
-        """Open the port; if it is not there yet, say so once and check
-        again every POLL seconds.  Other errors stop the server."""
-        said = False
-        ports = None                # the ports last listed
-        while True:
-            try:
-                self._open()
-                if said:
-                    print("serial port %s: found it" % self.path, flush=True)
-                return
-            except self.serial.SerialException as e:
-                if not self._not_there(e):
-                    raise OSError(str(e))
-                if not said:
-                    print("serial port %s is not there; waiting for it.  "
-                          "Ctrl-C to stop." % self.path, flush=True)
-                    said = True
-                ports = report_ports(ports)
-                time.sleep(poll)
+    def _fatal(self, e):
+        return OSError(str(e))      # main reports it as "cannot open ..."
 
     def set_baud(self, baud):
         """Switch the port to another rate (BAUD, and back)."""
@@ -907,31 +907,65 @@ PORT_SETUP_ERRORS = (termios.error,) if POSIX else ()   # see main
 # Server
 # --------------------------------------------------------------------------
 
-class LisaFtpServer:
-    # console output (class defaults, so tests that skip __init__ work)
-    debug_on = False            # detailed output (DEBUG ON / --debug)
-    debug_default = False       # the startup setting; HELLO restores it
-    _pcol = 0                   # progress marks on the current console line
-    _pending = None             # a line read while waiting for NEXT, for the command loop
-    _mark = None                # MARK: time of the previous MARK
-    _client_failed = False      # send_chunk: the client sent FAIL (answered OK)
-    _done_line = None           # send_chunk: the client's DONE, taken as the
-                                # ACK of the end-of-file chunk (its A was lost)
-    _send_why = ""              # send_chunk: why it failed (for our FAIL line)
-    _pdone = 0                  # progress: bytes of the file transferred so far
-    _ptotal = 0                 # progress: the file size (for the percentage)
-    PROGLINE = 60               # progress marks per console line (as the Lisa)
+class Console:
+    """What the server prints on its console (stderr): messages, the
+    progress bar of a GET/PUT, its speed and the per-chunk timing."""
 
-    def prog_start(self, total):
-        self._pcol = 0
-        self._pdone = 0
-        self._ptotal = total
-        self._pt0 = time.monotonic()    # transfer start, for the rate
+    MARKS_PER_LINE = 60         # progress marks per console line (as the Lisa)
+
+    def __init__(self, debug):
+        self.debug_on = debug       # detailed output (DEBUG ON / --debug)
+        self.debug_default = debug  # the startup setting; HELLO restores it
+        self._marks_on_line = 0     # progress marks on the current console line
+        self._bytes_done = 0        # progress: bytes of the file transferred so far
+        self._bytes_total = 0       # progress: the file size (for the percentage)
+        self._t_start = 0.0         # progress: when the transfer started
+        self._timing = {}           # per-chunk timing: key -> (n, total, min, max)
+
+    def say(self, msg):
+        """Always shown: commands and their outcome."""
+        self._endline()
+        print(msg, file=sys.stderr, flush=True)
+
+    def dlog(self, msg):
+        """Shown only when debug output is on."""
+        if self.debug_on:
+            self.say("    " + msg)
+
+    # -- progress bar ------------------------------------------------------
+
+    def progress_start(self, total):
+        self._marks_on_line = 0
+        self._bytes_done = 0
+        self._bytes_total = total
+        self._t_start = time.monotonic()
+
+    def mark(self, ok, n=0):
+        """Progress bar (debug off only): '.' = a chunk of n file bytes got
+        through, 'x' = a failed try that is retried.  Each line of marks
+        ends with the percentage of the file done (see _endline)."""
+        self._bytes_done += n
+        if self.debug_on:
+            return
+        sys.stderr.write("." if ok else "x")
+        sys.stderr.flush()
+        self._marks_on_line += 1
+        if self._marks_on_line >= self.MARKS_PER_LINE:
+            self._endline()
+
+    def _endline(self):
+        """End a line of progress marks with ' (23% complete)'."""
+        if self._marks_on_line:
+            pct = 100 if self._bytes_total <= 0 else \
+                min(100, self._bytes_done * 100 // self._bytes_total)
+            sys.stderr.write(" (%d%% complete)\n" % pct)
+            sys.stderr.flush()
+            self._marks_on_line = 0
 
     def rate(self, nbytes):
-        """' in 12.3 s (456 bytes/s)': time and speed since prog_start,
+        """' in 12.3 s (456 bytes/s)': time and speed since progress_start,
         for the end of a successful GET/PUT."""
-        secs = time.monotonic() - self._pt0
+        secs = time.monotonic() - self._t_start
         bps = nbytes / secs if secs > 0 else 0.0
         return " in %.1f s (%.0f bytes/s)" % (secs, bps)
 
@@ -945,25 +979,25 @@ class LisaFtpServer:
     # the server checking it and sending the ACK ("server").  Only clean
     # chunks count: not retries, not the empty end-of-file chunk.
 
-    def tm_reset(self):
-        self._tm = {}
+    def timing_reset(self):
+        self._timing = {}
 
-    def tm_add(self, key, secs):
-        n, tot, lo, hi = self._tm.get(key, (0, 0.0, secs, secs))
-        self._tm[key] = (n + 1, tot + secs, min(lo, secs), max(hi, secs))
+    def timing_add(self, key, secs):
+        n, tot, lo, hi = self._timing.get(key, (0, 0.0, secs, secs))
+        self._timing[key] = (n + 1, tot + secs, min(lo, secs), max(hi, secs))
 
-    def tm_ms(self, key, secs):
-        """tm_add, and ' key N ms' for the debug line."""
-        self.tm_add(key, secs)
+    def timing_ms(self, key, secs):
+        """timing_add, and ' key N ms' for the debug line."""
+        self.timing_add(key, secs)
         return " %s %.0f ms" % (key, secs * 1000)
 
-    def tm_line(self, parts):
+    def timing_line(self, parts):
         """'  per chunk (N): label A ms (min-max), ...' or None."""
         out = []
         count = 0
         for key, label in parts:
-            if key in getattr(self, "_tm", {}):
-                n, tot, lo, hi = self._tm[key]
+            if key in self._timing:
+                n, tot, lo, hi = self._timing[key]
                 count = max(count, n)
                 out.append("%s %.0f ms (%.0f-%.0f)"
                            % (label, tot / n * 1000, lo * 1000, hi * 1000))
@@ -971,52 +1005,33 @@ class LisaFtpServer:
             return None
         return "  per chunk (%d chunks): %s" % (count, ", ".join(out))
 
-    def _endline(self):
-        """End a line of progress marks with ' (23% complete)'."""
-        if self._pcol:
-            pct = 100 if self._ptotal <= 0 else \
-                min(100, self._pdone * 100 // self._ptotal)
-            sys.stderr.write(" (%d%% complete)\n" % pct)
-            sys.stderr.flush()
-            self._pcol = 0
 
-    def say(self, msg):
-        """Always shown: commands and their outcome."""
-        self._endline()
-        print(msg, file=sys.stderr, flush=True)
-
-    def dlog(self, msg):
-        """Shown only when debug output is on."""
-        if self.debug_on:
-            self.say("    " + msg)
-
-    def mark(self, ok, n=0):
-        """Progress bar (debug off only): '.' = a chunk of n file bytes got
-        through, 'x' = a failed try that is retried.  Each line of marks
-        ends with the percentage of the file done (see _endline)."""
-        self._pdone += n
-        if self.debug_on:
-            return
-        sys.stderr.write("." if ok else "x")
-        sys.stderr.flush()
-        self._pcol += 1
-        if self._pcol >= self.PROGLINE:
-            self._endline()
-
-    def __init__(self, args):
+class LisaFtpServer(Console):
+    def __init__(self, args, port=None):
+        """args: the command line (see main).  port: an open port to use
+        instead of opening args.port (the tests pass a stand-in)."""
+        Console.__init__(self, args.debug)
         self.args = args
         self.home_dir = os.path.realpath(args.home_dir)
-        self.chunk = CHUNK
         self.timeout = args.timeout
-        self.max_retries = MAX_RETRIES
         self.readonly = args.read_only
         self.monkey_wrench = args.monkey_wrench
-        self.port = SerialPort(args.port, args.baud, args.debug)
+        self.port = port or SerialPort(args.port, args.baud, args.debug)
         self.start_baud = args.baud     # QUIT, and a garbled line, go back to it
         self._confirm_until = None      # BAUD: until when the new rate is on trial
         self._baud_old = None           # BAUD: the rate to go back to if it fails
-        self.debug_default = args.debug
-        self.debug_on = args.debug
+        self._pending = None            # a line read while waiting for NEXT,
+                                        # for the command loop
+        self._page = 0                  # LIST: bytes sent since the last MORE
+        self._mark = None               # MARK: time of the previous MARK
+        self._t_reply = None            # send_chunk: when the last ACK came
+        self._client_failed = False     # send_chunk: the client sent FAIL
+                                        # (answered OK)
+        self._done_line = None          # send_chunk: the client's DONE, taken
+                                        # as the ACK of the end-of-file chunk
+                                        # (its A was lost)
+        self._send_why = ""             # send_chunk: why it failed (for our
+                                        # FAIL line)
 
     # -- low level ---------------------------------------------------------
 
@@ -1024,7 +1039,7 @@ class LisaFtpServer:
         """Timeout for n bytes of a frame that has started: T_BLOCK plus
         twice their time on the wire (10 bits each), or at the Lisa's own
         sending speed (~2700 bytes/s) if that is slower."""
-        baud = getattr(getattr(self, "args", None), "baud", None) or 57600
+        baud = self.args.baud
         rate = min(baud / 10.0, 2700.0)
         return T_BLOCK + 2.0 * n / rate
 
@@ -1055,11 +1070,11 @@ class LisaFtpServer:
                     # partial line: drop it, stay in sync
                     self.dlog("dropping partial line: %r" % buf)
                     return ""
-                return None          # idle timeout
+                return None          # no byte within TIMEOUT
             buf += b
             if b == b"\n":
                 line = buf[:-1].rstrip(b"\r").decode(WIRE)
-                if len(line) > 1024:
+                if len(line) > MAX_IN_LINE:
                     self.dlog("line too long, dropped")
                     return ""
                 if not quiet:
@@ -1076,7 +1091,7 @@ class LisaFtpServer:
         head = "Hi from Lisa Serial FTP Server version %s : " % PROTOCOL
         shown = "".join(c if " " <= c <= "~" else "?" for c in self.home_dir)
         home = "home_dir=%s " % shown
-        tail = "chunk_size=%d" % self.chunk
+        tail = "chunk_size=%d" % CHUNK
         room = MAX_LINE - len(head) - len(tail)
         if len(home) > room:
             home = home[:room]
@@ -1130,12 +1145,10 @@ class LisaFtpServer:
         """NAK the chunk we are still waiting for; the peer retransmits it."""
         self.port.write(b"N %d\r\n" % (seq % SEQ_MOD))
 
-    def _drain(self):
-        """port.drain() for the timing, if the port has one (a test's
-        stand-in port may not)."""
-        drain = getattr(self.port, "drain", None)
-        if drain:
-            drain()
+    def _wait_sent(self):
+        """Wait until what we wrote has left the PC (for the timing, and
+        before a baud change)."""
+        self.port.drain()
 
     def _ack(self, seq):
         """ACK chunk seq: 'A <seq>' (numbered, so the peer can tell it
@@ -1149,7 +1162,7 @@ class LisaFtpServer:
         ever discards the bad frame's leftover bytes.  A cap keeps it from
         running away on a noisy line."""
         n = 0
-        cap = 2 * (self.chunk + 7)
+        cap = 2 * (CHUNK + 7)
         while n < cap:
             try:
                 self.port.read(1, T_QUIET)
@@ -1165,7 +1178,7 @@ class LisaFtpServer:
         timeout.  Used to inspect a 'FAIL ...' line the peer sent where a
         chunk header was expected."""
         buf = b""
-        while len(buf) < 1024:
+        while len(buf) < MAX_IN_LINE:
             try:
                 b = self.port.read(1, T_BLOCK)
             except (TimeoutError, ClientGone):
@@ -1179,7 +1192,7 @@ class LisaFtpServer:
     # -- path safety -------------------------------------------------------
 
     def safe_path(self, name):
-        name = dec(name.strip())
+        name = name_from_wire(name.strip())
         if not name:
             raise ProtocolError(1, "empty name")
         # '/' is the separator; the name is under home_dir
@@ -1246,7 +1259,7 @@ class LisaFtpServer:
         # the reply must be out of the adapter too before the switch: the
         # kernel's queue first, then about its own length again at the old
         # rate for the adapter's FIFO
-        self._drain()
+        self._wait_sent()
         time.sleep(0.1 + 12 * 10.0 / old)
         if nb == old:
             self.say("  ok: the baud rate stays %d" % nb)
@@ -1321,7 +1334,8 @@ class LisaFtpServer:
                 continue
             kind = "D" if os.path.isdir(full) else "F"
             # long names are truncated to MAX_LINE by send_line
-            if not self.list_line("%s %d %s" % (kind, st.st_size, enc(entry))):
+            line = "%s %d %s" % (kind, st.st_size, name_to_wire(entry))
+            if not self.list_line(line):
                 return
             n += 1
         if not self.list_line("DONE"):
@@ -1369,7 +1383,7 @@ class LisaFtpServer:
         p = self.safe_path(args[0])
         if not os.path.isfile(p):
             raise ProtocolError(11, "no such file on server: %s" % p)
-        if os.path.getsize(p) > 64 * 1024 * 1024:
+        if os.path.getsize(p) > MAX_FILE:
             raise ProtocolError(4, "file too big")
         with open(p, "rb") as f:
             data = f.read()
@@ -1379,8 +1393,9 @@ class LisaFtpServer:
         bsum = sum(data) & 0xFFFF
         self.send_line("OK %d %04x %04x" % (len(data), crc, bsum))
         self.say("  ok: %s%s: %d bytes, crc %04x, sum %04x"
-                 % (dec(args[0]), " (as Lisa text)" if args[1].upper() == "T"
-                    else "", len(data), crc, bsum))
+                 % (name_from_wire(args[0]),
+                    " (as Lisa text)" if args[1].upper() == "T" else "",
+                    len(data), crc, bsum))
 
     def cmd_mark(self, args):
         """MARK <label>: answer with the ms since the previous MARK (the
@@ -1415,18 +1430,18 @@ class LisaFtpServer:
             n = 0
         if not 1 <= n <= 400:
             raise ProtocolError(1, "usage: FRAMES n (1..400)")
-        payload = bytes((i * 37) & 0xFF for i in range(self.chunk))
-        self.prog_start(n * self.chunk)
-        self.tm_reset()
+        payload = bytes((i * 37) & 0xFF for i in range(CHUNK))
+        self.progress_start(n * CHUNK)
+        self.timing_reset()
         self._t_reply = None
         for seq in range(n + 1):
             if not self.send_chunk(seq, payload if seq < n else b""):
                 self.say("  FAILED: frames: %s" % self._send_why)
                 return
         self.say("  ok: %d chunks sent" % n)
-        tl = self.tm_line([("wire", "the frame leaves the PC"),
-                           ("lisa", "the Lisa until its ACK"),
-                           ("server", "the server")])
+        tl = self.timing_line([("wire", "the frame leaves the PC"),
+                               ("lisa", "the Lisa until its ACK"),
+                               ("server", "the server")])
         if tl:
             self.say(tl)
 
@@ -1443,15 +1458,15 @@ class LisaFtpServer:
             raise ProtocolError(11, "no such file on server: %s" % p)
         pages = None
         if len(args) == 2:
-            if os.path.getsize(p) > 64 * 1024 * 1024:
+            if os.path.getsize(p) > MAX_FILE:
                 raise ProtocolError(4, "file too big")
             with open(p, "rb") as f:
                 pages = lisa_pages(f.read())
             size = len(pages)
         else:
             size = os.path.getsize(p)
-        self.prog_start(size)
-        self.tm_reset()
+        self.progress_start(size)
+        self.timing_reset()
         self._t_reply = None
         self.send_line("OK %d" % size)
         # Wait for the client's GO: it sends it once its local file is
@@ -1479,7 +1494,7 @@ class LisaFtpServer:
         try:
             with (io.BytesIO(pages) if pages is not None else open(p, "rb")) as f:
                 while True:
-                    payload = f.read(self.chunk)
+                    payload = f.read(CHUNK)
                     if not self.send_chunk(seq, payload):
                         if self._client_failed:
                             return        # the client gave up (we said OK)
@@ -1518,10 +1533,11 @@ class LisaFtpServer:
             what = (" (%d Lisa text pages)" % (size // TEXT_PAGE)
                     if pages is not None else "")
             self.say("  ok: sent %d bytes of %s%s, verified (crc %s)%s"
-                     % (size, dec(args[0]), what, mycrc, self.rate(size)))
-            tl = self.tm_line([("wire", "the frame leaves the PC"),
-                               ("lisa", "the Lisa until its ACK"),
-                               ("server", "the server")])
+                     % (size, name_from_wire(args[0]), what, mycrc,
+                        self.rate(size)))
+            tl = self.timing_line([("wire", "the frame leaves the PC"),
+                                   ("lisa", "the Lisa until its ACK"),
+                                   ("server", "the server")])
             if tl:
                 self.say(tl)
         else:
@@ -1539,24 +1555,21 @@ class LisaFtpServer:
         return crc
 
     def _wrench(self, frame, seq, what):
-        """Monkey wrench (test mode): with probability 0.20, flip one random
-        byte of frame[5:] -- the payload or the CRC, never the 5-byte header --
-        to a random value.  The header is left intact on purpose: corrupting
-        it would desync the byte stream, whereas corrupting the payload or the
-        CRC is what exercises the CRC check + NAK + retransmit path this
-        option exists to test.  frame must be a mutable bytearray.  Prints a
-        line to stdout when a byte is flipped."""
-        if not self.monkey_wrench or random.random() >= 0.20:
+        """Monkey wrench (test mode): with probability WRENCH_ODDS, flip one
+        random byte after the FRAME_HEAD -- the payload or the CRC, never the
+        header -- to a random value.  The header is left intact on purpose:
+        corrupting it would desync the byte stream, whereas corrupting the
+        payload or the CRC is what exercises the CRC check + NAK + retransmit
+        path this option exists to test.  frame must be a mutable bytearray.
+        Reports each flipped byte on the console."""
+        if not self.monkey_wrench or random.random() >= WRENCH_ODDS:
             return
-        i = 5 + random.randrange(len(frame) - 5)
+        i = FRAME_HEAD + random.randrange(len(frame) - FRAME_HEAD)
         old = frame[i]
         new = random.randrange(256)
         if new == old:
             new = (new + 1) & 0xFF     # guarantee an actual change
         frame[i] = new
-        # flush=True: stdout is block-buffered when captured by a tool
-        # instead of a TTY, and these lines are rare enough that the
-        # buffer would never fill on its own
         self.say("[monkey-wrench] %s chunk seq=%d: byte %d 0x%02x -> 0x%02x"
                  % (what, seq, i, old, new))
 
@@ -1586,21 +1599,21 @@ class LisaFtpServer:
         FAIL, which has been answered with OK: no FAIL from us then)."""
         self._client_failed = False
         self._done_line = None
-        self._send_why = "no ACK from the client after %d tries" % self.max_retries
-        s16 = seq % SEQ_MOD
-        nxt = (seq + 1) % SEQ_MOD
-        base = (b"T" + s16.to_bytes(2, "big")
+        self._send_why = "no ACK from the client after %d tries" % MAX_RETRIES
+        wire_seq = seq % SEQ_MOD
+        next_seq = (seq + 1) % SEQ_MOD
+        base = (b"T" + wire_seq.to_bytes(2, "big")
                 + len(payload).to_bytes(2, "big") + payload)
         base += crc16(base[1:]).to_bytes(2, "big")
         what = ("chunk %d: %d bytes sent" % (seq, len(payload))
                 if payload else "chunk %d: end-of-file chunk sent" % seq)
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             frame = bytearray(base)
             self._wrench(frame, seq, "send")
             t0 = time.monotonic()
-            prev = getattr(self, "_t_reply", None)
+            prev = self._t_reply
             self.port.write(bytes(frame))
-            self._drain()
+            self._wait_sent()
             t1 = time.monotonic()          # the frame has left the PC
             tries = " (try %d)" % attempt if attempt > 1 else ""
             # Wait for the A/N reply with T_REPLY: if it (or the whole
@@ -1613,20 +1626,23 @@ class LisaFtpServer:
                 except TimeoutError:
                     line = None
                 kind, num = parse_reply(line)
-                if kind is None or not seq_behind(num, s16) or nstale >= 4:
+                if (kind is None or not seq_behind(num, wire_seq)
+                        or nstale >= 4):
                     break
                 nstale += 1
                 self.dlog("chunk %d: stale reply %r (about an earlier chunk)"
                           " skipped" % (seq, line))
-            if kind is not None and seq_behind(num, s16):
+            if kind is not None and seq_behind(num, wire_seq):
                 kind = None           # only stale replies: resend
-            if kind == "A" and num == s16:
+            if kind == "A" and num == wire_seq:
                 t2 = time.monotonic()
                 self._t_reply = t2
                 tms = ""
                 if attempt == 1 and payload:   # clean chunks only
-                    tms = (self.tm_ms("wire", t1 - t0) + self.tm_ms("lisa", t2 - t1)
-                           + (self.tm_ms("server", t0 - prev) if prev else ""))
+                    tms = (self.timing_ms("wire", t1 - t0)
+                           + self.timing_ms("lisa", t2 - t1)
+                           + (self.timing_ms("server", t0 - prev)
+                              if prev else ""))
                 self.dlog("%s%s -> accepted (ACK)%s" % (what, tries, tms))
                 self.mark(True, len(payload))
                 return True
@@ -1649,13 +1665,13 @@ class LisaFtpServer:
                 self._client_failed = True
                 return False
             nak = num if kind == "N" else None
-            if nak == nxt:
+            if nak == next_seq:
                 self.dlog("%s%s -> NAK for the next chunk: the client already "
                           "has this one (its ACK was lost) -> accepted"
                           % (what, tries))
                 self.mark(True, len(payload))
                 return True
-            if nak == s16:
+            if nak == wire_seq:
                 self.dlog("%s%s -> rejected by the client (NAK), resending"
                           % (what, tries))
             elif line is None or line == "":
@@ -1666,7 +1682,7 @@ class LisaFtpServer:
                 self.dlog("%s%s -> unexpected reply %r, resending"
                           % (what, tries, line))
             self.mark(False)
-        self.dlog("chunk %d: no ACK after %d tries" % (seq, self.max_retries))
+        self.dlog("chunk %d: no ACK after %d tries" % (seq, MAX_RETRIES))
         return False
 
     def cmd_put(self, args):
@@ -1676,7 +1692,7 @@ class LisaFtpServer:
             raise ProtocolError(1, "usage: PUT name size")
         p = self.safe_path(args[0])
         size = int(args[1])
-        if size > 64 * 1024 * 1024:
+        if size > MAX_FILE:
             raise ProtocolError(4, "file too big")
         d = os.path.dirname(p)
         if not os.path.isdir(d):
@@ -1688,183 +1704,73 @@ class LisaFtpServer:
             f = open(p, "wb")
         except OSError as e:
             raise ProtocolError(13, "cannot create %s: %s" % (p, e.strerror))
-        self.prog_start(size)
-        self.tm_reset()
+        self.progress_start(size)
+        self.timing_reset()
         self.send_line("OK")
         seq = 0
         crc = 0xFFFF
         total = 0
-        fails = 0
+        fails = 0                       # failed tries on the current chunk
         giveup = False
         t_acked = None                  # our last ACK left the PC (timing)
         try:
             with f:
-                while not giveup:
-                    # 1. First byte of a chunk, long timeout: if the whole
-                    #    chunk was lost, the peer retransmits it after
-                    #    T_REPLY, so wait longer than that to catch it.
-                    try:
-                        b = self.port.read(1, T_FRAME)
-                        t_first = time.monotonic()   # a frame starts (timing)
-                    except TimeoutError:
-                        self.dlog("chunk %d: nothing arrived within %.0f s -> NAK"
-                                  % (seq, T_FRAME))
-                        self.mark(False)
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    if b == b"H":
-                        # possibly HELLO (the peer restarted)
-                        rest = b""
-                        try:
-                            rest = self.port.read(4, T_BLOCK)
-                        except TimeoutError:
-                            rest = b""
-                        if b"H" + rest == b"HELLO":
-                            raise PeerRestarted("HELLO in place of chunk header")
-                        # not HELLO: a corrupted header byte; desync
-                        self.dlog("chunk %d: byte %r where a chunk should start "
-                                  "(out of step) -> discard, NAK" % (seq, b))
-                        self.mark(False)
-                        self._discard_until_quiet()
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    if b == b"F":
-                        # the peer aborted: read its FAIL line, acknowledge
-                        # it, and drop the partial file
-                        line = "F" + self._read_rest_of_line()
-                        if line.startswith("FAIL"):
-                            self.say("  FAILED: the client aborted: %s" % line)
-                            self.port.write(b"OK\r\n")
-                            self.drop_partial(p)
-                            return
-                        # not a FAIL line: desync
-                        self.dlog("chunk %d: byte %r where a chunk should start "
-                                  "(out of step) -> discard, NAK" % (seq, b))
-                        self.mark(False)
-                        self._discard_until_quiet()
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    if b != b"T":
-                        # desync (a corrupted or partial frame)
-                        self.dlog("chunk %d: byte %r where a chunk should start "
-                                  "(out of step) -> discard, NAK" % (seq, b))
-                        self.mark(False)
-                        self._discard_until_quiet()
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    # 2. Rest of the header, payload, CRC with short
-                    #    timeouts: a byte lost mid-chunk makes a read short.
-                    try:
-                        rest = self.port.read(4, T_BLOCK)
-                        cseq = int.from_bytes(rest[0:2], "big")
-                        clen = int.from_bytes(rest[2:4], "big")
-                        if clen > self.chunk:
-                            raise ValueError(clen)
-                        payload = self.port.read(clen, self.t_block(clen)) if clen else b""
-                        crc_bytes = self.port.read(2, T_BLOCK)
-                        t_done = time.monotonic()    # the frame is in (timing)
-                    except TimeoutError:
-                        # partial chunk: discard the stray tail, then NAK
-                        self.dlog("chunk %d: incomplete (bytes lost) -> discard, NAK"
-                                  % seq)
-                        self.mark(False)
-                        self._discard_until_quiet()
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    except ValueError:
-                        # implausible length (a false sync): discard + NAK
-                        self.dlog("chunk %d: impossible length %d (out of step)"
-                                  " -> discard, NAK" % (seq, clen))
-                        self.mark(False)
-                        self._discard_until_quiet()
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        self._nak(seq)
-                        continue
-                    # 3. Reassemble the whole received frame so the monkey
-                    #    wrench (if enabled) can flip a payload/CRC byte
-                    #    before the CRC check below runs.
-                    hdr = b"T" + rest
-                    rx = bytearray(hdr)
-                    rx += payload
-                    rx += crc_bytes
-                    self._wrench(rx, cseq, "recv")
-                    ccrc = int.from_bytes(rx[len(rx) - 2:], "big")
-                    calc = crc16(bytes(rx[1:5]) + bytes(rx[5:len(rx) - 2]))
-                    s16 = seq % SEQ_MOD
-                    if seq_behind(cseq, s16):
-                        # duplicate: already accepted (our A was lost, so the
-                        # peer retransmitted it).  Re-ACK and discard; wait
-                        # for the real next chunk.
+                while True:
+                    got = self._recv_chunk(seq)
+                    kind = got[0]
+                    if kind == "fail":
+                        # the peer aborted: acknowledge its FAIL, drop the
+                        # partial file
+                        self.say("  FAILED: the client aborted: %s" % got[1])
+                        self.port.write(b"OK\r\n")
+                        self.drop_partial(p)
+                        return
+                    if kind == "dup":
+                        # already accepted (our A was lost, so the peer
+                        # retransmitted it): ACK it again and wait for the
+                        # real next chunk
                         self.dlog("chunk %d: received again (our ACK was lost)"
-                                  " -> ACK again" % cseq)
-                        self._ack(cseq)
-                        fails += 1
-                        if fails >= self.max_retries:
-                            giveup = True
-                            break
-                        continue
-                    if cseq != s16 or ccrc != calc:
-                        if cseq != s16:
-                            why = "chunk %d arrived, expected %d" % (cseq, seq)
-                        else:
-                            why = "bad CRC (received %04x, computed %04x)" % (ccrc, calc)
-                        self.dlog("chunk %d: rejected, %s -> NAK" % (seq, why))
+                                  " -> ACK again" % got[1])
+                        self._ack(got[1])
+                    elif kind == "bad":
+                        _, why, discard = got
+                        self.dlog("chunk %d: %s" % (seq, why))
                         self.mark(False)
-                        # discard any stray tail (a byte lost in the header
-                        # can leave the frame short even when the reads
-                        # succeeded); quiet if the frame was whole
-                        self._discard_until_quiet()
+                        if discard:
+                            self._discard_until_quiet()
+                    if kind != "ok":
                         fails += 1
-                        if fails >= self.max_retries:
+                        if fails >= MAX_RETRIES:
                             giveup = True
                             break
-                        self._nak(seq)
+                        if kind == "bad":
+                            self._nak(seq)     # the peer sends it again
                         continue
-                    # 4. good chunk
+                    # a good chunk: ACK it
+                    _, payload, t_first, t_done = got
+                    got_len = len(payload)
                     self._ack(seq)
-                    self._drain()
+                    self._wait_sent()
                     t_ack = time.monotonic()
                     tms = ""
-                    if clen and fails == 0:     # clean chunks only
-                        tms = ((self.tm_ms("lisa", t_first - t_acked) if t_acked else "")
-                               + self.tm_ms("frame", t_done - t_first)
-                               + self.tm_ms("server", t_ack - t_done))
+                    if got_len and fails == 0:     # clean chunks only
+                        tms = ((self.timing_ms("lisa", t_first - t_acked)
+                                if t_acked else "")
+                               + self.timing_ms("frame", t_done - t_first)
+                               + self.timing_ms("server", t_ack - t_done))
                     t_acked = t_ack
-                    if clen:
+                    if got_len:
                         self.dlog("chunk %d: %d bytes received, CRC ok -> ACK%s"
-                                  % (seq, clen, tms))
+                                  % (seq, got_len, tms))
                     else:
                         self.dlog("chunk %d: end-of-file chunk received -> ACK" % seq)
-                    self.mark(True, clen)
+                    self.mark(True, got_len)
                     fails = 0
-                    if clen == 0:
+                    if got_len == 0:
                         break
                     f.write(payload)
                     crc = crc16(payload, crc)
-                    total += clen
+                    total += got_len
                     seq += 1
         except PeerRestarted:
             self.drop_partial(p)
@@ -1897,10 +1803,12 @@ class LisaFtpServer:
                 good = False
         if good and total == size:
             self.say("  ok: received %d bytes into %s, verified (crc %04x)%s"
-                     % (total, dec(args[0]), crc, self.rate(total)))
-            tl = self.tm_line([("lisa", "the Lisa until its next frame starts"),
-                               ("frame", "the frame arrives"),
-                               ("server", "the server")])
+                     % (total, name_from_wire(args[0]), crc,
+                        self.rate(total)))
+            tl = self.timing_line([("lisa", "the Lisa until its next frame"
+                                            " starts"),
+                                   ("frame", "the frame arrives"),
+                                   ("server", "the server")])
             if tl:
                 self.say(tl)
         elif good:
@@ -1913,6 +1821,77 @@ class LisaFtpServer:
             if verdict == "HELLO":
                 self.peer_restarted()
 
+    def _recv_chunk(self, seq):
+        """PUT: read one framed chunk, the one numbered SEQ, and check it.
+        Returns what arrived:
+          ("ok", payload, t_first, t_done)  chunk SEQ, CRC good (payload b""
+                                            is the end-of-file chunk); the
+                                            times are for the timing line
+          ("dup", n)                        chunk n, an earlier one again
+          ("bad", why, discard)             no good chunk: WHY for the debug
+                                            line; DISCARD if bytes of a bad
+                                            frame may still be arriving
+          ("fail", line)                    the peer's FAIL line (it aborted)
+        Raises PeerRestarted on a HELLO where a chunk should start."""
+        # 1. First byte of a chunk, long timeout: if the whole chunk was
+        #    lost, the peer retransmits it after T_REPLY, so wait longer
+        #    than that to catch it.
+        try:
+            b = self.port.read(1, T_FRAME)
+        except TimeoutError:
+            return ("bad", "nothing arrived within %.0f s -> NAK" % T_FRAME, False)
+        t_first = time.monotonic()      # a frame starts (timing)
+        out_of_step = ("bad", "byte %r where a chunk should start (out of step)"
+                       " -> discard, NAK" % b, True)
+        if b == b"H":
+            # possibly HELLO (the peer restarted)
+            try:
+                rest = self.port.read(4, T_BLOCK)
+            except TimeoutError:
+                rest = b""
+            if b"H" + rest == b"HELLO":
+                raise PeerRestarted("HELLO in place of chunk header")
+            return out_of_step          # a corrupted header byte
+        if b == b"F":
+            line = "F" + self._read_rest_of_line()
+            return ("fail", line) if line.startswith("FAIL") else out_of_step
+        if b != b"T":
+            return out_of_step          # a corrupted or partial frame
+        # 2. Rest of the header, payload, CRC with short timeouts: a byte
+        #    lost mid-chunk makes a read short.
+        try:
+            rest = self.port.read(4, T_BLOCK)
+            got_seq = int.from_bytes(rest[0:2], "big")
+            got_len = int.from_bytes(rest[2:4], "big")
+            if got_len > CHUNK:
+                # implausible length: a false sync
+                return ("bad", "impossible length %d (out of step) -> discard, NAK"
+                        % got_len, True)
+            payload = (self.port.read(got_len, self.t_block(got_len))
+                       if got_len else b"")
+            crc_bytes = self.port.read(2, T_BLOCK)
+            t_done = time.monotonic()   # the frame is in (timing)
+        except TimeoutError:
+            return ("bad", "incomplete (bytes lost) -> discard, NAK", True)
+        # 3. Reassemble the whole received frame so the monkey wrench (if
+        #    enabled) can flip a payload/CRC byte before the CRC check.
+        rx = bytearray(b"T" + rest + payload + crc_bytes)
+        self._wrench(rx, got_seq, "recv")
+        got_crc = int.from_bytes(rx[-2:], "big")
+        calc = crc16(bytes(rx[1:-2]))
+        wire_seq = seq % SEQ_MOD
+        if seq_behind(got_seq, wire_seq):
+            return ("dup", got_seq)
+        if got_seq != wire_seq:
+            why = "chunk %d arrived, expected %d" % (got_seq, seq)
+        elif got_crc != calc:
+            why = "bad CRC (received %04x, computed %04x)" % (got_crc, calc)
+        else:
+            return ("ok", payload, t_first, t_done)
+        # discard any stray tail (a byte lost in the header can leave the
+        # frame short even when the reads succeeded); quiet if it was whole
+        return ("bad", "rejected, %s -> NAK" % why, True)
+
     def _read_verdict(self, eofseq, done):
         """PUT: read the client's OK/BAD verdict after our DONE.  If the
         client sends the end-of-file chunk (number eofseq) again instead
@@ -1920,7 +1899,7 @@ class LisaFtpServer:
         they arrived -- ACK it again and resend DONE, rather than reading
         the frame as a garbled verdict (which would delete a good file).
         Returns the verdict line, or None."""
-        for _ in range(self.max_retries):
+        for _ in range(MAX_RETRIES):
             try:
                 b = self.port.read(1, self.timeout)
             except TimeoutError:
@@ -1949,11 +1928,23 @@ class LisaFtpServer:
 
     # -- main loop ---------------------------------------------------------
 
-    # every command and protocol reply a client sends; any other line is
-    # garbled (or sent at another rate: see BAUD)
-    KNOWN = {"HELLO", "LIST", "GET", "PUT", "SUM", "CAL", "DEBUG", "MARK",
-             "ECHO", "FRAMES", "DELETE", "DELTESTS", "BAUD", "QUIT", "NEXT",
-             "DONE", "OK", "BAD", "FAIL", "GO", "A", "N"}
+    def cmd_quit(self, args):
+        self.say("  ok: the client quit")
+        raise ClientGone("quit")
+
+    # the commands a client can send, and the method that serves each
+    COMMANDS = {
+        "HELLO": cmd_hello, "LIST": cmd_list, "GET": cmd_get, "PUT": cmd_put,
+        "SUM": cmd_sum, "DELETE": cmd_delete, "BAUD": cmd_baud,
+        "DEBUG": cmd_debug, "CAL": cmd_cal, "QUIT": cmd_quit,
+        # hidden: the client's 'bench' command, and the Lisa test macro
+        "MARK": cmd_mark, "ECHO": cmd_echo, "FRAMES": cmd_frames,
+        "DELTESTS": cmd_deltests,
+    }
+    # every line a client sends: a command, or a protocol reply (which is
+    # answered ERR 99 where no command is expected).  Any other line is
+    # garbled, or sent at another rate (see BAUD).
+    KNOWN = set(COMMANDS) | {"NEXT", "DONE", "OK", "BAD", "FAIL", "GO", "A", "N"}
 
     def handle_client(self):
         while True:
@@ -2000,35 +1991,9 @@ class LisaFtpServer:
             if cmd != "MARK":           # bench marks: cmd_mark reports them
                 self.say("> " + line)
             try:
-                if cmd == "HELLO":
-                    self.cmd_hello(parts[1:])
-                elif cmd == "LIST":
-                    self.cmd_list(parts[1:])
-                elif cmd == "GET":
-                    self.cmd_get(parts[1:])
-                elif cmd == "PUT":
-                    self.cmd_put(parts[1:])
-                elif cmd == "SUM":
-                    self.cmd_sum(parts[1:])
-                elif cmd == "CAL":
-                    self.cmd_cal(parts[1:])
-                elif cmd == "DEBUG":
-                    self.cmd_debug(parts[1:])
-                elif cmd == "MARK":
-                    self.cmd_mark(parts[1:])
-                elif cmd == "ECHO":
-                    self.cmd_echo(parts[1:])
-                elif cmd == "FRAMES":
-                    self.cmd_frames(parts[1:])
-                elif cmd == "DELETE":
-                    self.cmd_delete(parts[1:])
-                elif cmd == "BAUD":
-                    self.cmd_baud(parts[1:])
-                elif cmd == "DELTESTS":
-                    self.cmd_deltests(parts[1:])
-                elif cmd == "QUIT":
-                    self.say("  ok: the client quit")
-                    raise ClientGone("quit")
+                serve = self.COMMANDS.get(cmd)
+                if serve:
+                    serve(self, parts[1:])
                 else:
                     self.send_line("ERR 99 unknown command")
                     self.say("  error: unknown command")
@@ -2077,6 +2042,10 @@ class LisaFtpServer:
         finally:
             self.port.close()
 
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(

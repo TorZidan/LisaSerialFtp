@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tests/..
 import LisaSerialFtpServer as srv
@@ -69,6 +70,9 @@ class MockPort:
     def log(self, msg):
         if VERBOSE:
             print("[srv] " + msg, file=sys.stderr)
+
+    def drain(self, limit=2.0):
+        pass                           # writes are instant here
 
     def flush_input(self):
         with self.lock:
@@ -143,16 +147,11 @@ class MockPort:
 
 
 def make_server(root):
-    s = srv.LisaFtpServer.__new__(srv.LisaFtpServer)
-    s.port = MockPort()
-    s.chunk = srv.CHUNK
-    s.timeout = srv.T_FRAME
-    s.max_retries = srv.MAX_RETRIES
-    s.readonly = False
-    s.monkey_wrench = False
-    s.home_dir = root
-    s.args = None
-    return s
+    """A server on a MockPort, with the command line it would have had."""
+    args = types.SimpleNamespace(home_dir=root, timeout=srv.T_FRAME,
+                                 read_only=False, monkey_wrench=False,
+                                 port=None, baud=57600, debug=False)
+    return srv.LisaFtpServer(args, port=MockPort())
 
 
 def lisa_sender(port, data, chunk, drop_fn, max_retry=1000, lie=False):
@@ -225,7 +224,7 @@ def run_case(name, data, drop_fn, lie=False):
         result["err"] = "bad PUT ack: %r" % (ack,)
         t.join(timeout=5)
         return False
-    ok = lisa_sender(s.port, data, s.chunk, drop_fn, lie=lie)
+    ok = lisa_sender(s.port, data, srv.CHUNK, drop_fn, lie=lie)
     t.join(timeout=30)
     if t.is_alive():
         result["ok"] = False
@@ -351,7 +350,7 @@ def run_get_case(name, data, drop_fn, lie=False):
     t = threading.Thread(target=server_main)
     t.start()
     time.sleep(0.2)
-    got = lisa_receiver(s.port, s.chunk, drop_fn, lie=lie)
+    got = lisa_receiver(s.port, srv.CHUNK, drop_fn, lie=lie)
     t.join(timeout=30)
     if t.is_alive():
         result["ok"] = False

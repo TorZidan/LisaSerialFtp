@@ -115,7 +115,8 @@ $("start").addEventListener("click", async () => {
     if (e.name !== "NotFoundError") log.say("no serial port: " + e.message);
     return;                        // NotFoundError: the user cancelled the picker
   }
-  port = new WebSerialPort(sp, Number($("baud").value));
+  const startBaud = Number($("baud").value);
+  port = new WebSerialPort(sp, startBaud);
   try {
     await port.open();
   } catch (e) {
@@ -126,9 +127,17 @@ $("start").addEventListener("click", async () => {
   }
   server = new LisaFtpServer(port, source, log);
   server.debugDefault = server.debugOn = $("debug").checked;
+  const ro = source.writable ? "" : ", read only";
+  // BAUD from the Lisa (and the switch back after a failed one, or QUIT):
+  // show the rate the port is at now
+  server.onBaud = rate => {
+    $("baud").value = String(rate);
+    setStatus(`running at ${rate} baud${ro}`, "ok");
+  };
   $("start").disabled = true;
   $("stop").disabled = false;
-  setStatus(`running at ${port.baud} baud` + (source.writable ? "" : ", read only"), "ok");
+  setStatus(`running at ${port.baud} baud${ro}`, "ok");
+  $("baud").disabled = true;        // the Lisa's 'baud' command changes it now
   try {
     await server.run();
   } catch (e) {
@@ -142,6 +151,8 @@ $("start").addEventListener("click", async () => {
     server = null;
     $("start").disabled = !("serial" in navigator);
     $("stop").disabled = true;
+    $("baud").disabled = false;
+    $("baud").value = String(startBaud);
     progressEl.hidden = true;
   }
 });

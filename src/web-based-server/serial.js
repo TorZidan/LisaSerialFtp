@@ -89,6 +89,8 @@ export class WebSerialPort {
     this.reader = null;
     this.writer = null;
     this.closing = false;
+    this.reopening = false; // setBaud: the read loop ends, the queue stays
+    this.loop = null;       // the read loop's promise
     this.onGone = null;     // called once if the port goes away
   }
 
@@ -98,12 +100,36 @@ export class WebSerialPort {
       flowControl: "none", bufferSize: 64 * 1024,
     });
     this.writer = this.port.writable.getWriter();
-    this._readLoop();
+    this.loop = this._readLoop();
+  }
+
+  // BAUD: Web Serial cannot change the rate of an open port, so close it
+  // and open it again at the new rate.  The queue (and a read waiting on
+  // it) carries on: to the protocol code it is the same port.
+  async setBaud(rate) {
+    this.reopening = true;
+    try {
+      try { if (this.reader) await this.reader.cancel(); } catch {}
+      await this.loop;                 // the read loop has ended
+      try { this.writer.releaseLock(); } catch {}
+      await this.port.close();
+    } finally {
+      this.reopening = false;          // (before open: its read loop checks it)
+    }
+    this.baud = rate;
+    try {
+      await this.open();
+    } catch (e) {
+      const err = new Error(`cannot open the serial port again at ${rate} baud: ${e.message}`);
+      this.queue.fail(err);
+      if (this.onGone) this.onGone(err);
+      throw err;
+    }
   }
 
   async _readLoop() {
     try {
-      while (this.port.readable && !this.closing) {
+      while (this.port.readable && !this.closing && !this.reopening) {
         this.reader = this.port.readable.getReader();
         try {
           for (;;) {
@@ -113,14 +139,16 @@ export class WebSerialPort {
           }
         } catch (e) {
           // a framing / parity / break error ends this reader; the
-          // stream can be read again (Web Serial spec)
-          if (this.closing) break;
+          // stream can be read again (Web Serial spec).  Bytes at a wrong
+          // rate cause these, so after BAUD they are normal.
+          if (this.closing || this.reopening) break;
         } finally {
           this.reader.releaseLock();
           this.reader = null;
         }
       }
     } finally {
+      if (this.reopening) return;      // setBaud opens it again
       const err = new Error("the serial port is closed or was unplugged");
       this.queue.fail(err);
       if (!this.closing && this.onGone) this.onGone(err);

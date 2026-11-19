@@ -39,22 +39,30 @@ function makeLink() {
   const toServer = new ByteQueue();
   const toClient = new ByteQueue();
   const link = { spoil: null, toServer, toClient };
+  // the client's rate: bytes between sides at different rates arrive
+  // garbled (high bytes; the line end survives, so the other side sees a
+  // garbled line).  baudLog: the rates the server switched to.
+  link.clientBaud = 57600;
+  link.baudLog = [];
+  link.garble = b => (link.clientBaud === link.serverPort.baud ? b
+    : b.map(x => (x === 10 ? 10 : 0x80 | (x ^ 0x5A))));
   link.serverPort = {
     read: (n, t) => toServer.read(n, t),
     write: async bytes => {
       const b = link.spoil ? link.spoil(Uint8Array.from(bytes)) : bytes;
-      if (b) toClient.push(Uint8Array.from(b));
+      if (b) toClient.push(link.garble(Uint8Array.from(b)));
     },
     flushInput: () => toServer.flush(),
     baud: 57600,
+    setBaud: async rate => { link.serverPort.baud = rate; link.baudLog.push(rate); },
   };
   return link;
 }
 
 class FakeLisa {
   constructor(link) { this.link = link; }
-  send(text) { this.link.toServer.push(toWire(text + "\r\n")); }
-  sendRaw(bytes) { this.link.toServer.push(bytes); }
+  send(text) { this.sendRaw(toWire(text + "\r\n")); }
+  sendRaw(bytes) { this.link.toServer.push(this.link.garble(Uint8Array.from(bytes))); }
   async line(t = 3000) {
     const buf = [];
     for (;;) {
@@ -274,8 +282,85 @@ lisa.send("HELLO");
 check((await lisa.line()).startsWith("Hi from"), "HELLO -> banner");
 lisa.send("DEBUG OFF");
 check(await lisa.line() === "OK debug off", "DEBUG OFF -> OK debug off");
-lisa.send("BAUD 9600");
-check(await lisa.line() === "ERR 99 unknown command", "BAUD -> ERR 99 (not in the prototype yet)");
+lisa.send("XYZZY");
+check(await lisa.line() === "ERR 99 unknown command", "an unknown command -> ERR 99");
+
+// BAUD
+{
+  const sp = link.serverPort;
+  lisa.send("BAUD 9600");
+  const ok = await lisa.line();               // still at the old rate
+  link.clientBaud = 9600;                     // the client switches too
+  await new Promise(r => setTimeout(r, 400));
+  lisa.send("HELLO");
+  const hi = await lisa.line();
+  check(ok === "OK 9600" && hi.startsWith("Hi from") && sp.baud === 9600 && server.confirmUntil === null,
+    "BAUD 9600 -> OK 9600 at the old rate, then served at 9600, trial over");
+  lisa.send("SUM one.bin B");
+  check((await lisa.line()).startsWith("OK 1016 "), "commands work at the new rate");
+
+  lisa.send("BAUD 57600");
+  const ok2 = await lisa.line();
+  link.clientBaud = 57600;
+  await new Promise(r => setTimeout(r, 300));
+  await lisa.sync();
+  check(ok2 === "OK 57600" && sp.baud === 57600, "BAUD 57600 -> back at 57600");
+
+  lisa.send("BAUD 57600");
+  check(await lisa.line() === "OK 57600" && sp.baud === 57600 && server.confirmUntil === null,
+    "BAUD at the current rate -> OK, no switch");
+  lisa.send("BAUD 115200");
+  check((await lisa.line()).startsWith("ERR 21 unsupported baud rate 115200"), "BAUD 115200 -> ERR 21");
+  lisa.send("BAUD fast");
+  check((await lisa.line()).startsWith("ERR 1 usage"), "BAUD fast -> ERR 1 usage");
+
+  // the client did not switch: its HELLO arrives garbled -> back to the old rate
+  lisa.send("BAUD 19200");
+  await lisa.line();
+  await new Promise(r => setTimeout(r, 300));
+  const before = link.baudLog.length;
+  lisa.send("HELLO");                         // garbled at 19200
+  await new Promise(r => setTimeout(r, 300));
+  lisa.send("HELLO");                         // the client tries again
+  const hi2 = await lisa.line();
+  check(hi2.startsWith("Hi from") && sp.baud === 57600 && link.baudLog[before] === 57600,
+    "BAUD, then a garbled line on trial -> back to the old rate, served there");
+
+  // silence on trial -> back to the old rate after the trial time
+  server.baudTrial = 1500;
+  lisa.send("BAUD 38400");
+  await lisa.line();
+  await new Promise(r => setTimeout(r, 2500));
+  lisa.send("HELLO");
+  const hi3 = await lisa.line();
+  check(hi3.startsWith("Hi from") && sp.baud === 57600, "BAUD, then no client at the new rate -> back after the trial");
+  server.baudTrial = 10000;
+
+  // a garbled line at a changed rate (after the trial) -> back to the start rate
+  lisa.send("BAUD 4800");
+  await lisa.line();
+  link.clientBaud = 4800;
+  await new Promise(r => setTimeout(r, 300));
+  await lisa.sync();
+  link.clientBaud = 57600;                    // e.g. the Lisa client was restarted
+  lisa.send("HELLO");                         // garbled at 4800
+  await new Promise(r => setTimeout(r, 300));
+  lisa.send("HELLO");
+  check((await lisa.line()).startsWith("Hi from") && sp.baud === 57600,
+    "a garbled line at a changed rate -> back to the startup rate");
+
+  // QUIT at a changed rate -> the next client is served at the startup rate
+  lisa.send("BAUD 2400");
+  await lisa.line();
+  link.clientBaud = 2400;
+  await new Promise(r => setTimeout(r, 300));
+  await lisa.sync();
+  lisa.send("QUIT");
+  await new Promise(r => setTimeout(r, 300));
+  link.clientBaud = 57600;
+  lisa.send("HELLO");
+  check((await lisa.line()).startsWith("Hi from") && sp.baud === 57600, "QUIT at 2400 -> the next client at 57600");
+}
 
 // CAL: the reply comes CAL_MS (2 s) later
 {

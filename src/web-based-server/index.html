@@ -61,9 +61,8 @@
   <h1>Lisa Serial FTP Server</h1>
   <p class="sub">A prototype of the server in your browser. It serves LisaSerialFtpClient's
     <code>list</code>, <code>get</code> (also <code>-b</code>, <code>-t</code> and <code>-c</code>) and
-    <code>hello</code>, <code>bench</code> and <code>timeout-factor auto</code>, and <code>put</code> and
-    <code>delete</code> for a folder on this computer. Only <code>baud</code> is answered
-    <code>ERR 99</code> for now: set the rate here instead.</p>
+    <code>hello</code>, <code>baud</code>, <code>bench</code> and <code>timeout-factor auto</code>, and
+    <code>put</code> and <code>delete</code> for a folder on this computer.</p>
 
   <div class="panel" id="unsupported">
     <b>This browser cannot open serial ports.</b> Use Chrome or Microsoft Edge on a
@@ -107,7 +106,8 @@
       <label><input type="checkbox" id="debug"> Debug output</label>
     </div>
     <p class="hint" style="margin-left:0">8 data bits, no parity, 1 stop bit, no flow control,
-      as the Lisa client uses. Set the same rate on the Lisa.</p>
+      as the Lisa client uses. Start at the rate the Lisa client is at; its <code>baud</code>
+      command then changes both, and <code>quit</code> comes back to this one.</p>
     <div class="row">
       <button id="start" type="button">Choose port and start</button>
       <button id="stop" class="secondary" type="button" disabled>Stop</button>

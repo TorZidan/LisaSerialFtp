@@ -3,8 +3,9 @@
 // A JavaScript port of the parts of src/server/LisaSerialFtpServer.py that
 // the prototype needs: HELLO, DEBUG (the client sends it right after
 // HELLO), QUIT, GET (binary and text), SUM (get -c), LIST (list), PUT,
-// DELETE, CAL (timeout-factor auto) and the bench's MARK / ECHO / FRAMES.
-// Every other command (BAUD) is answered "ERR 99 unknown command".
+// DELETE, BAUD, CAL (timeout-factor auto) and the bench's MARK / ECHO /
+// FRAMES: all the commands the client sends.  Anything else is answered
+// "ERR 99 unknown command".
 // Names, constants and behaviour follow the Python server, so its
 // docstrings (and TECHNICAL.md) explain this code too; keep the two in
 // step.
@@ -15,7 +16,8 @@
 //
 //   port:   { baud, read(n, timeoutMs) -> Promise<Uint8Array>  (rejects
 //             with TimeoutError if fewer than n bytes came),
-//             write(bytes) -> Promise, flushInput() }
+//             write(bytes) -> Promise, flushInput(),
+//             setBaud(rate) -> Promise  (BAUD: switch the open port) }
 //   source: { label, readFile(name) -> Promise<Uint8Array>,
 //             list(dir) -> Promise<[{ name, size, isDir }]>  (dir '' is
 //             the top),
@@ -46,6 +48,17 @@ export const T_COMMAND = 15000;     // the Python server's --timeout default
 export const T_BLOCK = 1000;        // mid-chunk bytes (receiver)
 export const T_QUIET = 300;         // discard-until-quiet (receiver)
 export const CAL_MS = 2000;         // CAL reply delay (CALSECS in the client)
+export const BAUD_TRIAL = 10000;    // BAUD: the client has this long to send a
+                                    // command at the new rate
+
+// The rates the Lisa can use too (57600 is the most its driver can set).
+export const BAUDS = [300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600];
+
+// every line a client sends: a command, or a protocol reply.  Any other
+// line is garbled, or sent at another rate (see BAUD).
+const KNOWN = new Set(["HELLO", "LIST", "GET", "PUT", "SUM", "DELETE", "BAUD",
+  "DEBUG", "CAL", "QUIT", "MARK", "ECHO", "FRAMES",
+  "NEXT", "DONE", "OK", "BAD", "FAIL", "GO", "A", "N"]);
 
 export class TimeoutError extends Error {
   constructor(msg = "timeout") { super(msg); this.name = "TimeoutError"; }
@@ -230,6 +243,11 @@ export class LisaFtpServer {
     this.markAt = null;        // MARK: time of the previous MARK
     this.timing = {};          // per-chunk timing: key -> [n, total, min, max] ms
     this.tReply = null;        // sendChunk: when the last ACK came
+    this.startBaud = port.baud; // QUIT, and a garbled line, go back to it
+    this.confirmUntil = null;  // BAUD: until when the new rate is on trial
+    this.baudOld = null;       // BAUD: the rate to go back to if it fails
+    this.onBaud = null;        // called with the new rate after a switch
+    this.baudTrial = BAUD_TRIAL;
     this.page = 0;             // LIST: bytes sent since the last MORE
     this.doneLine = null;      // sendChunk: a DONE taken as the last ACK
     this.clientFailed = false; // sendChunk: the client sent FAIL
@@ -389,12 +407,54 @@ export class LisaFtpServer {
     return false;
   }
 
+  // BAUD <rate>: answer 'OK <rate>' at the old rate, let it leave, and
+  // switch.  The new rate is then on trial: the client's next command (its
+  // HELLO) must arrive at it, as a valid line, within BAUD_TRIAL; silence,
+  // or a garbled line (what bytes sent at another rate look like), switches
+  // back to the old rate (run).  Web Serial cannot change the rate of an
+  // open port, so the switch closes and reopens it (port.setBaud).
+  async cmdBaud(args) {
+    if (args.length !== 1 || !/^\d+$/.test(args[0])) throw new ProtocolError(1, "usage: BAUD rate");
+    const nb = Number(args[0]);
+    if (!BAUDS.includes(nb))
+      throw new ProtocolError(21, `unsupported baud rate ${nb} (${BAUDS.join(" ")})`);
+    const old = this.port.baud;
+    await this.sendLine("OK " + nb);
+    // the reply must be out of the adapter too before the switch: write()
+    // has handed it to the port; then about its own length again at the
+    // old rate for the adapter's FIFO, as the Python server waits
+    await sleep(100 + 12 * 10000 / old);
+    if (nb === old) {
+      this.log.say(`  ok: the baud rate stays ${nb}`);
+      return;
+    }
+    await this.setBaud(nb);
+    this.baudOld = old;
+    this.confirmUntil = performance.now() + this.baudTrial;
+    this.log.say(`  ok: now at ${nb} baud (was ${old}); waiting for the client at it`);
+  }
+
+  async setBaud(rate) {
+    await this.port.setBaud(rate);
+    if (this.onBaud) this.onBaud(rate);
+  }
+
+  // Back to the rate `to` (a failed BAUD, a garbled line, QUIT).
+  async revertBaud(to, why) {
+    this.confirmUntil = null;
+    if (this.port.baud !== to) {
+      const was = this.port.baud;
+      await this.setBaud(to);
+      this.log.say(`  baud: back to ${to} (from ${was}): ${why}`);
+    }
+  }
+
   // CAL: answer exactly CAL_MS of real time after the request came.  The
   // Lisa counts its 1-second input timeouts meanwhile: in LisaEm at a high
   // throttle that is how the client learns how much faster emulated time
   // runs (timeout-factor auto).  A real Lisa counts ~2.
   async cmdCal() {
-    await new Promise(r => setTimeout(r, CAL_MS));
+    await sleep(CAL_MS);
     await this.sendLine(`CAL ${CAL_MS}`);
     this.log.say(`  ok: answered after ${CAL_MS / 1000} s`);
   }
@@ -848,10 +908,11 @@ export class LisaFtpServer {
   async handleLine(line) {
     const parts = line.split(/\s+/).filter(Boolean);
     const cmd = parts.length ? parts[0].toUpperCase() : "";
-    // (The Python server uses KNOWN to spot a line sent at another baud
-    // rate, after BAUD; there is no BAUD here yet, so an unknown line is
-    // just answered ERR 99, as there.)
-    if (cmd === "NEXT") return;                  // a late NEXT: nothing to answer
+    if (cmd === "NEXT") {
+      // a late NEXT for a listing that is over (its MORE was resent)
+      this.dlog("late NEXT ignored");
+      return;
+    }                  // a late NEXT: nothing to answer
     // bench marks: cmdMark reports them, and their 'bench: ...' lines
     // belong together (no '> MARK', no empty line between them)
     if (cmd !== "MARK") this.log.say("> " + line);
@@ -868,12 +929,13 @@ export class LisaFtpServer {
       MARK: a => this.cmdMark(a),
       ECHO: a => this.cmdEcho(a),
       FRAMES: a => this.cmdFrames(a),
+      BAUD: a => this.cmdBaud(a),
     }[cmd];
     try {
       if (serve) await serve(parts.slice(1));
       else {
         await this.sendLine("ERR 99 unknown command");
-        this.log.say("  error: unknown command (not in this prototype yet)");
+        this.log.say("  error: unknown command");
       }
     } catch (e) {
       if (e instanceof ProtocolError) {
@@ -891,19 +953,65 @@ export class LisaFtpServer {
     }
   }
 
+  // The next command line, or null.  As handle_client() in the Python
+  // server, it also runs the BAUD trial: a new rate on trial needs bytes at
+  // least every second and a whole valid line before the deadline, else it
+  // goes back; at a changed rate, a garbled line goes back to the starting
+  // rate, where the client may be.
+  async nextLine() {
+    let line = this.pending;           // a command that ended a listing early
+    this.pending = null;
+    if (line === null && this.confirmUntil !== null) {
+      const left = this.confirmUntil - performance.now();
+      line = await this.readLine(Math.max(50, Math.min(1000, left)), true);
+      if (line === null && performance.now() < this.confirmUntil) return null;
+      if (!line) {
+        await this.revertBaud(this.baudOld, line === null
+          ? `no client at ${this.port.baud} baud`
+          : "a garbled line: the client is at another rate");
+        return null;
+      }
+    } else if (line === null) {
+      line = await this.readLine(LINE_GAP, true);
+    }
+    if (line === null || line === "") {
+      if (line === "" && this.port.baud !== this.startBaud)
+        await this.revertBaud(this.startBaud, "a garbled line");
+      return null;                     // idle, or a partial line
+    }
+    const parts = line.split(/\s+/).filter(Boolean);
+    const cmd = parts.length ? parts[0].toUpperCase() : "";
+    if (!KNOWN.has(cmd) || /[\x00-\x1f\x7f]/.test(line)) {
+      // bytes sent at another rate: back to the old rate (on trial) or to
+      // the startup rate; at the startup rate, it is answered ERR 99
+      if (this.confirmUntil !== null) {
+        await this.revertBaud(this.baudOld, "a garbled line: the client is at another rate");
+        return null;
+      }
+      if (this.port.baud !== this.startBaud) {
+        await this.revertBaud(this.startBaud, "a garbled line");
+        return null;
+      }
+    } else if (this.confirmUntil !== null) {
+      this.confirmUntil = null;
+      this.log.say(`  baud: the client is there at ${this.port.baud} baud`);
+    }
+    return line;
+  }
+
   // Serve until stop() is called or the port fails.
   async run() {
-    this.log.say(`${PROTOCOL} listening, home_dir=${this.source.label}`);
+    this.log.say(`${PROTOCOL} listening at ${this.port.baud} baud, home_dir=${this.source.label}`);
     await this.sendBanner();
     while (!this.stopped) {
-      let line = this.pending;       // a command that ended a listing early
-      this.pending = null;
-      if (line === null) line = await this.readLine(LINE_GAP, true);
-      if (line === null || line === "") continue;   // idle, or a partial line
+      const line = await this.nextLine();
+      if (line === null) continue;
       try {
         await this.handleLine(line);
       } catch (e) {
         if (!(e instanceof ClientQuit)) throw e;
+        // the next client starts at the startup rate
+        await this.revertBaud(this.startBaud, "the client quit");
         this.log.say("waiting for a new client");
       }
     }
@@ -913,6 +1021,8 @@ export class LisaFtpServer {
 }
 
 const CRLF = Uint8Array.of(13, 10);
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function concatBytes(a, b) {
   const out = new Uint8Array(a.length + b.length);

@@ -39,9 +39,14 @@ It talks to the unchanged Lisa client ([`LisaSerialFtpClient.text`](../client/Li
 | `CAL` | yes (for `timeout-factor auto`): answered 2 s after it came |
 | `MARK` / `ECHO` / `FRAMES` | yes (for `bench`): the ms between marks, lines `A 12345`, made-up chunks |
 | `QUIT` | yes |
-| `BAUD` | not yet: `ERR 99 unknown command`. Set the rate on the page to the Lisa's |
+| `BAUD <rate>` | yes: `OK <rate>` at the old rate, then the switch. The new rate is on trial: if no valid command comes at it within 10 s, or a garbled line comes, the page goes back to the old rate, as the Python server does. A garbled line at a changed rate, and `QUIT`, go back to the rate the page was started at |
 
-So every client command works except `baud`.
+So every command of the client works. Anything else gets `ERR 99 unknown command`, as from the Python
+server.
+
+Web Serial cannot change the rate of an open port, so for `BAUD` the page closes the port and opens it
+again at the new rate. The page's baud rate field follows: start the page at the
+rate the Lisa client is at, and let the client's `baud` command change both.
 
 After a `get` (and the bench's `FRAMES`) the log shows where the time of a chunk went, like the Python
 server: the frame being handed to the port, the Lisa until its ACK, and this page. One difference: the
@@ -83,10 +88,11 @@ pseudo-terminal that LisaEm uses. To test with LisaEm, use the Python server.
 |---|---|
 | [`index.html`](index.html) | the page |
 | [`app.js`](app.js) | the page's code: connects the controls and the log to the server |
-| [`protocol.js`](protocol.js) | the protocol: a port of the Python server's command code (all but BAUD). No browser APIs, so it runs in Node too |
+| [`protocol.js`](protocol.js) | the protocol: a port of the Python server's command code. No browser APIs, so it runs in Node too |
 | [`serial.js`](serial.js) | the Web Serial port, with the `read(n, timeout)` the protocol code expects |
 | [`sources.js`](sources.js) | where the files come from: a local folder (also written to, for `put` / `delete`), or a base URL (and how each is listed) |
 | [`tests/test_protocol.mjs`](tests/test_protocol.mjs) | tests in Node, with a fake Lisa client: `node src/web-based-server/tests/test_protocol.mjs` |
+| [`tests/test_serial.mjs`](tests/test_serial.mjs) | tests of `serial.js` with a mock Web Serial port (reading, and the close-and-reopen of `BAUD`): `node src/web-based-server/tests/test_serial.mjs` |
 
 `protocol.js` follows the Python server's names and rules (`send_chunk`, `cmd_get`, `lisa_pages`, ...), so
 the Python docstrings and [TECHNICAL.md](../../TECHNICAL.md) describe it too. The test checks its text pages

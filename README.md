@@ -76,7 +76,19 @@ program name `LisaSerialFtpClient` (there is no need to type the file
 extension), enter. The program will start, it will attempt to connect to the
 server, and will give you a `>` command prompt. Type `hello` and `help` to see what's there.
 
-## Running the server on your PC
+## Running the web-based server (no install)
+
+Open **[https://torzidan.github.io/LisaSerialFtp/src/web-based-server/](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/)** in **Chrome or Edge** browser on your PC.
+
+Pick the files to serve: a folder on your PC (the Lisa can also put and delete
+files there), or files on the web (read only).
+Then click "Choose port and start", choose your USB serial adapter and click "Connect".
+Keep the tab visible while it serves: browsers slow down hidden tabs.
+It does not work with LisaEm, whose serial port is a PTY port that the browser cannot open.
+
+See [its README](src/web-based-server/README.md) for the details.
+
+## Running the python server on your PC
 
 Requirements: **Python 3.5 or newer**.  On Linux and macOS nothing else is
 needed: the server uses only Python's standard library.  On Windows it also
@@ -86,16 +98,6 @@ The server shares one folder with the Lisa, the "home folder" given with
 `--home_dir`: the Lisa can list, get, put and delete the files in it and in its
 subfolders, and nothing outside it.  **The folder must exist** (the server does
 not create it, so a mistyped path is an error rather than a new, empty share).
-
-### The web-based server (no install)
-
-Open **[https://torzidan.github.io/LisaSerialFtp/src/web-based-server/](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/)** in **Chrome or Edge** (other browsers have no Web Serial).
-Pick the files to serve: a folder on your PC (the Lisa can also put and delete
-files there), or files on the web, by default this repository on GitHub (read only).
-Then choose the baud rate, click "Choose port and start" and pick your USB serial adapter.
-Keep the tab visible while it serves: browsers slow down hidden tabs.
-It does not work with LisaEm, whose serial port is a pty the browser cannot open.
-See [its README](src/web-based-server/README.md) for the details.
 
 For the Python server, run these commands from the folder where you cloned this repository:
 

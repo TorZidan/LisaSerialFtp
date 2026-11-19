@@ -7,18 +7,24 @@ It talks to the same Lisa client ([`LisaSerialFtpClient.text`](../client/LisaSer
 
 ## Running it 
 
-Just open https://torzidan.github.io/LisaSerialFtp/src/web-based-server/ in Chrome or Edge browser
+Just open https://torzidan.github.io/LisaSerialFtp/src/web-based-server/ in **Chrome or Edge** browser
 on your PC.
 
 ## How to use it
 
-Choose the files to serve, then click the "Choose port and start" button, select your serial port
-from the list, and click "Connect".
+Make sure the Lisa and your PC are connected with a [serial cable](../../README.md#serial-wiring).
+
+Pick the files to serve: a folder on your PC (the Lisa can also put and delete
+files there), or files on the web (read only).
+Then click "Choose port and start", choose your USB serial adapter and click "Connect".
+Keep the tab visible while it serves: browsers slow down hidden tabs.
+It does not work with LisaEm, whose serial port is a PseudoTTY port that the browser cannot open.
+
 
 On the Lisa side, run the LisaSerialFtpClient.obj app, as described in the 
 [README](../../README.md#installing-and-running-the-client-app-in-lisa-workshop)
 
- It can ser serves files from one of two places:
+ It can serve files from one of two places:
 
 - **a folder on this computer**, picked with the File System Access API. With **Allow put and delete**
   ticked (the default), the browser asks for write access when you choose the folder, and the Lisa can

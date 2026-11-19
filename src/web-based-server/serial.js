@@ -5,7 +5,7 @@
 // PosixSerialPort.read() in the Python server.  WebSerialPort feeds one
 // from a Web Serial port (Chrome / Edge only, https only).
 
-import { TimeoutError } from "./protocol.js";
+import { TimeoutError, PortGone } from "./protocol.js";
 
 export class ByteQueue {
   constructor() {
@@ -120,7 +120,7 @@ export class WebSerialPort {
     try {
       await this.open();
     } catch (e) {
-      const err = new Error(`cannot open the serial port again at ${rate} baud: ${e.message}`);
+      const err = new PortGone(`cannot open the serial port again at ${rate} baud: ${e.message}`);
       this.queue.fail(err);
       if (this.onGone) this.onGone(err);
       throw err;
@@ -149,7 +149,7 @@ export class WebSerialPort {
       }
     } finally {
       if (this.reopening) return;      // setBaud opens it again
-      const err = new Error("the serial port is closed or was unplugged");
+      const err = new PortGone("the serial port is closed or was unplugged");
       this.queue.fail(err);
       if (!this.closing && this.onGone) this.onGone(err);
     }
@@ -157,7 +157,75 @@ export class WebSerialPort {
 
   read(n, timeoutMs) { return this.queue.read(n, timeoutMs); }
 
-  write(bytes) { return this.writer.write(bytes); }
+  async write(bytes) {
+    try {
+      await this.writer.write(bytes);
+    } catch (e) {
+      if (this.closing) throw e;
+      throw new PortGone(`cannot write to the serial port: ${e.message}`);
+    }
+  }
+
+  // The port went away (PortGone): wait for it to come back, checking once
+  // every poll ms, and open it again, at the rate it was at -- as
+  // wait_back() in the Python server.  A USB adapter plugged in again is a
+  // new SerialPort for the browser: it is the one among the ports this page
+  // may use (navigator.serial.getPorts()) with the same USB vendor and
+  // product id.  (Chrome keeps the permission for an adapter with a USB
+  // serial number; for one without, it may ask again: then Stop and
+  // Start.)  Throws if close() is called meanwhile (Stop).
+  async waitBack(poll = 1000) {
+    let info = {};
+    try { info = this.port.getInfo(); } catch {}
+    this.reopening = true;             // the read loop ends without failing the queue
+    try {
+      try { if (this.reader) await this.reader.cancel(); } catch {}
+      try { await this.loop; } catch {}
+      try { this.writer.releaseLock(); } catch {}
+      try { await this.port.close(); } catch {}
+    } finally {
+      this.reopening = false;
+    }
+    while (!this.closing) {
+      await new Promise(r => setTimeout(r, poll));
+      if (this.closing) break;
+      let ports = [];
+      try { ports = await navigator.serial.getPorts(); } catch {}
+      const same = p => {
+        if (p === this.port) return true;
+        if (info.usbVendorId === undefined) return false;
+        let i = {};
+        try { i = p.getInfo(); } catch {}
+        return i.usbVendorId === info.usbVendorId && i.usbProductId === info.usbProductId;
+      };
+      // the old port object first, then the others like it
+      const tries = ports.filter(same).sort((a, b) => (b === this.port) - (a === this.port));
+      for (const p of tries) {
+        if (p.connected === false) continue;
+        try {
+          this.queue.error = null;
+          this.queue.flush();
+          const old = this.port;
+          this.port = p;
+          try {
+            await this.open();
+          } catch (e) {
+            this.port = old;
+            throw e;
+          }
+          if (this.closing) {          // Stop while it was opening
+            try { this.writer.releaseLock(); } catch {}
+            try { await this.port.close(); } catch {}
+            break;
+          }
+          return;
+        } catch {
+          // not there yet, or in use by another program
+        }
+      }
+    }
+    throw new Error("stopped");
+  }
 
   flushInput() { this.queue.flush(); }
 

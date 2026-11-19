@@ -79,8 +79,27 @@ $("pickFolder").addEventListener("click", async () => {
     document.querySelector('input[name=src][value=folder]').checked = true;
   } catch (e) {
     if (e.name !== "AbortError") log.say("cannot open the folder: " + e.message);
+    return;
   }
+  await sourceChanged();
 });
+
+// Uploads allowed after the folder was chosen read only: ask for write
+// access now (the browser asks only during a click, as this one).
+$("allowWrite").addEventListener("change", async () => {
+  if ($("allowWrite").checked && folderHandle) {
+    try {
+      if ((await folderHandle.queryPermission({ mode: "readwrite" })) !== "granted")
+        await folderHandle.requestPermission({ mode: "readwrite" });
+    } catch (e) {
+      log.say("cannot get write access to the folder: " + e.message);
+    }
+  }
+  await sourceChanged();
+});
+for (const r of document.querySelectorAll("input[name=src]"))
+  r.addEventListener("change", sourceChanged);
+$("baseUrl").addEventListener("change", sourceChanged);   // Enter, or leaving the field
 
 async function makeSource() {
   const kind = document.querySelector("input[name=src]:checked").value;
@@ -98,6 +117,45 @@ async function makeSource() {
   const url = $("baseUrl").value.trim();
   if (!/^https:\/\//i.test(url)) throw new Error("the address must start with https://");
   return new WebSource(url);
+}
+
+function showRunning(rate) {
+  setStatus(`running at ${rate} baud${server.source.writable ? "" : ", read only"}`, "ok");
+}
+
+// A change in "1. Files to serve" while the server runs: serve the new
+// files from the Lisa's next command on.  A transfer under way finishes
+// with the old ones (it has its file open already).
+async function sourceChanged() {
+  if (!server) return;               // not running: Start reads the fields
+  let source;
+  try {
+    source = await makeSource();
+  } catch (e) {
+    log.say(`${e.message}: still serving ${server.source.label}`);
+    return;
+  }
+  if (!server) return;               // stopped meanwhile
+  server.source = source;
+  log.say(`now serving ${source.label}${source.writable ? "" : " (read only)"}`
+    + "; the Lisa sees it from its next command on");
+  showRunning(port.baud);
+}
+
+// The browser does not give a page the port's name (/dev/ttyUSB0, COM3):
+// only the USB adapter's vendor and product ids, e.g. "USB 0403:6001 (FTDI)",
+// which lsusb (Linux) and the Device Manager (Windows) show too.
+const USB_VENDORS = { 0x0403: "FTDI", 0x067b: "Prolific", 0x10c4: "Silicon Labs",
+  0x1a86: "WCH (CH340)", 0x2341: "Arduino", 0x0557: "ATEN" };
+
+function portName(sp) {
+  let info = {};
+  try { info = sp.getInfo(); } catch {}
+  if (info.usbVendorId === undefined) return "the serial port";
+  const hex = n => n.toString(16).padStart(4, "0");
+  const maker = USB_VENDORS[info.usbVendorId];
+  return `the serial port USB ${hex(info.usbVendorId)}:${hex(info.usbProductId ?? 0)}`
+    + (maker ? ` (${maker})` : "");
 }
 
 $("start").addEventListener("click", async () => {
@@ -120,23 +178,30 @@ $("start").addEventListener("click", async () => {
   try {
     await port.open();
   } catch (e) {
-    log.say("cannot open the serial port: " + e.message
-      + " (is another program, e.g. LisaSerialFtpServer.py, using it?)");
+    // Chrome gives no reason ("Failed to open serial port."): the usual
+    // one is that something else has the port open
+    log.say(`cannot open ${portName(sp)}. Is it in use by another browser tab`
+      + " running this page, or by LisaSerialFtpServer.py, or another program?"
+      + " Stop that and click Start again. (The browser said: " + e.message + ")");
     port = null;
     return;
   }
   server = new LisaFtpServer(port, source, log);
   server.debugDefault = server.debugOn = $("debug").checked;
-  const ro = source.writable ? "" : ", read only";
   // BAUD from the Lisa (and the switch back after a failed one, or QUIT):
   // show the rate the port is at now
   server.onBaud = rate => {
     $("baud").value = String(rate);
-    setStatus(`running at ${rate} baud${ro}`, "ok");
+    showRunning(rate);
+  };
+  // the adapter unplugged, and plugged in again
+  server.onPort = back => {
+    if (back) showRunning(port.baud);
+    else setStatus("the serial port is gone: plug the adapter in again", "bad");
   };
   $("start").disabled = true;
   $("stop").disabled = false;
-  setStatus(`running at ${port.baud} baud${ro}`, "ok");
+  showRunning(port.baud);
   $("baud").disabled = true;        // the Lisa's 'baud' command changes it now
   try {
     await server.run();

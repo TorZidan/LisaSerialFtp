@@ -8,6 +8,7 @@ retried; the whole file size, CRC16 checksum and byte sum is verified at the
 end, and the file is accepted only then.
 
 The server: a non-interactive Python-based [**LisaSerialFtpServer.py**](./src/server/LisaSerialFtpServer.py) program that runs on your modern computer and listens for commands.
+Or, with nothing to install: the [**web-based server**](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/), a web page that does the same in Chrome or Edge (see [below](#the-web-based-server-no-install)).
 
 The tool is useful for developing applications for the Apple Lisa (both Lisa Office system and Workshop apps). Here is a typical development setup:
 * Write source code (in Pascal, Assembler, Basic, etc) on your PC using your favorite editor.
@@ -86,7 +87,17 @@ The server shares one folder with the Lisa, the "home folder" given with
 subfolders, and nothing outside it.  **The folder must exist** (the server does
 not create it, so a mistyped path is an error rather than a new, empty share).
 
-Run these commands from the folder where you cloned this repository:
+### The web-based server (no install)
+
+Open **[https://torzidan.github.io/LisaSerialFtp/src/web-based-server/](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/)** in **Chrome or Edge** (other browsers have no Web Serial).
+Pick the files to serve: a folder on your PC (the Lisa can also put and delete
+files there), or files on the web, by default this repository on GitHub (read only).
+Then choose the baud rate, click "Choose port and start" and pick your USB serial adapter.
+Keep the tab visible while it serves: browsers slow down hidden tabs.
+It does not work with LisaEm, whose serial port is a pty the browser cannot open.
+See [its README](src/web-based-server/README.md) for the details.
+
+For the Python server, run these commands from the folder where you cloned this repository:
 
 ### On Linux
 
@@ -328,6 +339,7 @@ At the end, upon success, it will just exit to the Workshop main menu.
 | file | runs on | role |
 |---|---|---|
 | [`src/server/LisaSerialFtpServer.py`](src/server/LisaSerialFtpServer.py) | Linux, macOS, Windows | serial **server**; shares a directory |
+| [`src/web-based-server/`](src/web-based-server) | Chrome / Edge ([live page](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/)) | the same **server** as a web page (Web Serial); shares a folder or files on the web |
 | [`src/client/LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) | the Lisa (Lisa Pascal) | console **client**; talks to the built-in RS-232 driver |
 | [`src/client/LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text) | the Lisa (Lisa Pascal) | part of the client (`!list`, `!delete`), included with `{$I ...}`; keep it on the same volume |
 | [`src/client/LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text) | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy and the text decoder, 10-15 times faster than Pascal |

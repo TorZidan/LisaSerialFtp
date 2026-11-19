@@ -1,6 +1,6 @@
-# Lisa Serial FTP Server in a web page (prototype)
+# Lisa Serial FTP Server in a web page
 
-A prototype of [`LisaSerialFtpServer.py`](../server/LisaSerialFtpServer.py) that runs in the browser, with nothing to install.
+The [`LisaSerialFtpServer.py`](../server/LisaSerialFtpServer.py) server as a web page: it runs in the browser, with nothing to install.
 It talks to the unchanged Lisa client ([`LisaSerialFtpClient.text`](../client/LisaSerialFtpClient.text)) through the
 **Web Serial API**, and serves files from one of two places:
 
@@ -25,7 +25,12 @@ It talks to the unchanged Lisa client ([`LisaSerialFtpClient.text`](../client/Li
 
   Files on the web are read only: `put` and `delete` get `ERR 20 server is read-only`.
 
-## What works so far
+You can change the files to serve while the server runs: pick another folder, switch between
+the folder and the web, edit the address (press Enter), or tick or untick uploads. The log says
+"now serving ...", and the Lisa gets the new files from its next command on. A transfer that has
+already started finishes with the old files.
+
+## Commands
 
 | Command | State |
 |---|---|
@@ -75,6 +80,13 @@ Lisa), and click **Choose port and start**. The browser asks which serial port t
 `LisaSerialFtpServer.py` first if it is running: only one program can have the port open.
 
 On GitHub Pages the folder works as it is (it is all static files).
+
+If the USB serial adapter is unplugged, the server says so in the log and waits. When you plug
+it in again it reopens the port at the same baud rate, with no need to click Start, as the Python
+server does. A transfer under way when the adapter was pulled fails; the Lisa can retry it. Chrome
+finds the adapter again by its USB vendor and product id. For an adapter without a USB serial
+number, Chrome may not let the page use it again without asking; if it is not found, click
+**Stop**, then **Choose port and start**.
 
 Keep the tab visible during a transfer: browsers slow down timers in hidden tabs, which can break the
 protocol's timeouts.

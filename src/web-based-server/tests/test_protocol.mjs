@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
-  LisaFtpServer, ProtocolError, crc16, lisaPages, toWire, fromWire, nameToWire,
+  LisaFtpServer, ProtocolError, PortGone, crc16, lisaPages, toWire, fromWire, nameToWire,
   CHUNK, LIST_PAGE,
 } from "../protocol.js";
 import { ByteQueue } from "../serial.js";
@@ -612,6 +612,52 @@ check((await lisa.line()).startsWith("ERR 1 usage"), "DELETE without a name -> E
   srv.stop();
   ro.toServer.fail(new Error("stopped"));
   await run2;
+}
+
+// the serial port goes away (unplugged) and comes back: the server waits
+// for it, sends its banner again, and serves on
+{
+  const un = makeLink();
+  let comeBack = null;                   // waitBack() returns when this is called
+  let waits = 0;
+  un.serverPort.waitBack = () => new Promise(r => {
+    waits++;
+    comeBack = () => { un.toServer.error = null; un.toServer.flush(); r(); };
+  });
+  const states = [];
+  const srv = new LisaFtpServer(un.serverPort, memorySource({ "big.bin": new Uint8Array(5000) }), quietLog);
+  srv.onPort = back => states.push(back);
+  const run3 = srv.run().catch(e => { if (!srv.stopped) throw e; });
+  const lisa3 = new FakeLisa(un);
+  await lisa3.line();                    // the banner
+  // unplugged while idle
+  un.toServer.fail(new PortGone("the serial port is closed or was unplugged"));
+  await new Promise(r => setTimeout(r, 30));
+  const waited = waits === 1 && states.join() === "false";
+  comeBack();
+  const b1 = await lisa3.line();
+  lisa3.send("HELLO");
+  const b2 = await lisa3.line();
+  check(waited && b1.startsWith("Hi from") && b2.startsWith("Hi from") && states.join() === "false,true",
+    "unplugged while idle: waits for the port, then the banner again and HELLO is served");
+  // unplugged in the middle of a GET
+  lisa3.send("GET big.bin B");
+  await lisa3.line();                    // the size line
+  await new Promise(r => setTimeout(r, 30));
+  un.toServer.fail(new PortGone("the serial port is closed or was unplugged"));
+  await new Promise(r => setTimeout(r, 30));
+  const waited2 = waits === 2;
+  comeBack();
+  un.toClient.flush();
+  await new Promise(r => setTimeout(r, 30));
+  un.toClient.flush();                   // what was left of the GET
+  lisa3.send("HELLO");
+  let b3 = await lisa3.line();
+  while (!b3.startsWith("Hi from")) b3 = await lisa3.line();
+  check(waited2 && !srv.stopped, "unplugged during a GET: the server waits for the port and serves on");
+  srv.stop();
+  un.toServer.fail(new Error("stopped"));
+  await run3;
 }
 
 lisa.send("QUIT");

@@ -1,7 +1,6 @@
 // Lisa Serial FTP -- the protocol core of the web-based server.
 //
-// A JavaScript port of the parts of src/server/LisaSerialFtpServer.py that
-// the prototype needs: HELLO, DEBUG (the client sends it right after
+// A JavaScript port of src/server/LisaSerialFtpServer.py's commands: HELLO, DEBUG (the client sends it right after
 // HELLO), QUIT, GET (binary and text), SUM (get -c), LIST (list), PUT,
 // DELETE, BAUD, CAL (timeout-factor auto) and the bench's MARK / ECHO /
 // FRAMES: all the commands the client sends.  Anything else is answered
@@ -66,6 +65,12 @@ export class TimeoutError extends Error {
 
 export class ProtocolError extends Error {
   constructor(code, text) { super(text); this.code = code; this.text = text; }
+}
+
+// The serial port went away (a USB adapter unplugged): run() waits for it
+// to come back (port.waitBack()), as the Python server's wait_back().
+export class PortGone extends Error {
+  constructor(msg) { super(msg); this.name = "PortGone"; }
 }
 
 class PeerRestarted extends Error {}
@@ -246,7 +251,8 @@ export class LisaFtpServer {
     this.startBaud = port.baud; // QUIT, and a garbled line, go back to it
     this.confirmUntil = null;  // BAUD: until when the new rate is on trial
     this.baudOld = null;       // BAUD: the rate to go back to if it fails
-    this.onBaud = null;        // called with the new rate after a switch
+    this.onBaud = null;
+    this.onPort = null;        // onPort(false): the port went away; onPort(true): it is back        // called with the new rate after a switch
     this.baudTrial = BAUD_TRIAL;
     this.page = 0;             // LIST: bytes sent since the last MORE
     this.doneLine = null;      // sendChunk: a DONE taken as the last ACK
@@ -999,20 +1005,35 @@ export class LisaFtpServer {
     return line;
   }
 
-  // Serve until stop() is called or the port fails.
+  // Serve until stop() is called or the port fails for good.
   async run() {
     this.log.say(`${PROTOCOL} listening at ${this.port.baud} baud, home_dir=${this.source.label}`);
-    await this.sendBanner();
+    let banner = true;
     while (!this.stopped) {
-      const line = await this.nextLine();
-      if (line === null) continue;
       try {
+        if (banner) { banner = false; await this.sendBanner(); }
+        const line = await this.nextLine();
+        if (line === null) continue;
         await this.handleLine(line);
       } catch (e) {
-        if (!(e instanceof ClientQuit)) throw e;
-        // the next client starts at the startup rate
-        await this.revertBaud(this.startBaud, "the client quit");
-        this.log.say("waiting for a new client");
+        if (e instanceof ClientQuit) {
+          // the next client starts at the startup rate
+          await this.revertBaud(this.startBaud, "the client quit");
+          this.log.say("waiting for a new client");
+          continue;
+        }
+        if (!(e instanceof PortGone) || this.stopped) throw e;
+        // The port is gone (unplugged): say so once, then wait for it to
+        // come back, as the Python server does.  A BAUD trial is over.
+        this.log.say(`serial port: ${e.message}; waiting for it to come back`
+          + " (plug the adapter in again)");
+        if (this.onPort) this.onPort(false);
+        this.confirmUntil = null;
+        this.pending = null;
+        await this.port.waitBack();      // throws if stop() closes the port
+        this.log.say("serial port: it is back; waiting for a client");
+        if (this.onPort) this.onPort(true);
+        banner = true;
       }
     }
   }

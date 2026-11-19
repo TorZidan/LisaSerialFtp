@@ -1,8 +1,24 @@
 # Lisa Serial FTP Server in a web page
 
-The [`LisaSerialFtpServer.py`](../server/LisaSerialFtpServer.py) server as a web page: it runs in the browser, with nothing to install.
-It talks to the unchanged Lisa client ([`LisaSerialFtpClient.text`](../client/LisaSerialFtpClient.text)) through the
-**Web Serial API**, and serves files from one of two places:
+This is another implementation of the [`LisaSerialFtpServer.py`](../server/LisaSerialFtpServer.py) server, in as a web page: 
+it runs in the browser, with nothing to install.
+It talks to the same Lisa client ([`LisaSerialFtpClient.text`](../client/LisaSerialFtpClient.text)) through the
+[**Chrome browser Web Serial API**](https://developer.chrome.com/docs/capabilities/serial).
+
+## Running it 
+
+Just open https://torzidan.github.io/LisaSerialFtp/src/web-based-server/ in Chrome or Edge browser
+on your PC.
+
+## How to use it
+
+Choose the files to serve, then click the "Choose port and start" button, select your serial port
+from the list, and click "Connect".
+
+On the Lisa side, run the LisaSerialFtpClient.obj app, as described in the 
+[README](../../README.md#installing-and-running-the-client-app-in-lisa-workshop)
+
+ It can ser serves files from one of two places:
 
 - **a folder on this computer**, picked with the File System Access API. With **Allow put and delete**
   ticked (the default), the browser asks for write access when you choose the folder, and the Lisa can
@@ -30,45 +46,12 @@ the folder and the web, edit the address (press Enter), or tick or untick upload
 "now serving ...", and the Lisa gets the new files from its next command on. A transfer that has
 already started finishes with the old files.
 
-## Commands
+## Running it from a locally-hosted web page on your PC
 
-| Command | State |
-|---|---|
-| `HELLO` | the banner, as the Python server's (`home_dir=` shows the folder name or the base address) |
-| `DEBUG ON/OFF` | yes (the client sends it right after `HELLO`) |
-| `GET <name>` / `GET <name> T` | yes: binary and Lisa text pages, CRC check, NAK / resend, lost ACKs, `FAIL`, a restarted client |
-| `SUM <name> T\|B` | yes (for `get -c`): size, CRC and byte sum, of the file as Lisa text for `T` |
-| `LIST [dir]` | yes (for `list`): sorted, names encoded as the Python server does (`%20` for a space), in pages of at most 384 bytes with `MORE` / `NEXT`. Folders show size 0: browsers do not give a folder's size |
-| `PUT <name> <size>` | yes, into a folder (see below): CRC check, NAK, re-ACK of a resent chunk, a lost `DONE`, `FAIL`, a size mismatch, a restarted client |
-| `DELETE <name>` | yes, in a folder: one file, never a folder |
-| `CAL` | yes (for `timeout-factor auto`): answered 2 s after it came |
-| `MARK` / `ECHO` / `FRAMES` | yes (for `bench`): the ms between marks, lines `A 12345`, made-up chunks |
-| `QUIT` | yes |
-| `BAUD <rate>` | yes: `OK <rate>` at the old rate, then the switch. The new rate is on trial: if no valid command comes at it within 10 s, or a garbled line comes, the page goes back to the old rate, as the Python server does. A garbled line at a changed rate, and `QUIT`, go back to the rate the page was started at |
-
-So every command of the client works. Anything else gets `ERR 99 unknown command`, as from the Python
-server.
-
-Web Serial cannot change the rate of an open port, so for `BAUD` the page closes the port and opens it
-again at the new rate. The page's baud rate field follows: start the page at the
-rate the Lisa client is at, and let the client's `baud` command change both.
-
-After a `get` (and the bench's `FRAMES`) the log shows where the time of a chunk went, like the Python
-server: the frame being handed to the port, the Lisa until its ACK, and this page. One difference: the
-Python server waits until the frame has left the PC, and Web Serial cannot. So "the frame handed to the
-port" is shorter than the Python server's "the frame leaves the PC", and "the Lisa until its ACK" is
-longer by the same amount; their sum is comparable.
-
-An upload replaces a file only once it is verified, like the Python server's `<name>.part` file. Here the
-browser does it: `createWritable()` writes into a hidden swap file, `<name>.crswap` in Chrome, and only
-when the client's OK comes is the file replaced by it. Until then an older file of that name is
-untouched. A failed upload removes the swap file, and a new file it had created. A `.crswap` file
-can only be left behind if the browser itself stops in the middle of an upload.
-
-## Running it
+This is useful if you want to make code changes to it.
 
 It needs **Chrome or Microsoft Edge** on a computer, and the page must come from `https://` or from
-`http://localhost`. Browsers do not allow `file://` pages to load these scripts. To try it locally:
+`http://localhost`. Browsers do not allow `file://` pages to load these scripts. 
 
 ```
 cd src/web-based-server
@@ -98,8 +81,8 @@ pseudo-terminal that LisaEm uses. To test with LisaEm, use the Python server.
 
 | File | What it is |
 |---|---|
-| [`index.html`](index.html) | the page |
-| [`app.js`](app.js) | the page's code: connects the controls and the log to the server |
+| [`index.html`](index.html) | the web page |
+| [`app.js`](app.js) | the web page's code: connects the controls and the log to the server |
 | [`protocol.js`](protocol.js) | the protocol: a port of the Python server's command code. No browser APIs, so it runs in Node too |
 | [`serial.js`](serial.js) | the Web Serial port, with the `read(n, timeout)` the protocol code expects |
 | [`sources.js`](sources.js) | where the files come from: a local folder (also written to, for `put` / `delete`), or a base URL (and how each is listed) |

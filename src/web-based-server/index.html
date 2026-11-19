@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lisa Serial FTP Server (web)</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64;
+    --line: #d9d7cf; --accent: #2f5d8a; --ok: #2e7d32; --bad: #b3261e;
+    --log-bg: #1e1f1c; --log-ink: #e9e7df;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161614; --panel: #20201d; --ink: #ecebe4; --muted: #a09e95;
+      --line: #3a3934; --accent: #7fb0e0; --ok: #7cc47f; --bad: #f08a80;
+      --log-bg: #0f0f0e; --log-ink: #e9e7df;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 1rem; margin: 0 0 12px; }
+  label { display: block; margin: 6px 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  input[type=url] { width: 100%; padding: 6px 8px; font: inherit; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--ink); }
+  select { font: inherit; padding: 4px 6px; }
+  button {
+    font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--accent);
+    background: var(--accent); color: var(--panel); cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .hint { color: var(--muted); font-size: .9rem; margin: 4px 0 0 24px; }
+  #status { font-weight: 600; }
+  #status.ok { color: var(--ok); }
+  #status.bad { color: var(--bad); }
+  progress { width: 100%; height: 10px; margin-top: 8px; }
+  #log {
+    background: var(--log-bg); color: var(--log-ink); border-radius: 8px;
+    padding: 12px; height: 360px; overflow: auto; margin: 0;
+    font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #unsupported { display: none; border-color: var(--bad); }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .92em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Lisa Serial FTP Server</h1>
+  <p class="sub">A prototype of the server in your browser. It serves LisaSerialFtpClient's
+    <code>list</code>, <code>get</code> (also <code>-b</code>, <code>-t</code> and <code>-c</code>) and
+    <code>hello</code>; <code>put</code>, <code>delete</code>, <code>baud</code> and <code>bench</code>
+    are answered <code>ERR 99</code> for now.</p>
+
+  <div class="panel" id="unsupported">
+    <b>This browser cannot open serial ports.</b> Use Chrome or Microsoft Edge on a
+    computer, and open this page over https (or from <code>http://localhost</code>).
+  </div>
+
+  <div class="panel">
+    <h2>1. Files to serve</h2>
+    <label><input type="radio" name="src" value="web" checked>
+      Files on the web, under this address:</label>
+    <div class="hint">
+      <input type="url" id="baseUrl" value="https://raw.githubusercontent.com/TorZidan/LisaSerialFtp/main/">
+      The default is this project on GitHub: on the Lisa,
+      <code>get src/client/LisaSerialFtpClient.text</code>. The site must allow
+      browser downloads (CORS); <code>raw.githubusercontent.com</code> does.
+      Web sites cannot list a folder, so <code>list</code> uses the GitHub API for a
+      <code>raw.githubusercontent.com</code> address (60 listings an hour), and an
+      <code>index.json</code> file in the folder for any other address.
+    </div>
+    <label><input type="radio" name="src" value="folder">
+      A folder on this computer</label>
+    <div class="hint row">
+      <button class="secondary" id="pickFolder" type="button">Choose folder…</button>
+      <span id="folderName">none chosen</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>2. Serial port</h2>
+    <div class="row">
+      <label>Baud rate
+        <select id="baud">
+          <option>300</option><option>600</option><option>1200</option><option>2400</option>
+          <option>4800</option><option>9600</option><option>19200</option>
+          <option>38400</option><option selected>57600</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="debug"> Debug output</label>
+    </div>
+    <p class="hint" style="margin-left:0">8 data bits, no parity, 1 stop bit, no flow control,
+      as the Lisa client uses. Set the same rate on the Lisa.</p>
+    <div class="row">
+      <button id="start" type="button">Choose port and start</button>
+      <button id="stop" class="secondary" type="button" disabled>Stop</button>
+      <span id="status">stopped</span>
+    </div>
+    <progress id="progress" value="0" max="1" hidden></progress>
+  </div>
+
+  <pre id="log" aria-live="polite"></pre>
+  <p class="hint" style="margin-left:0">Keep this tab visible during a transfer: browsers slow
+    down timers in hidden tabs, which can break the protocol's timeouts.</p>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

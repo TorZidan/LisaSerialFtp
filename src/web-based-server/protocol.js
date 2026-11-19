@@ -1,0 +1,585 @@
+// Lisa Serial FTP -- the protocol core of the web-based server.
+//
+// A JavaScript port of the parts of src/server/LisaSerialFtpServer.py that
+// the prototype needs: HELLO, DEBUG (the client sends it right after
+// HELLO), QUIT, GET (binary and text), SUM (get -c) and LIST (ls).  Every
+// other command is answered "ERR 99 unknown command".  Names, constants and behaviour follow the
+// Python server, so its docstrings (and TECHNICAL.md) explain this code
+// too; keep the two in step.
+//
+// It knows nothing about the browser: the serial port and the file source
+// are passed in (see serial.js and sources.js), so the same code runs in
+// Node with a fake port (tests/test_protocol.mjs).
+//
+//   port:   { read(n, timeoutMs) -> Promise<Uint8Array>  (rejects with
+//             TimeoutError if fewer than n bytes came),
+//             write(bytes) -> Promise, flushInput() }
+//   source: { label, readFile(name) -> Promise<Uint8Array>,
+//             list(dir) -> Promise<[{ name, size, isDir }]>  (dir '' is
+//             the top; both throw ProtocolError for a bad or missing name) }
+//   log:    { say(text), debug(text), progress(ok, nbytes), progressStart(total) }
+
+export const VERSION = "v1.0";
+export const PROTOCOL = "LISA-SERIAL-FTP/" + VERSION;
+export const SEQ_MOD = 65536;
+export const MAX_LINE = 255;
+export const MAX_IN_LINE = 1024;
+export const CHUNK = 1016;
+export const MAX_FILE = 64 * 1024 * 1024;
+export const TEXT_PAGE = 1024;
+export const MAX_RETRIES = 10;
+export const LIST_PAGE = 384;   // LIST: bytes per page, MORE line included
+export const LIST_TRIES = 3;    // MORE is resent this often if no NEXT comes
+
+// timeouts, in milliseconds (the Python server's are in seconds)
+export const T_FRAME = 15000;
+export const T_REPLY = 10000;
+export const LINE_GAP = 5000;
+export const T_COMMAND = 15000;     // the Python server's --timeout default
+
+export class TimeoutError extends Error {
+  constructor(msg = "timeout") { super(msg); this.name = "TimeoutError"; }
+}
+
+export class ProtocolError extends Error {
+  constructor(code, text) { super(text); this.code = code; this.text = text; }
+}
+
+class PeerRestarted extends Error {}
+class ClientQuit extends Error {}
+
+// -------------------------------------------------------------------------
+// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), as crc16() in the server
+// -------------------------------------------------------------------------
+
+const CRC_TABLE = (() => {
+  const t = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let crc = i << 8;
+    for (let k = 0; k < 8; k++)
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+    t[i] = crc & 0xFFFF;
+  }
+  return t;
+})();
+
+export function crc16(data, crc = 0xFFFF) {
+  for (let i = 0; i < data.length; i++)
+    crc = ((crc << 8) & 0xFFFF) ^ CRC_TABLE[((crc >> 8) ^ data[i]) & 0xFF];
+  return crc;
+}
+
+// -------------------------------------------------------------------------
+// Lisa text files (GET T): lisa_text() and lisa_pages() of the server
+// -------------------------------------------------------------------------
+
+// The lines of a text file as the Lisa stores them: LF, CRLF and a lone CR
+// each end a line; a line is split after every 255 characters; a last line
+// without a line ending gets one.  Returns an array of Uint8Arrays.
+export function lisaLines(data) {
+  const lines = [];
+  let line = [];
+  let pendCR = false;
+  const end = () => { lines.push(Uint8Array.from(line)); line = []; };
+  for (const b of data) {
+    if (b === 10) { end(); pendCR = false; continue; }
+    if (pendCR) end();
+    if (b === 13) { pendCR = true; continue; }
+    pendCR = false;
+    if (line.length >= 255) end();
+    line.push(b);
+  }
+  if (pendCR || line.length) end();
+  return lines;
+}
+
+// lisa_text(): the bytes a text file comes back as after a round trip
+// through the Lisa (each of lisaLines ending in LF).  SUM T checks these.
+export function lisaText(data) {
+  const lines = lisaLines(data);
+  const out = new Uint8Array(lines.reduce((n, l) => n + l.length + 1, 0));
+  let k = 0;
+  for (const l of lines) { out.set(l, k); k += l.length; out[k++] = 10; }
+  return out;
+}
+
+// The text pages of the Lisa .TEXT file the client writes for data (without
+// the header page, which the client makes): each line ends in CR, 2..223
+// leading spaces become DLE + CHR(32 + n), a line that does not fit in the
+// page (1023 bytes) starts a new one, pages are padded with NULs to 1024.
+export function lisaPages(data) {
+  const out = [];
+  let page = [];
+  const flush = () => {
+    while (page.length < TEXT_PAGE) page.push(0);
+    out.push(...page);
+    page = [];
+  };
+  for (const line of lisaLines(data)) {
+    const n = line.length;
+    let sp = 0;
+    while (sp < n && line[sp] === 32) sp++;
+    sp = Math.min(sp, 223);
+    if (sp < 2) sp = 0;
+    const need = sp ? 2 + n - sp + 1 : n + 1;
+    if (page.length && page.length + need > TEXT_PAGE - 1) flush();
+    if (sp) page.push(16, 32 + sp);
+    for (let i = sp; i < n; i++) page.push(line[i]);
+    page.push(13);
+  }
+  if (page.length) flush();
+  return Uint8Array.from(out);
+}
+
+// -------------------------------------------------------------------------
+// Lines on the wire: Mac Roman, the Lisa's character set
+// -------------------------------------------------------------------------
+
+const MAC_DECODER = new TextDecoder("macintosh");
+const MAC_ENCODE = new Map();      // character -> Mac Roman byte (>= 0x80)
+{
+  const hi = new Uint8Array(128).map((_, i) => 0x80 + i);
+  [...MAC_DECODER.decode(hi)].forEach((c, i) => MAC_ENCODE.set(c, 0x80 + i));
+}
+
+export function fromWire(bytes) {
+  return MAC_DECODER.decode(bytes);
+}
+
+// a character the Lisa does not have becomes '?'
+export function toWire(text) {
+  const out = [];
+  for (const c of text) {
+    const code = c.codePointAt(0);
+    if (code < 0x80) out.push(code);
+    else out.push(MAC_ENCODE.get(c) ?? 0x3F);
+  }
+  return Uint8Array.from(out);
+}
+
+// name_to_wire(): a file name as the Lisa sees it (LIST): letters, digits
+// and ._-~ as they are; a character the Lisa has (Mac Roman 0x80..0xFF,
+// e.g. e-acute) as itself; everything else (spaces, other punctuation,
+// characters the Lisa lacks) percent-encoded as UTF-8 bytes, e.g. %20.
+// nameFromWire() reverses it, so any name LIST shows can be typed back.
+const SAFE_CHARS = /^[A-Za-z0-9._~-]$/;
+const UTF8 = new TextEncoder();
+
+export function nameToWire(name) {
+  let out = "";
+  for (const c of name) {
+    if (SAFE_CHARS.test(c) || (c >= "\x80" && c !== "\xa0" && MAC_ENCODE.has(c))) {
+      out += c;
+      continue;
+    }
+    for (const b of UTF8.encode(c))
+      out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+// name_from_wire(): %XX escapes are UTF-8 bytes.  (The Python server keeps
+// bytes that are not UTF-8 with surrogateescape; a browser cannot name
+// such files anyway, so here a bad escape is just a bad name.)
+export function nameFromWire(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    throw new ProtocolError(2, "bad name");
+  }
+}
+
+export function seqBehind(r, s) {
+  const d = ((s - r) % SEQ_MOD + SEQ_MOD) % SEQ_MOD;
+  return d >= 1 && d <= 32767;
+}
+
+export function parseReply(line) {
+  if (line) {
+    const p = line.split(/\s+/).filter(Boolean);
+    if (p.length === 2 && (p[0] === "A" || p[0] === "N") && /^\d+$/.test(p[1])
+        && Number(p[1]) < SEQ_MOD)
+      return [p[0], Number(p[1])];
+  }
+  return [null, null];
+}
+
+// -------------------------------------------------------------------------
+// The server
+// -------------------------------------------------------------------------
+
+export class LisaFtpServer {
+  constructor(port, source, log) {
+    this.port = port;
+    this.source = source;
+    this.log = log;
+    this.debugDefault = false; // debug output at startup; HELLO goes back to it
+    this.debugOn = false;
+    this.stopped = false;
+    this.pending = null;       // a line read while waiting for NEXT, for run()
+    this.page = 0;             // LIST: bytes sent since the last MORE
+    this.doneLine = null;      // sendChunk: a DONE taken as the last ACK
+    this.clientFailed = false; // sendChunk: the client sent FAIL
+    this.sendWhy = "";
+  }
+
+  dlog(text) { if (this.debugOn) this.log.debug(text); }
+
+  // -- lines ---------------------------------------------------------------
+
+  async sendLine(line) {
+    if (line.length > MAX_LINE) line = line.slice(0, MAX_LINE);
+    await this.port.write(concatBytes(toWire(line), CRLF));
+    this.dlog("sent: " + line);
+  }
+
+  // One CRLF-terminated line.  null: no byte within timeoutMs; "": a
+  // partial line was dropped, or the line was too long.
+  async readLine(timeoutMs, quiet = false) {
+    const buf = [];
+    for (;;) {
+      let b;
+      try {
+        b = (await this.port.read(1, timeoutMs))[0];
+      } catch (e) {
+        if (!(e instanceof TimeoutError)) throw e;
+        if (buf.length) { this.dlog("dropping partial line"); return ""; }
+        return null;
+      }
+      if (b === 10) {
+        if (buf.length && buf[buf.length - 1] === 13) buf.pop();
+        if (buf.length > MAX_IN_LINE) { this.dlog("line too long, dropped"); return ""; }
+        const line = fromWire(Uint8Array.from(buf));
+        if (!quiet) this.dlog("received: " + line);
+        return line;
+      }
+      buf.push(b);
+    }
+  }
+
+  async sendBanner() {
+    const head = `Hi from Lisa Serial FTP Server version ${PROTOCOL} : `;
+    const shown = [...this.source.label].map(c => (c >= " " && c <= "~") ? c : "?").join("");
+    let home = `home_dir=${shown} `;
+    const tail = `chunk_size=${CHUNK}`;
+    const room = MAX_LINE - head.length - tail.length;
+    if (home.length > room) home = home.slice(0, room);
+    await this.sendLine(head + home + tail);
+  }
+
+  async abort(text) {
+    this.log.say("  FAILED: " + text);
+    await this.sendLine("FAIL " + text);
+    for (;;) {
+      const line = await this.readLine(T_COMMAND);
+      if (line === null || line === "" || line === "OK") return;
+      if (line === "HELLO") { await this.peerRestarted(); return; }
+    }
+  }
+
+  async peerRestarted() {
+    this.log.say("  FAILED: the client restarted (HELLO) -- transfer abandoned");
+    this.debugOn = this.debugDefault;
+    this.port.flushInput();
+    await this.sendBanner();
+  }
+
+  // -- commands ------------------------------------------------------------
+
+  async cmdHello() {
+    this.debugOn = this.debugDefault;     // a new session
+    await this.sendBanner();
+    this.log.say("  ok: banner sent");
+  }
+
+  async cmdDebug(args) {
+    const a = (args[0] || "").toUpperCase();
+    if (a !== "ON" && a !== "OFF") throw new ProtocolError(1, "usage: DEBUG ON|OFF");
+    this.debugOn = a === "ON";
+    await this.sendLine("OK debug " + a.toLowerCase());
+    this.log.say("  ok: debug output " + a.toLowerCase());
+  }
+
+  async cmdQuit() {
+    this.log.say("  ok: the client quit");
+    throw new ClientQuit();
+  }
+
+  // SUM name T|B: size, CRC-16 and byte sum of a file, for get -c / put -c
+  // (T: of the file as Lisa text, see lisaText)
+  async cmdSum(args) {
+    if (args.length !== 2 || !["T", "B"].includes(args[1].toUpperCase()))
+      throw new ProtocolError(1, "usage: SUM name T|B");
+    const name = this.remoteName(args[0]);
+    let data = await this.source.readFile(name);
+    if (data.length > MAX_FILE) throw new ProtocolError(4, "file too big");
+    const text = args[1].toUpperCase() === "T";
+    if (text) data = lisaText(data);
+    const crc = crc16(data);
+    let bsum = 0;
+    for (const b of data) bsum = (bsum + b) & 0xFFFF;
+    await this.sendLine(`OK ${data.length} ${hex4(crc)} ${hex4(bsum)}`);
+    this.log.say(`  ok: ${name}${text ? " (as Lisa text)" : ""}: ${data.length} bytes,`
+      + ` crc ${hex4(crc)}, sum ${hex4(bsum)}`);
+  }
+
+  // LIST [dir]: 'OK', then 'D|F <size> <name>' per entry, sorted, then
+  // 'DONE'; in pages of at most LIST_PAGE bytes, each but the last ending
+  // with MORE (the client answers NEXT): the Lisa's serial input has no
+  // flow control and a 512-byte buffer (see LIST_PAGE in the Python server).
+  async cmdList(args) {
+    const dir = args.length ? this.remoteName(args[0]) : "";
+    const entries = await this.source.list(dir);
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    this.page = 0;
+    if (!(await this.listLine("OK"))) return;
+    for (const e of entries) {
+      if (!(await this.listLine(`${e.isDir ? "D" : "F"} ${e.size} ${nameToWire(e.name)}`)))
+        return;
+    }
+    if (!(await this.listLine("DONE"))) return;
+    const n = entries.length;
+    this.log.say(`  ok: ${n} ${n === 1 ? "entry" : "entries"} listed`);
+  }
+
+  // sendLine for LIST, in pages: if this line would make the page longer
+  // than LIST_PAGE bytes (with room for MORE), end the page with MORE and
+  // wait for NEXT.  FALSE if the client did not ask for more.
+  async listLine(line) {
+    const n = Math.min(line.length, MAX_LINE) + 2;
+    if (this.page && this.page + n + "MORE\r\n".length > LIST_PAGE) {
+      if (!(await this.more())) return false;
+      this.page = 0;
+    }
+    this.page += n;
+    await this.sendLine(line);
+    return true;
+  }
+
+  // MORE, then wait for NEXT; MORE is resent if no reply comes.  Any other
+  // line means the client gave up the listing (Apple-period, or it
+  // restarted): it is kept, and run() handles it as the next command.
+  async more() {
+    for (let i = 0; i < LIST_TRIES; i++) {
+      await this.sendLine("MORE");
+      const line = await this.readLine(T_COMMAND);
+      if (!line) {
+        this.dlog(`no NEXT within ${T_COMMAND / 1000} s, sending MORE again`);
+        continue;
+      }
+      if (line.toUpperCase() === "NEXT") return true;
+      this.log.say(`  FAILED: the client stopped the listing (${JSON.stringify(line)})`);
+      this.pending = line;
+      return false;
+    }
+    this.log.say("  FAILED: no NEXT from the client -- listing abandoned");
+    return false;
+  }
+
+  // a name from the wire, decoded and checked (the source checks '..')
+  remoteName(s) {
+    const name = nameFromWire(s.trim());
+    if (!name) throw new ProtocolError(1, "empty name");
+    return name;
+  }
+
+  async cmdGet(args) {
+    if (!args.length) throw new ProtocolError(1, "missing filename in GET command");
+    if (args.length > 2 || (args.length === 2 && args[1].toUpperCase() !== "T"))
+      throw new ProtocolError(1, "usage: GET name [T]");
+    const name = this.remoteName(args[0]);
+    let data = await this.source.readFile(name);
+    if (data.length > MAX_FILE) throw new ProtocolError(4, "file too big");
+    const text = args.length === 2;
+    if (text) data = lisaPages(data);
+    const size = data.length;
+    this.log.progressStart(size);
+    const t0 = performance.now();
+    await this.sendLine("OK " + size);
+
+    // the client's GO (or 'N 0': our OK's GO was lost; FAIL: it could not
+    // create its file) -- see cmd_get in the Python server
+    const go = await this.readLine(Math.max(T_COMMAND, T_FRAME + 5000), true);
+    if (go === "HELLO") { await this.peerRestarted(); return; }
+    if (go !== null && go.startsWith("FAIL")) {
+      this.log.say("  FAILED: the client could not start the get: " + go);
+      return;
+    }
+    if (go !== "GO" && go !== "N 0") {
+      await this.abort(`no GO from the client (got ${JSON.stringify(go)})`);
+      return;
+    }
+    this.dlog("received: " + go);
+
+    let line;
+    try {
+      for (let seq = 0, off = 0; ; seq++, off += CHUNK) {
+        const payload = data.subarray(off, Math.min(off + CHUNK, size));
+        if (!(await this.sendChunk(seq, payload))) {
+          if (!this.clientFailed) await this.abort(this.sendWhy);
+          return;
+        }
+        if (!payload.length) break;       // the end-of-file chunk went through
+      }
+      line = this.doneLine ?? await this.readLine(T_COMMAND);
+    } catch (e) {
+      if (e instanceof PeerRestarted) { await this.peerRestarted(); return; }
+      throw e;
+    }
+    if (line === "HELLO") { await this.peerRestarted(); return; }
+    if (line === null || !line.startsWith("DONE")) {
+      await this.abort("no DONE from client");
+      return;
+    }
+    const mycrc = hex4(crc16(data));
+    const p = line.split(/\s+/).filter(Boolean);
+    const good = p.length === 3 && /^\d+$/.test(p[1]) && Number(p[1]) === size
+      && p[2].toLowerCase() === mycrc;
+    await this.sendLine(`${good ? "OK" : "BAD"} ${size} ${mycrc}`);
+    if (good) {
+      const secs = (performance.now() - t0) / 1000;
+      const what = text ? ` (${size / TEXT_PAGE} Lisa text pages)` : "";
+      this.log.say(`  ok: sent ${size} bytes of ${name}${what}, verified (crc ${mycrc})`
+        + (secs > 0 ? `, ${Math.round(size / secs)} bytes/s` : ""));
+    } else {
+      this.log.say(`  FAILED: verify: the client got ${JSON.stringify(line)}, we sent ${size} ${mycrc}`);
+    }
+  }
+
+  // One framed chunk ('T', seq, length, data, CRC), then wait for A / N.
+  // TRUE when the client has it.  The same rules as send_chunk() in the
+  // Python server: stale replies are skipped, 'N <seq+1>' and (for the
+  // end-of-file chunk) DONE count as an ACK, anything else is a failed try.
+  async sendChunk(seq, payload) {
+    this.clientFailed = false;
+    this.doneLine = null;
+    this.sendWhy = `no ACK from the client after ${MAX_RETRIES} tries`;
+    const wireSeq = seq % SEQ_MOD;
+    const nextSeq = (seq + 1) % SEQ_MOD;
+    const frame = new Uint8Array(5 + payload.length + 2);
+    frame[0] = 0x54;                                   // 'T'
+    frame[1] = wireSeq >> 8; frame[2] = wireSeq & 0xFF;
+    frame[3] = payload.length >> 8; frame[4] = payload.length & 0xFF;
+    frame.set(payload, 5);
+    const crc = crc16(frame.subarray(1, 5 + payload.length));
+    frame[5 + payload.length] = crc >> 8;
+    frame[6 + payload.length] = crc & 0xFF;
+    const what = payload.length ? `chunk ${seq}: ${payload.length} bytes sent`
+      : `chunk ${seq}: end-of-file chunk sent`;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      await this.port.write(frame);
+      const tries = attempt > 1 ? ` (try ${attempt})` : "";
+      let line, kind, num, nstale = 0;
+      for (;;) {
+        line = await this.readLine(T_REPLY, true);
+        [kind, num] = parseReply(line);
+        if (kind === null || !seqBehind(num, wireSeq) || nstale >= 4) break;
+        nstale++;
+        this.dlog(`chunk ${seq}: stale reply ${JSON.stringify(line)} skipped`);
+      }
+      if (kind !== null && seqBehind(num, wireSeq)) kind = null;
+      if (kind === "A" && num === wireSeq) {
+        this.dlog(`${what}${tries} -> accepted (ACK)`);
+        this.log.progress(true, payload.length);
+        return true;
+      }
+      if (!payload.length && line && line.startsWith("DONE")) {
+        this.dlog(`${what}${tries} -> DONE instead of the ACK -> accepted`);
+        this.log.progress(true, 0);
+        this.doneLine = line;
+        return true;
+      }
+      if (line === "HELLO") throw new PeerRestarted();
+      if (line && line.startsWith("FAIL")) {
+        this.dlog(`${what}${tries} -> the client gave up: ${line}`);
+        await this.port.write(toWire("OK\r\n"));
+        this.log.say("  FAILED: the client aborted: " + line);
+        this.clientFailed = true;
+        return false;
+      }
+      const nak = kind === "N" ? num : null;
+      if (nak === nextSeq) {
+        this.dlog(`${what}${tries} -> NAK for the next chunk (its ACK was lost) -> accepted`);
+        this.log.progress(true, payload.length);
+        return true;
+      }
+      if (nak === wireSeq) this.dlog(`${what}${tries} -> rejected by the client (NAK), resending`);
+      else if (!line) this.dlog(`${what}${tries} -> no reply within ${T_REPLY / 1000} s, resending`);
+      else this.dlog(`${what}${tries} -> unexpected reply ${JSON.stringify(line)}, resending`);
+      this.log.progress(false, 0);
+    }
+    this.dlog(`chunk ${seq}: no ACK after ${MAX_RETRIES} tries`);
+    return false;
+  }
+
+  // -- main loop -----------------------------------------------------------
+
+  async handleLine(line) {
+    const parts = line.split(/\s+/).filter(Boolean);
+    const cmd = parts.length ? parts[0].toUpperCase() : "";
+    // (The Python server uses KNOWN to spot a line sent at another baud
+    // rate, after BAUD; there is no BAUD here yet, so an unknown line is
+    // just answered ERR 99, as there.)
+    if (cmd === "NEXT") return;                  // a late NEXT: nothing to answer
+    this.log.say("> " + line);
+    const serve = {
+      HELLO: () => this.cmdHello(),
+      DEBUG: a => this.cmdDebug(a),
+      QUIT: () => this.cmdQuit(),
+      GET: a => this.cmdGet(a),
+      SUM: a => this.cmdSum(a),
+      LIST: a => this.cmdList(a),
+    }[cmd];
+    try {
+      if (serve) await serve(parts.slice(1));
+      else {
+        await this.sendLine("ERR 99 unknown command");
+        this.log.say("  error: unknown command (not in this prototype yet)");
+      }
+    } catch (e) {
+      if (e instanceof ProtocolError) {
+        await this.sendLine(`ERR ${e.code} ${e.text}`);
+        this.log.say("  error: " + e.text);
+      } else if (e instanceof PeerRestarted) {
+        await this.peerRestarted();
+      } else if (e instanceof TimeoutError) {
+        await this.abort("timeout");
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  // Serve until stop() is called or the port fails.
+  async run() {
+    this.log.say(`${PROTOCOL} listening, home_dir=${this.source.label}`);
+    await this.sendBanner();
+    while (!this.stopped) {
+      let line = this.pending;       // a command that ended a listing early
+      this.pending = null;
+      if (line === null) line = await this.readLine(LINE_GAP, true);
+      if (line === null || line === "") continue;   // idle, or a partial line
+      try {
+        await this.handleLine(line);
+      } catch (e) {
+        if (!(e instanceof ClientQuit)) throw e;
+        this.log.say("waiting for a new client");
+      }
+      this.log.say("");
+    }
+  }
+
+  stop() { this.stopped = true; }
+}
+
+const CRLF = Uint8Array.of(13, 10);
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+}
+
+function hex4(n) { return n.toString(16).padStart(4, "0"); }

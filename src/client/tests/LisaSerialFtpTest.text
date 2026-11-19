@@ -1,5 +1,9 @@
 $EXEC
 ${Round-trip test of LisaSerialFtpClient, run on the Lisa.}
+${To run it: in the Workshop main menu press R (for "run"), then type}
+${<LisaSerialFtpTest and press RETURN.  The '<' in front tells Workshop}
+${to run the file as an exec file (a macro); the .TEXT is not needed.}
+${LisaSerialFtpClientMake.text fetches this file onto the Lisa.}
 ${Needs: LisaSerialFtpServer.py running with --home_dir set to the src/client}
 ${folder, and LisaSerialFtpClient.OBJ on the Lisa side.}
 ${Files it creates on the Lisa: LisaSerialFtpClientTest1.text,}

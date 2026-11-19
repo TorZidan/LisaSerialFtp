@@ -3,17 +3,22 @@
 { Lisa Pascal file-inclusion directive (the "I" directive) naming this     }
 { file.                                                                    }
 {                                                                          }
-{ Holds all the code for the '!list' command (local volume listing):       }
+{ Holds all the code for the local-file commands '!list' (local volume     }
+{ listing) and '!delete':                                                  }
 {   EntryKind  -- name for a catalog entry type (Q_Info.etype)             }
 {   Pad2       -- a number as two digits ('07')                            }
 {   DateStr    -- a file time stamp as MM/DD/YY-HH:MM                      }
 {   DoListVol  -- the '!list' handler itself                               }
+{   AskYes     -- a Y/N question (also used by 'delete', later in          }
+{                 LisaSerialFtpClient.text)                                }
+{   DoDelLocal -- the '!delete' handler                                    }
 {                                                                          }
 { This is NOT a standalone program: no PROGRAM statement, no USES, no      }
 { final END.  It is included at the point of the I-inclusion directive     }
 { in LisaSerialFtpClient.text -- after all program-scope declarations,     }
 { so string255 is in scope -- and uses the syscall unit's                  }
-{ GET_WORKING_DIR / LOOKUP / RESET_CATALOG / LOOKUP_NEXT_ENTRY.  Works     }
+{ GET_WORKING_DIR / LOOKUP / RESET_CATALOG / LOOKUP_NEXT_ENTRY /           }
+{ KILL_OBJECT, and the program's kbd and ecode.  Works                     }
 { purely locally: no serial link or server needed.                         }
 {****************************************************************************}
 
@@ -225,4 +230,43 @@ BEGIN
       WRITELN('!list: catalog error: ', err);
   IF PageMore THEN
     WRITELN(n, ' entries');
+END;
+
+{ Ask question Q and wait for Y or N (read from kbd, no echo; other keys
+  are ignored).  TRUE for Y.  In a Workshop exec file the answer comes
+  from the file (the test macro answers 'Y' on the next line). }
+FUNCTION AskYes (Q: string255): BOOLEAN;
+VAR ch: CHAR;
+BEGIN
+  WRITE(Q, ' (Y/N) ');
+  REPEAT
+    READ(kbd, ch);
+  UNTIL (ch = 'Y') OR (ch = 'y') OR (ch = 'N') OR (ch = 'n');
+  WRITELN(ch);
+  AskYes := (ch = 'Y') OR (ch = 'y');
+END;
+
+{ '!delete <local>' / '!del': delete a file on the Lisa (KILL_OBJECT),
+  after a Y/N question.  Whether the file exists is not checked first:
+  KILL_OBJECT's error says so. }
+PROCEDURE DoDelLocal (name: string255);
+VAR p: pathname;
+BEGIN
+  IF name = '' THEN
+  BEGIN
+    WRITELN('usage: !delete <local>   (or !del)');
+    EXIT(DoDelLocal);
+  END;
+  IF NOT AskYes(concat('delete ', name, ' on the Lisa?')) THEN
+  BEGIN
+    WRITELN('not deleted');
+    EXIT(DoDelLocal);
+  END;
+  p := name;
+  ecode := 0;
+  KILL_OBJECT(ecode, p);
+  IF ecode > 0 THEN
+    WRITELN('cannot delete ', name, ': error ', ecode)
+  ELSE
+    WRITELN('deleted ', name);
 END;

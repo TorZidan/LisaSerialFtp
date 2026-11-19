@@ -119,11 +119,11 @@ built-in serial port.  If there
 is none yet, it waits for one.  Two narrower variants pick in the same way,
 but only among some of the ports:
 
-* `--port auto-pty`: only the PseudoTTYs, for LisaEm;
-* `--port auto-serial`: only the USB adapters and built-in serial ports, for
+* `--port auto-pty`: discovers only PseudoTTYs ports, like the ones opened by LisaEm;
+* `--port auto-serial`: discovers only the USB adapters and built-in serial ports, use with a
   a real Lisa.
 
-For example, `--port auto`:
+For example, `--port auto` may show:
 
 ```
 --port auto: ports found on this computer:
@@ -187,7 +187,7 @@ its banner and carries on.
 Below is a sample client session.
 
 ```
-LisaSerialFtpClient v1.0 (build 2026-11-18 15:47)
+LisaSerialFtpClient v1.0 (build 2026-11-18 16:37)
 file transfer over RS232B at 57600 baud
 commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
           debug, repeat, help, quit
@@ -397,11 +397,11 @@ At the end, upon success, it will just exit to the Workshop main menu.
 |---|---|---|
 | `src/server/LisaSerialFtpServer.py` | Linux, macOS, Windows | serial **server**; shares a directory |
 | `src/client/LisaSerialFtpClient.text` | the Lisa (Lisa Pascal) | console **client**; talks to the built-in RS-232 driver |
-| `src/client/LisaSerialFtpClientInclude.text` | the Lisa (Lisa Pascal) | part of the client (the `!list` command), pulled in by `{$I LisaSerialFtpClientInclude.text}`; keep it on the same volume |
+| `src/client/LisaSerialFtpClientInclude.text` | the Lisa (Lisa Pascal) | part of the client (the `!list` and `!delete` commands), pulled in by `{$I LisaSerialFtpClientInclude.text}`; keep it on the same volume |
 | `src/client/LisaSerialFtpClientAsm.text` | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy, the text decoder and page writer, 10-15 times faster than Pascal; built with it (see `LisaSerialFtpClientMake.text`) |
 | `src/client/LisaSerialFtpClientMake.text` | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
 | `src/server/tests/*.py` | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
-| `src/client/tests/LisaSerialFtpTestMacro.text` | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
+| `src/client/tests/LisaSerialFtpTest.text` | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
 
 ## How the Lisa sees the serial ports
 
@@ -821,8 +821,8 @@ test shell, `nwshell`):
 
 | Segment | Contents |
 |---|---|
-| blank (default) | the serial port routines, the CRC, the chunk protocol (`SendChunk`, `RecvChunk`) and the main program: the code every transfer runs all the time |
-| `CmdSeg` | paging, `list`, `!list` (the whole include file `LisaSerialFtpClientInclude.text`), `help`, `baud`, port setup, the timeout-factor measurement, `hello`, `debug` and the other commands |
+| blank (default) | the serial port routines, the CRC, the chunk protocol (`SendChunk`, `RecvChunk`, `ReadFrame`) and the main program: the code every transfer runs all the time |
+| `CmdSeg` | paging, `list`, `!list` and `!delete` (the whole include file `LisaSerialFtpClientInclude.text`), `help`, `baud`, port setup, the timeout-factor measurement, `hello`, `debug` and the other commands |
 | `XferSeg` | the `get` and `put` transfers (`DoGet`, `DoPut`) and the end-of-transfer verification |
 
 A `{$S CmdSeg  }` or `{$S XferSeg }` line in the source starts putting
@@ -890,7 +890,7 @@ verification (a client that answers BAD, or reports a wrong CRC).
 
 ### Testing on the Lisa
 
-`src/client/tests/LisaSerialFtpTestMacro.text` is a Workshop exec file
+`src/client/tests/LisaSerialFtpTest.text` is a Workshop exec file
 that tests the client on the Lisa itself.  `LisaSerialFtpClientMake.text`
 fetches it onto the Lisa.  It gets the client's sources and puts a file
 in `src/client/tests`, so start the server sharing `src/client` for it
@@ -900,7 +900,9 @@ in `src/client/tests`, so start the server sharing `src/client` for it
 python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/client
 ```
 
-and run it from the Workshop.  It:
+and run it from the Workshop: in the main Workshop menu press `r`
+("run"), type `<LisaSerialFtpTest` and enter (the `<` runs it as an exec
+file, as for `<LisaSerialFtpClientMake`).  It:
 
 1. deletes `LisaSerialFtpClientTest1.text`, `LisaSerialFtpClientTest2.text`
    and `LisaSerialFtpClientTest3.text` left from an earlier run;
@@ -936,7 +938,8 @@ of it.  (The Pascal timings, and writing a text file the way `get` once
 did, with `TXTPUT`, and sending a `WRITE_DATA` per character, are
 commented out in the source.)  It prints bytes/s for each; the server
 prints the times too.  Give it a small file (e.g.
-`bench LisaSerialFtpClientInclude.text`).
+`bench LisaSerialFtpClientInclude.text`); a file that is not there is
+reported before anything is measured, and `bench` stops.
 
 ## Design notes / limitations
 

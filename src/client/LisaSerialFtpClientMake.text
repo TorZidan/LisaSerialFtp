@@ -1,4 +1,15 @@
 $EXEC
+${Build LisaSerialFtpClient on the Lisa: fetch the newest sources from}
+${the server with the current client, assemble, compile and link them}
+${into LisaSerialFtpClient.OBJ, and delete the intermediate object files.}
+${To run it: in the Workshop main menu press r (for "run"), then type}
+${<LisaSerialFtpClientMake and press RETURN.  The '<' in front tells}
+${Workshop to run the file as an exec file (a macro); the .TEXT is not}
+${needed.  Watch its progress; when it succeeds it returns to the}
+${Workshop main menu.  It needs a LisaSerialFtpClient.OBJ on the Lisa}
+${already (to fetch the sources), and this file itself; to get a newer}
+${copy of this file, run the client and type}
+${  get LisaSerialFtpClientMake.text}
 $
 ${Fetch the newest sources from the server with the current client}
 ${(LisaSerialFtpServer.py must be running; get replaces the old files)}
@@ -6,7 +17,7 @@ ${The server must share THIS folder (src/client of the repository): the}
 ${names below are relative to it.  E.g., in the repository folder:}
 ${  python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/client}
 R{un}LisaSerialFtpClient.OBJ
-get -c tests/LisaSerialFtpTestMacro.text LisaSerialFtpTestMacro.text
+get -c tests/LisaSerialFtpTest.text LisaSerialFtpTest.text
 get -c LisaSerialFtpClientInclude.text
 get -c LisaSerialFtpClientAsm.text
 get -c LisaSerialFtpClient.text

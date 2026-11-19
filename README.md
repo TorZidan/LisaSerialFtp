@@ -61,6 +61,13 @@ is set to **Serial Cable**, like so:
 
 ![thisishowyoudoitbabe](assets/screenshots/workshop-prefrences-app.png)
 
+Then just choose File->Quit; it will save your choices.
+
+Note: you don't need to run "portconfig" in Workshop before running the client app.
+The app configures the serial port B at startup, and then does it as-needed
+(e.g. its `baud` command).
+
+
 ### Running the client app in Lisa Workshop
 
 To run the app: in the main Workshop menu, press `r` (for "run"), then type the
@@ -437,7 +444,6 @@ This would have to be done on the Lisa client side, which is a CPU-intensive tas
   WRITELN. This adds about 36 ms per line on a real Lisa. Avoiding it is the
   reason the conversion is done on our server.
 * In conclusion: it is possible to implement a Lisa Client app that works with a standard Kermit server, but its transfer speeds will be considerably lower due to the added CPU overhead on the client.
-
 
 ### How to find the device name of my USB serial dongle?
 

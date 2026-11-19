@@ -187,7 +187,7 @@ its banner and carries on.
 Below is a sample client session.
 
 ```
-LisaSerialFtpClient v1.0 (build 2026-11-18 16:37)
+LisaSerialFtpClient v1.0 (build 2026-11-18 16:52)
 file transfer over RS232B at 57600 baud
 commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
           debug, repeat, help, quit

@@ -93,7 +93,7 @@ USES
     {$U PasLibCall.Obj}  PasLibCall;   { PAbortFlag: Apple-period pressed? }
 
 CONST
-  BUILD = '2026-11-18 16:37';  { printed at startup, so it is easy
+  BUILD = '2026-11-18 16:52';  { printed at startup, so it is easy
                                  to see which build runs; change it with each change }
   BAUD     = 57600;           { the maximum (Port B, the only port this client uses) }
   VERSION  = 'v1.0';          { the client's version; the 1 is the MAJOR version.

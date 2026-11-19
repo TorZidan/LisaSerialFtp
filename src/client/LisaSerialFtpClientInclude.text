@@ -115,14 +115,16 @@ END;
   (no second LOOKUP per entry).  Works purely locally -- no serial
   link or server needed.
 
-  The layout is the Workshop File Manager's (List):
+  The layout is like the Workshop File Manager's (List), with room for
+  the longest Lisa name (MAXNAME, 32 characters), so no name is cut:
     Contents of -vol-=
-    Filename                     Size Psize   Last-Mod-Date   Creation-Date  Attr
-    --------                     ---- -----   -------------   -------------  ----
-    ALERT                       18432    36  06/22/84-14:08  06/22/84-14:06
-  A name longer than 24 characters is cut to 23 plus an ellipsis.  Attr
-  shows the entry type when it is not a plain file (catalog, link, ...)
-  and 'protected' for a protected file.
+    Filename                            Size Psize   Last-Mod-Date  Creation-Date Attr
+    --------                            ---- -----   -------------  ------------- ----
+    ALERT                              18432    36  06/22/84-14:08 06/22/84-14:06
+  Attr shows the entry type when it is not a plain file (catalog, link,
+  ...) and 'protected' for a protected file.  A line is 77 characters
+  (87 with 'protected'): within the 88 columns of the Lisa console, so
+  it never wraps.
 
   LOOKUP_NEXT_ENTRY does the prefix match (case-insensitive).  A
   trailing '=' (the Workshop's wildcard, as in 'ALEX=') is accepted and
@@ -180,11 +182,11 @@ BEGIN
   more := PageMore;
   WRITELN('Contents of ', vol, prefix, '=');
   IF PageMore THEN
-    WRITELN('Filename                     Size Psize   Last-Mod-Date   Creation-Date  Attr')
+    WRITELN('Filename                            Size Psize   Last-Mod-Date  Creation-Date Attr')
   ELSE
     EXIT(DoListVol);
   IF PageMore THEN
-    WRITELN('--------                     ---- -----   -------------   -------------  ----')
+    WRITELN('--------                            ---- -----   -------------  ------------- ----')
   ELSE
     EXIT(DoListVol);
   n := 0;
@@ -194,14 +196,8 @@ BEGIN
     IF err = 0 THEN
     BEGIN
       n := n + 1;
-      outl := q.name;
-      IF LENGTH(outl) > 24 THEN           { cut to 23 + an ellipsis }
-      BEGIN
-        outl := COPY(outl, 1, 23);
-        outl := concat(outl, ' ');
-        outl[24] := CHR(201);             { the Lisa character set's ... }
-      END;
-      FOR j := LENGTH(outl) + 1 TO 24 DO
+      outl := q.name;                     { at most MAXNAME (32) characters }
+      FOR j := LENGTH(outl) + 1 TO MAXNAME DO
         outl := concat(outl, ' ');
       attr := '';
       IF q.etype <> fileentry THEN
@@ -214,6 +210,8 @@ BEGIN
           attr := 'protected'
         ELSE
           attr := concat(attr, ' protected');
+      IF attr <> '' THEN
+        attr := concat(' ', attr);        { after the dates, if any }
       DateStr(q.DTM, dm);
       DateStr(q.DTC, dcr);
       more := PageMore;
@@ -221,7 +219,7 @@ BEGIN
         { Psize: 512-byte blocks.  Q_Info.psize is the physical size in
           BYTES (18432 for 36 blocks); rounded up, in case it is not a
           whole number of blocks. }
-        WRITELN(outl, q.size:9, (q.psize + 511) DIV 512:6, '  ', dm, '  ', dcr, '  ', attr);
+        WRITELN(outl, q.size:8, (q.psize + 511) DIV 512:6, '  ', dm, ' ', dcr, attr);
     END;
   UNTIL (err <> 0) OR NOT more;
   IF NOT more THEN EXIT(DoListVol);       { CLEAR at a page prompt }

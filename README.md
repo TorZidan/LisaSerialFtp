@@ -1,20 +1,21 @@
 # Lisa Serial FTP — file transfer between an Apple Lisa and a modern computer over a serial cable
 
-The client: a terminal-like Pascal-based program LisaSerialFtpClient.obj that runs in the Apple Lisa Workshop 3.0 development environment. All user interaction happens here. It supports downloading and uploading both text and binary files (note: the
+The client: a terminal-like Pascal-based program [**LisaSerialFtpClient.obj**](./src/client/LisaSerialFtpClient.obj) that runs in the Apple Lisa Workshop 3.0 development environment.
+All user interaction happens here. It supports downloading and uploading both text and binary files (note: the
 Lisa OS stores them differently), listing and deleting files on both sides. It
 transfers data in retryable chunks; every chunk is verified and, if needed,
 retried; the whole file size, CRC16 checksum and byte sum is verified at the
 end, and the file is accepted only then.
 
-The server: a non-interactive Python-based LisaSerialFtpServer.py program that runs on your modern computer and listens for commands.
+The server: a non-interactive Python-based [**LisaSerialFtpServer.py**](./src/server/LisaSerialFtpServer.py) program that runs on your modern computer and listens for commands.
 
 The tool is useful for developing applications for the Apple Lisa (both Lisa Office system and Workshop apps). Here is a typical development setup:
 * Write source code (in Pascal, Assembler, Basic, etc) on your PC using your favorite editor.
-* Keep the LisaSerialFtpServer.py server running on your PC (it auto-reconnects as needed, there is no need to restart it).
-* Download your code onto your Lisa: go on your Lisa (either on a real Lisa or the LisaEm emulator running on the same PC), launch the LisaSerialFtpClient app in the Workshop development environment,
-  and run one-or-more "get" commands to download your files.
+* Keep the [`LisaSerialFtpServer.py`](src/server/LisaSerialFtpServer.py) server running on your PC (it auto-reconnects as needed, there is no need to restart it).
+* Download your code onto your Lisa: go on your Lisa (either on a real Lisa or the LisaEm emulator running on the same PC), launch the `LisaSerialFtpClient` app in the Workshop development environment,
+  and run one-or-more `get` commands to download your files.
 * Compile, link and test your app on the Lisa.
-* A powerful option: use a Workshop Macro like [this one](src/client/LisaSerialFtpClientMake.text)  on your Lisa to download, compile and link your code with just one command!
+* A powerful option: use a Workshop Macro like [this one](src/client/LisaSerialFtpClientMake.text) on your Lisa to download, compile and link your code with just one command!
 
 ![The client on a real Lisa: a get of its own source as a text file, then a put of its executable file](assets/photos/lisa-in-action.jpg)
 
@@ -25,10 +26,10 @@ Clone this repository to a folder on your PC.
 
 ### Get the `LisaSerialFtpClient.obj` executable into Workshop.
 
-* Option 1: The DC42 floppy disk image file `LisaSerialFtpClient.dc42` contains the
+* **Option 1**: The DC42 floppy disk image file [`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42) contains the
 executable file `LisaSerialFtpClient.obj`. Boot into Lisa Workshop, then insert ("mount") that
 disk image, e.g. using a FloppyEmu or ESFloppy floppy disk hardware
-emulator on a real Lisa, or in the LisaEm emulator, from the File -> Insert Diskette menu item.
+emulator on a real Lisa, or in the [LisaEm](https://lisaem.sunder.net/) emulator, from the **File -> Insert Diskette** menu item.
 Once in Workshop, you will have to copy it to your ProFile hard
 drive, this way: Press `f` to get into the File Manager submenu, then press `c` for
 "copy", then enter source filename `-UPPER-LisaSerialFtpClient.obj`, enter,
@@ -39,15 +40,15 @@ in the source filename). On a Lisa 2/10 the boot menu looks different: your
 floppy disk drive is named "LOWER", and the hard disk is "UPPER" in Workshop.
 Press `q` to exit to the main Workshop menu.
 
-* Option 2: Most people use a ProFile hardware emulator on their Lisa-s such as ESProfile (the most popular one) and others; the hard disk image files sit on an micro-SD card.
-Plug the SD card in your PC, and use my "copy" tool at https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files
-to copy file [LisaSerialFtpClient.obj](./LisaSerialFtpClient.obj) onto your desired disk image, then move the mocroSD card back into the ProFile hardware emulator.
+* **Option 2**: Most people use a ProFile hardware emulator on their Lisa-s such as ESProfile (the most popular one) and others; the hard disk image files sit on a micro-SD card.
+Plug the SD card in your PC, and use the "copy" command of my [LisaFileSystemTool](https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files)
+to copy file [`LisaSerialFtpClient.obj`](src/client/LisaSerialFtpClient.obj) onto your desired disk image, then move the micro-SD card back into the ProFile hardware emulator.
 
-* Option 3: Just copy the
+* **Option 3**: Just copy the
   [profile-5MB-LOSAndWorkshop3-UseWith88iorom.image](./profile-5MB-LOSAndWorkshop3-UseWith88iorom.image)
   to your SD card and boot it up into Workshop. It has a clean installation of
-  Lisa Office System 3.1, Workshop 3.0 and the LisaSerialFtpClient.obj
-  executable. As the file name says, it should be used with I/O Rom version 88
+  Lisa Office System 3.1, Workshop 3.0 and the `LisaSerialFtpClient.obj`
+  executable. As the file name says, it should be used with **I/O Rom version 88**
   (aka Lisa 2/10). Booting it up using any other I/O Rom version may result in
   a boot error.
 
@@ -55,8 +56,8 @@ Note: once you have `LisaSerialFtpClient.obj` on your ProFile hard drive, you ca
 
 ### Ensure Serial Port B is set to "Serial Cable" in the Workshop Preferences
 In Workshop, press `s` for Sys-Manager submenu, then `p` to run the Preferences app.
-In it: check the "Connect Devices" checkbox and make sure that "Serial B Connector"
-is set to "Serial Cable, like so:
+In it: check the **Connect Devices** checkbox and make sure that **Serial B Connector**
+is set to **Serial Cable**, like so:
 
 ![thisishowyoudoitbabe](assets/screenshots/workshop-prefrences-app.png)
 
@@ -71,11 +72,11 @@ server, and will give you a `>` command prompt. Type `hello` and `help` to see w
 
 Requirements: **Python 3.5 or newer**.  On Linux and macOS nothing else is
 needed: the server uses only Python's standard library.  On Windows it also
-needs **pyserial** (`pip install pyserial`), because Windows has no `termios`.
+needs [**pyserial**](https://pypi.org/project/pyserial/) (`pip install pyserial`), because Windows has no `termios`.
 
 The server shares one folder with the Lisa, the "home folder" given with
 `--home_dir`: the Lisa can list, get, put and delete the files in it and in its
-subfolders, and nothing outside it.  The folder must exist (the server does
+subfolders, and nothing outside it.  **The folder must exist** (the server does
 not create it, so a mistyped path is an error rather than a new, empty share).
 
 Run these commands from the folder where you cloned this repository:
@@ -94,7 +95,7 @@ mkdir -p ~/lisa-share
 python3 src/server/LisaSerialFtpServer.py --port /dev/cu.usbserial-1410 --home_dir ~/lisa-share
 ```
 
-Use the `/dev/cu.*` name of the adapter, not its `/dev/tty.*` twin (opening that
+Use the **`/dev/cu.*`** name of the adapter, not its `/dev/tty.*` twin (opening that
 one can wait for a carrier signal that never comes).
 
 ### On Windows
@@ -111,7 +112,7 @@ your USB serial adapter: see the FAQ
 . If using the LisaEm emulator (instead of a real Apple Lisa computer), use its virtual port instead, e.g. `--port /tmp/lisaem-port-b`. Find detailed instructions
 at [Setting up LisaEm for a 1st time](https://github.com/arcanebyte/lisaem/blob/master/LisaEmAsASoftwareDevelopmentEnvironment.md#setting-up-lisaem-for-a-1st-time).
 
-`--port` can also be left out: it defaults to `--port auto`, which finds the
+`--port` can also be left out: it defaults to **`--port auto`**, which finds the
 port itself.  If there is just one serial or PseudoTTY port, it uses
 that one; if there are more, it lists them and chooses one this way: a symbolic link to a pty
 (such as `/tmp/lisaem-port-b` (created by the LisaEm emulator) first, then the pty of a running LisaEm, then a USB adapter, then a
@@ -119,8 +120,8 @@ built-in serial port.  If there
 is none yet, it waits for one.  Two narrower variants pick in the same way,
 but only among some of the ports:
 
-* `--port auto-pty`: discovers only PseudoTTYs ports, like the ones opened by LisaEm;
-* `--port auto-serial`: discovers only the USB adapters and built-in serial ports, use with a
+* `--port auto-pty`: discovers only PseudoTTY ports, like the ones opened by LisaEm;
+* `--port auto-serial`: discovers only the USB adapters and built-in serial ports; use it with
   a real Lisa.
 
 For example, `--port auto` may show:
@@ -156,7 +157,7 @@ it is served.
 
 ### Stopping the server
 
-The server runs until you stop it with Ctrl-C.
+The server runs until you stop it with **Ctrl-C**.
 
 If the port is not there when it starts (LisaEm emulator not running yet, adapter not
 plugged in), the server says so once and waits for it.  It also lists the
@@ -255,53 +256,53 @@ sent 4096 bytes from image.bin, verified (CRC 1C2D)
 
 The client app supports the following commands:
 
-* `put` uploads a file to the server. It guesses if the source file is text vs. binary from the filename (text files are stored in a special way on the Lisa file system).
-   : a filename ending in
-  `.TEXT` (any case) is a Lisa text file and is sent as text; all others are sent as binary. 
-  For text files, Lisa-style line endings \r are auto converted to Linux-style line endings \n.
+* **`put`** uploads a file to the server. It guesses if the source file is text vs. binary from the filename (text files are stored in a special way on the Lisa file system,
+  see [LisaOsTextFileSpecification.txt](LisaOsTextFileSpecification.txt)): a filename ending in
+  `.TEXT` (any case) is a Lisa text file and is sent as text; all others are sent as binary.
+  For text files, Lisa-style line endings `\r` are auto converted to Linux-style line endings `\n`.
    `put -b` always sends byte-exact, even a `.TEXT` file (its raw pages, header
   included: a byte-exact copy), and `put -t` always sends as text.
 
-* `get` downloada a file from the server. It guesses if the source file is text vs. binary from the filename (text files are stored in a special way on the Lisa file system):
-   If the local name is given and
+* **`get`** downloads a file from the server. It guesses if the source file is text vs. binary from the filename (text files are stored in a special way on the Lisa file system):
+  if the local name is given and
   ends in `.TEXT`, or the remote name ends in `.TEXT` (any case), it
-  downloads as text, othherwise it downloads as binary.
-  For text files, Windows and Linux style line endings \n, \r\n are auto-converted to Lisa sytle line endings \r.
+  downloads as text, otherwise it downloads as binary.
+  For text files, Windows and Linux style line endings `\r\n`, `\n` are auto-converted to Lisa style line endings `\r`.
   `get -b`
   always downloads byte-exact, and `get -t` always as text.
 
-* `get -c` and `put -c` (c for checksum, as in `rsync -c`) first check
+* **`get -c`** and **`put -c`** (c for checksum, as in `rsync -c`) first check
   whether the transfer is needed. If the files match (it checks the file size, the CRC-16 and the byte sum), 
   the command just exits (nothing to do); otherwise, it does the transfer.
 
-* Hotkey Apple + .  stops and cancels any ongoing transfer and returns to the `>` prompt.
+* Hotkey **Apple + .** stops and cancels any ongoing transfer and returns to the `>` prompt.
 
-* `repeat` (or `r`) runs the last command line again, arguments and
+* **`repeat`** (or `r`) runs the last command line again, arguments and
   all.
 
-* `delete <remote>` (or `del`) deletes a file on the server, `!delete
-  <local>` (or `!del`) deletes a file on the Lisa.  Both first ask for
+* **`delete <remote>`** (or `del`) deletes a file on the server, **`!delete
+  <local>`** (or `!del`) deletes a file on the Lisa.  Both first ask for
   Y/N confirmation (any other key is ignored). The server refuses to delete a
   folder, and nothing at all with `--read-only`.
 
-* `list` and `!list` list files on the server and locally. 
+* **`list`** and **`!list`** list files on the server and locally.
   They paginate (stop) after every 30 lines with `Type SPACE to
   continue, CLEAR to exit`.
 
-* Type `help` to see the remaining commands.
+* Type **`help`** to see the remaining commands.
 
 ## Compiling and linking the client app
 
-This step is needed only if you made changes to the client app and want to recompile it (Find above a pre-compiled client app).
+This step is needed only if you made changes to the client app and want to recompile it (a pre-compiled client app is [above](#get-the-lisaserialftpclientobj-executable-into-workshop)).
 
-`LisaSerialFtpClient.text` is a plain Lisa Pascal console program (`USES syscall`),
-with three small routines in 68000 assembly (`LisaSerialFtpClientAsm.text`).
+[`LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) is a plain Lisa Pascal console program (`USES syscall`),
+with a few small routines in 68000 assembly ([`LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text)).
 Assemble that file, compile the program, and link the two objects with
 `IOSPASLIB.OBJ`. It uses only stock OS file APIs (`OPEN`, `READ_DATA`,
 `WRITE_DATA`, `DEVICE_CONTROL`, `MAKE_FILE`, ... from the `syscall`
 unit).
 
- The Workshop macro / exec file `LisaSerialFtpClientMake.text` does all
+The Workshop macro / exec file [`LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) does all
 of it, after fetching the newest sources (which requires having a compiled `LisaSerialFtpClient.obj` on the
 Lisa).  It fetches the source files from the server's `src/client` folder, so the server must
 be "sharing" that folder; for example, in the repository folder:
@@ -319,13 +320,13 @@ At the end, upon success, it will just exit to the Workshop main menu.
 
 | file | runs on | role |
 |---|---|---|
-| `src/server/LisaSerialFtpServer.py` | Linux, macOS, Windows | serial **server**; shares a directory |
-| `src/client/LisaSerialFtpClient.text` | the Lisa (Lisa Pascal) | console **client**; talks to the built-in RS-232 driver |
-| `src/client/LisaSerialFtpClientInclude.text` | the Lisa (Lisa Pascal) | part of the client (the `!list` and `!delete` commands), pulled in by `{$I LisaSerialFtpClientInclude.text}`; keep it on the same volume |
-| `src/client/LisaSerialFtpClientAsm.text` | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy and the text decoder, 10-15 times faster than Pascal; built with it (see `LisaSerialFtpClientMake.text`) |
-| `src/client/LisaSerialFtpClientMake.text` | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
-| `src/server/tests/*.py` | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
-| `src/client/tests/LisaSerialFtpTest.text` | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
+| [`src/server/LisaSerialFtpServer.py`](src/server/LisaSerialFtpServer.py) | Linux, macOS, Windows | serial **server**; shares a directory |
+| [`src/client/LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) | the Lisa (Lisa Pascal) | console **client**; talks to the built-in RS-232 driver |
+| [`src/client/LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text) | the Lisa (Lisa Pascal) | part of the client (`!list`, `!delete`), included with `{$I ...}`; keep it on the same volume |
+| [`src/client/LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text) | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy and the text decoder, 10-15 times faster than Pascal |
+| [`src/client/LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
+| [`src/server/tests/*.py`](src/server/tests) | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
+| [`src/client/tests/LisaSerialFtpTest.text`](src/client/tests/LisaSerialFtpTest.text) | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
 
 ## How the Lisa sees the serial ports
 
@@ -346,12 +347,12 @@ It issues multiple `DEVICE_CONTROL` commands to setup the serial port, using the
 dvInDTR=7, dvInXON=8, dvTypeahd=9`.
 
 ## Serial wiring
-The Lisa has two DB-25 serial ports on the back labeled "__a" and "__b" (referred in the code as Port A and Port B). This tool works with Port B only: the port is hard-coded in the client (`devname := 'RS232B'`); Port A is not supported.
+The Lisa has two DB-25 serial ports on the back labeled "__a" and "__b" (referred in the code as Port A and Port B). This tool works with **Port B only**: the port is hard-coded in the client (`devname := 'RS232B'`); Port A is not supported.
 
 I use two cables connected together:
-* a serial **Null-modem (crossover) cable** with DB-25 male on the Lisa side and DB9 female on the other side, wired like this: TX↔RX, GND↔GND. That is all the
-  protocol needs — flow control is done by the protocol itself (see below), so no DTR/DSR/RTS/CTS wiring is required (you can still use a cable that has these wires).
-* a serial-to-USB dongle with DB9 male on one side (plugged into the other cable) and a standard USB on the other side (plugged into any USB port of my PC). 
+* a serial **Null-modem (crossover) cable** with DB-25 male on the Lisa side and DB9 female on the other side, wired like this: **TX↔RX, GND↔GND**. That is all the
+  protocol needs — flow control is done by the protocol itself (see [Serial line settings](#serial-line-settings)), so no DTR/DSR/RTS/CTS wiring is required (you can still use a cable that has these wires).
+* a **serial-to-USB dongle** with DB9 male on one side (plugged into the other cable) and a standard USB on the other side (plugged into any USB port of my PC). 
 There are many options on the market, including very cheap ones with questionable quality. I can't recommend a specific one.
 
 The back of the Lisa, with the null-modem cable plugged into Port B (the DB-25 port labeled `__b`):
@@ -427,10 +428,10 @@ the design notes are in [TECHNICAL.md](TECHNICAL.md):
 
 Mainly 2 reasons:
 
-* The kermit server cannot auto-translate \r\n (Windows line-endings) and \n (Linux line-endings) to \r (Lisa line-endings).
+* The [Kermit](https://www.kermitproject.org/) server cannot auto-translate `\r\n` (Windows line-endings) and `\n` (Linux line-endings) to `\r` (Lisa line-endings).
 This would have to be done on the Lisa client side, which is a CPU-intensive task that would slow down the transfer considerably.
 * The Lisa stores text files in a special way (see [LisaOsTextFileSpecification.txt](./LisaOsTextFileSpecification.txt)): A Lisa text
-  file isn't just lines ending in \r: it has a 1024-byte header page, lines
+  file isn't just lines ending in `\r`: it has a 1024-byte header page, lines
   packed into 1 KB pages with NUL padding, and leading spaces compressed. A
   Lisa Kermit client would have to build those pages itself, e.g. with Pascal
   WRITELN. This adds about 36 ms per line on a real Lisa. Avoiding it is the
@@ -440,7 +441,7 @@ This would have to be done on the Lisa client side, which is a CPU-intensive tas
 
 ### How to find the device name of my USB serial dongle?
 
-I recommend using `--port auto` or `--port auto-pty` or `--port auto-serial` on the server to auto-discover and connect to the port.
+I recommend using `--port auto` or `--port auto-pty` or `--port auto-serial` on the server to auto-discover and connect to the port (see [Running the server on your PC](#running-the-server-on-your-pc)).
 So the information below is just for completeness.
 
 **Linux**
@@ -520,4 +521,4 @@ I used AI in this project, to write most of the code and parts of this doc.
 
 ## License
 
-Published under the GNU General Public License v3.0.
+Published under the [GNU General Public License v3.0](LICENSE).

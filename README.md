@@ -346,6 +346,7 @@ At the end, upon success, it will just exit to the Workshop main menu.
 | [`src/client/LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
 | [`src/server/tests/*.py`](src/server/tests) | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
 | [`src/client/tests/LisaSerialFtpTest.text`](src/client/tests/LisaSerialFtpTest.text) | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
+| [`src/client/tests/LisaSourceFilesGetAll.text`](src/client/tests/LisaSourceFilesGetAll.text) | the Lisa (Workshop exec file) | `get -c` of the 860 Lisa OS source files that LisaSourceCompilation's `upload_files.sh` uploads |
 
 ## How the Lisa sees the serial ports
 

@@ -6,7 +6,7 @@ Runs on a modern computer at the other end of a serial cable (a USB serial
 adapter, a built-in serial port, or LisaEm's PseudoTTY) and serves one
 folder (--home_dir) to LisaSerialFtpClient on the Lisa, which uses the
 Lisa's Port B (RS232B) only.  It speaks the LISA-SERIAL-FTP/v1.0 protocol;
-README.md has the full specification.
+TECHNICAL.md has the full specification.
 
 Needs Python 3.5 or newer.  Linux and macOS: the standard library only
 (termios).  Windows: also pyserial for the serial port (pip install pyserial).
@@ -180,7 +180,7 @@ CAL_SECONDS = 2.0       # CAL reply delay, real seconds (must match CALSECS
 
 # The rates the Lisa can use too: 57600 is the most its serial driver can
 # set (at 115200 its baud-rate generator time constant would be -1; see
-# README, "Baud rate").
+# TECHNICAL.md, "Baud rates").
 BAUDS = (300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600)
 
 # --------------------------------------------------------------------------

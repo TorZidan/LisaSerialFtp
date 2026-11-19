@@ -192,6 +192,8 @@ class FakeLisa {
   }
 }
 
+const same = (a, b) => a && b && a.length === b.length && a.every((x, i) => x === b[i]);
+
 const quietLog = { say() {}, debug() {}, progress() {}, progressStart() {} };
 
 function memorySource(files) {
@@ -272,8 +274,59 @@ lisa.send("HELLO");
 check((await lisa.line()).startsWith("Hi from"), "HELLO -> banner");
 lisa.send("DEBUG OFF");
 check(await lisa.line() === "OK debug off", "DEBUG OFF -> OK debug off");
-lisa.send("CAL");
-check(await lisa.line() === "ERR 99 unknown command", "CAL -> ERR 99 (not in the prototype yet)");
+lisa.send("BAUD 9600");
+check(await lisa.line() === "ERR 99 unknown command", "BAUD -> ERR 99 (not in the prototype yet)");
+
+// CAL: the reply comes CAL_MS (2 s) later
+{
+  const t0 = performance.now();
+  lisa.send("CAL");
+  const r = await lisa.line(5000);
+  const ms = performance.now() - t0;
+  check(r === "CAL 2000" && ms >= 1950 && ms < 2600, `CAL -> ${r} after ${Math.round(ms)} ms`);
+}
+
+// the bench: MARK, ECHO, FRAMES
+{
+  lisa.send("MARK -");
+  const a = await lisa.line();
+  await new Promise(r => setTimeout(r, 300));
+  lisa.send("MARK something timed");
+  const b = await lisa.line();
+  const ms = Number(b.slice(3));
+  check(a === "OK 0" && b.startsWith("OK ") && ms >= 280 && ms < 600, `MARK -> ${a}, then ${b}`);
+}
+{
+  lisa.send("ECHO 3");
+  const got = [await lisa.line(), await lisa.line(), await lisa.line()];
+  await lisa.sync();
+  check(got.every(l => l === "A 12345"), "ECHO 3 -> 3 lines 'A 12345', nothing else");
+  lisa.send("ECHO 0");
+  const e0 = await lisa.line();
+  lisa.send("ECHO 101");
+  const e1 = await lisa.line();
+  check(e0.startsWith("ERR 1 usage") && e1.startsWith("ERR 1 usage"), "ECHO 0 / 101 -> ERR 1 usage");
+}
+{
+  // FRAMES 3: three 1016-byte chunks of (i * 37) & 255, then the end-of-file
+  // chunk; the second chunk NAKed once
+  lisa.send("FRAMES 3");
+  const want = new Uint8Array(CHUNK).map((_, i) => (i * 37) & 0xFF);
+  const seen = [];
+  let nakked = false;
+  for (;;) {
+    const f = await lisa.frame();
+    if (f.seq === 1 && !nakked) { nakked = true; lisa.send("N 1"); continue; }
+    lisa.send(`A ${f.seq}`);
+    seen.push([f.seq, f.crcOk, f.data.length, f.data.length ? same(f.data, want) : true]);
+    if (!f.data.length) break;
+  }
+  await lisa.sync();
+  check(JSON.stringify(seen) === JSON.stringify([[0, true, CHUNK, true], [1, true, CHUNK, true],
+    [2, true, CHUNK, true], [3, true, 0, true]]), "FRAMES 3 (one NAK) -> chunks 0..2 and the end-of-file chunk, nothing else");
+  lisa.send("FRAMES 401");
+  check((await lisa.line()).startsWith("ERR 1 usage"), "FRAMES 401 -> ERR 1 usage");
+}
 
 for (const name of ["empty.bin", "one.bin", "big.bin"]) {
   const r = await lisa.get(name);
@@ -408,7 +461,6 @@ check((await lisa.line()).startsWith("ERR 1 usage"), "GET with 3 arguments -> ER
 }
 
 // PUT
-const same = (a, b) => a && b && a.length === b.length && a.every((x, i) => x === b[i]);
 {
   const up = randomBytes(CHUNK * 3 + 7, 3);
   const r = await lisa.put("up/new.bin", up);

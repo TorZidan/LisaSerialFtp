@@ -36,11 +36,18 @@ It talks to the unchanged Lisa client ([`LisaSerialFtpClient.text`](../client/Li
 | `LIST [dir]` | yes (for `list`): sorted, names encoded as the Python server does (`%20` for a space), in pages of at most 384 bytes with `MORE` / `NEXT`. Folders show size 0: browsers do not give a folder's size |
 | `PUT <name> <size>` | yes, into a folder (see below): CRC check, NAK, re-ACK of a resent chunk, a lost `DONE`, `FAIL`, a size mismatch, a restarted client |
 | `DELETE <name>` | yes, in a folder: one file, never a folder |
+| `CAL` | yes (for `timeout-factor auto`): answered 2 s after it came |
+| `MARK` / `ECHO` / `FRAMES` | yes (for `bench`): the ms between marks, lines `A 12345`, made-up chunks |
 | `QUIT` | yes |
-| everything else (`BAUD`, `CAL`, the bench's `MARK` / `ECHO` / `FRAMES`) | `ERR 99 unknown command` |
+| `BAUD` | not yet: `ERR 99 unknown command`. Set the rate on the page to the Lisa's |
 
-So `list`, `get` (with `-b`, `-t` and `-c` too), `put` (also `-c`), `delete` and `hello` work; `baud`,
-`bench` and `timeout-factor auto` do not yet.
+So every client command works except `baud`.
+
+After a `get` (and the bench's `FRAMES`) the log shows where the time of a chunk went, like the Python
+server: the frame being handed to the port, the Lisa until its ACK, and this page. One difference: the
+Python server waits until the frame has left the PC, and Web Serial cannot. So "the frame handed to the
+port" is shorter than the Python server's "the frame leaves the PC", and "the Lisa until its ACK" is
+longer by the same amount; their sum is comparable.
 
 An upload replaces a file only once it is verified, like the Python server's `<name>.part` file. Here the
 browser does it: `createWritable()` writes into a hidden swap file, `<name>.crswap` in Chrome, and only
@@ -76,7 +83,7 @@ pseudo-terminal that LisaEm uses. To test with LisaEm, use the Python server.
 |---|---|
 | [`index.html`](index.html) | the page |
 | [`app.js`](app.js) | the page's code: connects the controls and the log to the server |
-| [`protocol.js`](protocol.js) | the protocol: a port of the Python server's HELLO / DEBUG / GET / SUM / LIST / PUT / DELETE code. No browser APIs, so it runs in Node too |
+| [`protocol.js`](protocol.js) | the protocol: a port of the Python server's command code (all but BAUD). No browser APIs, so it runs in Node too |
 | [`serial.js`](serial.js) | the Web Serial port, with the `read(n, timeout)` the protocol code expects |
 | [`sources.js`](sources.js) | where the files come from: a local folder (also written to, for `put` / `delete`), or a base URL (and how each is listed) |
 | [`tests/test_protocol.mjs`](tests/test_protocol.mjs) | tests in Node, with a fake Lisa client: `node src/web-based-server/tests/test_protocol.mjs` |

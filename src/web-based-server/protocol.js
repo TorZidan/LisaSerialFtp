@@ -2,8 +2,9 @@
 //
 // A JavaScript port of the parts of src/server/LisaSerialFtpServer.py that
 // the prototype needs: HELLO, DEBUG (the client sends it right after
-// HELLO), QUIT, GET (binary and text), SUM (get -c), LIST (list), PUT and
-// DELETE.  Every other command is answered "ERR 99 unknown command".
+// HELLO), QUIT, GET (binary and text), SUM (get -c), LIST (list), PUT,
+// DELETE, CAL (timeout-factor auto) and the bench's MARK / ECHO / FRAMES.
+// Every other command (BAUD) is answered "ERR 99 unknown command".
 // Names, constants and behaviour follow the Python server, so its
 // docstrings (and TECHNICAL.md) explain this code too; keep the two in
 // step.
@@ -44,6 +45,7 @@ export const LINE_GAP = 5000;
 export const T_COMMAND = 15000;     // the Python server's --timeout default
 export const T_BLOCK = 1000;        // mid-chunk bytes (receiver)
 export const T_QUIET = 300;         // discard-until-quiet (receiver)
+export const CAL_MS = 2000;         // CAL reply delay (CALSECS in the client)
 
 export class TimeoutError extends Error {
   constructor(msg = "timeout") { super(msg); this.name = "TimeoutError"; }
@@ -225,6 +227,9 @@ export class LisaFtpServer {
     this.debugOn = false;
     this.stopped = false;
     this.pending = null;       // a line read while waiting for NEXT, for run()
+    this.markAt = null;        // MARK: time of the previous MARK
+    this.timing = {};          // per-chunk timing: key -> [n, total, min, max] ms
+    this.tReply = null;        // sendChunk: when the last ACK came
     this.page = 0;             // LIST: bytes sent since the last MORE
     this.doneLine = null;      // sendChunk: a DONE taken as the last ACK
     this.clientFailed = false; // sendChunk: the client sent FAIL
@@ -382,6 +387,84 @@ export class LisaFtpServer {
     }
     this.log.say("  FAILED: no NEXT from the client -- listing abandoned");
     return false;
+  }
+
+  // CAL: answer exactly CAL_MS of real time after the request came.  The
+  // Lisa counts its 1-second input timeouts meanwhile: in LisaEm at a high
+  // throttle that is how the client learns how much faster emulated time
+  // runs (timeout-factor auto).  A real Lisa counts ~2.
+  async cmdCal() {
+    await new Promise(r => setTimeout(r, CAL_MS));
+    await this.sendLine(`CAL ${CAL_MS}`);
+    this.log.say(`  ok: answered after ${CAL_MS / 1000} s`);
+  }
+
+  // MARK <label>: answer 'OK <ms since the previous MARK>' (the client's
+  // bench times its own work with it; the Lisa has no fine clock).
+  async cmdMark(args) {
+    const now = performance.now();
+    const ms = this.markAt === null ? 0 : Math.round(now - this.markAt);
+    this.markAt = now;
+    await this.sendLine("OK " + ms);
+    const label = args.join(" ");
+    if (label && label !== "-") this.log.say(`  bench: ${label}: ${ms} ms`);
+  }
+
+  // ECHO <n>: n lines 'A 12345', back to back (the bench times reading
+  // short lines with them).
+  async cmdEcho(args) {
+    const n = /^\d+$/.test(args[0] || "") ? Number(args[0]) : 0;
+    if (n < 1 || n > 100) throw new ProtocolError(1, "usage: ECHO n (1..100)");
+    await this.port.write(toWire("A 12345\r\n".repeat(n)));
+    this.dlog(`sent ${n} lines 'A 12345'`);
+  }
+
+  // FRAMES <n>: n chunks of CHUNK made-up bytes, then the empty end-of-file
+  // chunk, sent as a GET sends them; nothing before or after (the bench
+  // times receiving chunks with it).
+  async cmdFrames(args) {
+    const n = /^\d+$/.test(args[0] || "") ? Number(args[0]) : 0;
+    if (n < 1 || n > 400) throw new ProtocolError(1, "usage: FRAMES n (1..400)");
+    const payload = new Uint8Array(CHUNK).map((_, i) => (i * 37) & 0xFF);
+    this.log.progressStart(n * CHUNK);
+    this.timingReset();
+    for (let seq = 0; seq <= n; seq++) {
+      if (!(await this.sendChunk(seq, seq < n ? payload : new Uint8Array(0)))) {
+        this.log.say("  FAILED: frames: " + this.sendWhy);
+        return;
+      }
+    }
+    this.log.say(`  ok: ${n} chunks sent`);
+    this.sayTiming();
+  }
+
+  // -- per-chunk timing (after a GET or FRAMES), as the Python server's:
+  // "write": the frame handed to the serial port (Web Serial cannot wait
+  // until it has left the PC, as the Python server's drain() does, so this
+  // is shorter there, and "lisa" longer); "lisa": from then until its ACK
+  // is here; "server": this page, before the next frame.  Clean chunks
+  // only: not retries, not the end-of-file chunk.
+
+  timingReset() { this.timing = {}; this.tReply = null; }
+
+  timingAdd(key, ms) {
+    const t = this.timing[key];
+    this.timing[key] = t ? [t[0] + 1, t[1] + ms, Math.min(t[2], ms), Math.max(t[3], ms)]
+      : [1, ms, ms, ms];
+    return ` ${key} ${Math.round(ms)} ms`;
+  }
+
+  sayTiming() {
+    const out = [];
+    let count = 0;
+    for (const [key, label] of [["write", "the frame handed to the port"],
+      ["lisa", "the Lisa until its ACK"], ["server", "this page"]]) {
+      const t = this.timing[key];
+      if (!t) continue;
+      count = Math.max(count, t[0]);
+      out.push(`${label} ${Math.round(t[1] / t[0])} ms (${Math.round(t[2])}-${Math.round(t[3])})`);
+    }
+    if (out.length) this.log.say(`  per chunk (${count} chunks): ${out.join(", ")}`);
   }
 
   // DELETE <name>: delete one file (the client has asked the user first).
@@ -630,6 +713,7 @@ export class LisaFtpServer {
     if (text) data = lisaPages(data);
     const size = data.length;
     this.log.progressStart(size);
+    this.timingReset();
     const t0 = performance.now();
     await this.sendLine("OK " + size);
 
@@ -676,7 +760,8 @@ export class LisaFtpServer {
       const secs = (performance.now() - t0) / 1000;
       const what = text ? ` (${size / TEXT_PAGE} Lisa text pages)` : "";
       this.log.say(`  ok: sent ${size} bytes of ${name}${what}, verified (crc ${mycrc})`
-        + (secs > 0 ? `, ${Math.round(size / secs)} bytes/s` : ""));
+        + (secs > 0 ? ` in ${secs.toFixed(1)} s (${Math.round(size / secs)} bytes/s)` : ""));
+      this.sayTiming();
     } else {
       this.log.say(`  FAILED: verify: the client got ${JSON.stringify(line)}, we sent ${size} ${mycrc}`);
     }
@@ -704,7 +789,10 @@ export class LisaFtpServer {
       : `chunk ${seq}: end-of-file chunk sent`;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const t0 = performance.now();
+      const prev = this.tReply;
       await this.port.write(frame);
+      const t1 = performance.now();          // handed to the port
       const tries = attempt > 1 ? ` (try ${attempt})` : "";
       let line, kind, num, nstale = 0;
       for (;;) {
@@ -716,7 +804,13 @@ export class LisaFtpServer {
       }
       if (kind !== null && seqBehind(num, wireSeq)) kind = null;
       if (kind === "A" && num === wireSeq) {
-        this.dlog(`${what}${tries} -> accepted (ACK)`);
+        const t2 = performance.now();
+        this.tReply = t2;
+        let tms = "";
+        if (attempt === 1 && payload.length)          // clean chunks only
+          tms = this.timingAdd("write", t1 - t0) + this.timingAdd("lisa", t2 - t1)
+            + (prev !== null ? this.timingAdd("server", t0 - prev) : "");
+        this.dlog(`${what}${tries} -> accepted (ACK)${tms}`);
         this.log.progress(true, payload.length);
         return true;
       }
@@ -758,7 +852,9 @@ export class LisaFtpServer {
     // rate, after BAUD; there is no BAUD here yet, so an unknown line is
     // just answered ERR 99, as there.)
     if (cmd === "NEXT") return;                  // a late NEXT: nothing to answer
-    this.log.say("> " + line);
+    // bench marks: cmdMark reports them, and their 'bench: ...' lines
+    // belong together (no '> MARK', no empty line between them)
+    if (cmd !== "MARK") this.log.say("> " + line);
     const serve = {
       HELLO: () => this.cmdHello(),
       DEBUG: a => this.cmdDebug(a),
@@ -768,6 +864,10 @@ export class LisaFtpServer {
       PUT: a => this.cmdPut(a),
       DELETE: a => this.cmdDelete(a),
       LIST: a => this.cmdList(a),
+      CAL: () => this.cmdCal(),
+      MARK: a => this.cmdMark(a),
+      ECHO: a => this.cmdEcho(a),
+      FRAMES: a => this.cmdFrames(a),
     }[cmd];
     try {
       if (serve) await serve(parts.slice(1));
@@ -786,6 +886,8 @@ export class LisaFtpServer {
       } else {
         throw e;
       }
+    } finally {
+      if (cmd !== "MARK") this.log.say("");   // the commands stand apart
     }
   }
 
@@ -804,7 +906,6 @@ export class LisaFtpServer {
         if (!(e instanceof ClientQuit)) throw e;
         this.log.say("waiting for a new client");
       }
-      this.log.say("");
     }
   }
 

@@ -2,21 +2,27 @@
 //
 // A JavaScript port of the parts of src/server/LisaSerialFtpServer.py that
 // the prototype needs: HELLO, DEBUG (the client sends it right after
-// HELLO), QUIT, GET (binary and text), SUM (get -c) and LIST (ls).  Every
-// other command is answered "ERR 99 unknown command".  Names, constants and behaviour follow the
-// Python server, so its docstrings (and TECHNICAL.md) explain this code
-// too; keep the two in step.
+// HELLO), QUIT, GET (binary and text), SUM (get -c), LIST (list), PUT and
+// DELETE.  Every other command is answered "ERR 99 unknown command".
+// Names, constants and behaviour follow the Python server, so its
+// docstrings (and TECHNICAL.md) explain this code too; keep the two in
+// step.
 //
 // It knows nothing about the browser: the serial port and the file source
 // are passed in (see serial.js and sources.js), so the same code runs in
 // Node with a fake port (tests/test_protocol.mjs).
 //
-//   port:   { read(n, timeoutMs) -> Promise<Uint8Array>  (rejects with
-//             TimeoutError if fewer than n bytes came),
+//   port:   { baud, read(n, timeoutMs) -> Promise<Uint8Array>  (rejects
+//             with TimeoutError if fewer than n bytes came),
 //             write(bytes) -> Promise, flushInput() }
 //   source: { label, readFile(name) -> Promise<Uint8Array>,
 //             list(dir) -> Promise<[{ name, size, isDir }]>  (dir '' is
-//             the top; both throw ProtocolError for a bad or missing name) }
+//             the top),
+//             writable  (false: PUT and DELETE get ERR 20),
+//             openWrite(name) -> Promise<{ write(bytes), commit(), abort() }>
+//               (nothing changes under name until commit()),
+//             deleteFile(name) -> Promise;
+//             all throw ProtocolError for a bad or missing name) }
 //   log:    { say(text), debug(text), progress(ok, nbytes), progressStart(total) }
 
 export const VERSION = "v1.0";
@@ -36,6 +42,8 @@ export const T_FRAME = 15000;
 export const T_REPLY = 10000;
 export const LINE_GAP = 5000;
 export const T_COMMAND = 15000;     // the Python server's --timeout default
+export const T_BLOCK = 1000;        // mid-chunk bytes (receiver)
+export const T_QUIET = 300;         // discard-until-quiet (receiver)
 
 export class TimeoutError extends Error {
   constructor(msg = "timeout") { super(msg); this.name = "TimeoutError"; }
@@ -376,6 +384,234 @@ export class LisaFtpServer {
     return false;
   }
 
+  // DELETE <name>: delete one file (the client has asked the user first).
+  // Never a folder.
+  async cmdDelete(args) {
+    if (!this.source.writable) throw new ProtocolError(20, "server is read-only");
+    if (args.length !== 1) throw new ProtocolError(1, "usage: DELETE name");
+    const name = this.remoteName(args[0]);
+    await this.source.deleteFile(name);
+    await this.sendLine("OK deleted");
+    this.log.say("  ok: deleted " + name);
+  }
+
+  // PUT <name> <size>: receive the file.  It goes into the source's
+  // openWrite() (in the browser, createWritable()'s hidden swap file), and
+  // replaces <name> only once the client has verified it: until then an
+  // older file of that name is untouched, and a failed upload leaves
+  // nothing behind -- as the Python server's '<name>.part'.  Opened before
+  // the OK, so a name the browser refuses is an error reply.
+  async cmdPut(args) {
+    if (!this.source.writable) throw new ProtocolError(20, "server is read-only");
+    if (args.length < 2 || !/^\d+$/.test(args[1]))
+      throw new ProtocolError(1, "usage: PUT name size");
+    const name = this.remoteName(args[0]);
+    const size = Number(args[1]);
+    if (size > MAX_FILE) throw new ProtocolError(4, "file too big");
+    const out = await this.source.openWrite(name);
+    let kept = false;
+    try {
+      kept = await this.putInto(out, name, size);
+    } finally {
+      if (!kept) {
+        try { await out.abort(); } catch {}
+        this.dlog("partial upload discarded");
+      }
+    }
+  }
+
+  // PUT, once out is open: receive the chunks into it, check them with the
+  // client, and on success commit it.  TRUE if the file was kept.
+  async putInto(out, name, size) {
+    this.log.progressStart(size);
+    const t0 = performance.now();
+    await this.sendLine("OK");
+    let seq = 0, crc = 0xFFFF, total = 0, fails = 0, giveup = false;
+    try {
+      for (;;) {
+        const got = await this.recvChunk(seq);
+        if (got.kind === "fail") {
+          this.log.say("  FAILED: the client aborted: " + got.line);
+          await this.port.write(toWire("OK\r\n"));
+          return false;
+        }
+        if (got.kind === "dup") {
+          this.dlog(`chunk ${got.seq}: received again (our ACK was lost) -> ACK again`);
+          await this.ack(got.seq);
+        } else if (got.kind === "bad") {
+          this.dlog(`chunk ${seq}: ${got.why}`);
+          this.log.progress(false, 0);
+          if (got.discard) await this.discardUntilQuiet();
+        }
+        if (got.kind !== "ok") {
+          if (++fails >= MAX_RETRIES) { giveup = true; break; }
+          if (got.kind === "bad") await this.nak(seq);   // the client sends it again
+          continue;
+        }
+        const payload = got.payload;
+        await this.ack(seq);
+        this.dlog(payload.length
+          ? `chunk ${seq}: ${payload.length} bytes received, CRC ok -> ACK`
+          : `chunk ${seq}: end-of-file chunk received -> ACK`);
+        this.log.progress(true, payload.length);
+        fails = 0;
+        if (!payload.length) break;
+        await out.write(payload);
+        crc = crc16(payload, crc);
+        total += payload.length;
+        seq++;
+      }
+    } catch (e) {
+      if (e instanceof PeerRestarted) { await this.peerRestarted(); return false; }
+      throw e;
+    }
+    if (giveup) { await this.abort("too many chunk errors"); return false; }
+    let done = `DONE ${total} ${hex4(crc)}`;
+    if (total !== size) {
+      // the CRC only covers what arrived: a short file must not pass
+      this.log.say(`  FAILED: the client announced ${size} bytes, ${total} arrived`);
+      done = `ERR 5 size mismatch: announced ${size}, received ${total}`;
+    }
+    await this.sendLine(done);
+    // the client answers OK/BAD with ITS numbers: keep the file only on OK
+    // with the numbers we received
+    const verdict = await this.readVerdict(seq, done);
+    const p = (verdict || "").split(/\s+/).filter(Boolean);
+    const good = p.length === 3 && p[0] === "OK" && /^\d+$/.test(p[1])
+      && Number(p[1]) === total && p[2].toLowerCase() === hex4(crc);
+    if (good && total === size) {
+      try {
+        await out.commit();
+      } catch (e) {
+        this.log.say(`  FAILED: cannot save ${name}: ${e.message}`);
+        return false;
+      }
+      const secs = (performance.now() - t0) / 1000;
+      this.log.say(`  ok: received ${total} bytes into ${name}, verified (crc ${hex4(crc)})`
+        + (secs > 0 ? `, ${Math.round(total / secs)} bytes/s` : ""));
+      return true;
+    }
+    if (good) this.log.say("  upload discarded (size mismatch)");
+    else {
+      this.log.say(`  FAILED: verify: the client said ${JSON.stringify(verdict)}, we received`
+        + ` ${total} ${hex4(crc)}; upload discarded`);
+      if (verdict === "HELLO") await this.peerRestarted();
+    }
+    return false;
+  }
+
+  // Timeout for n bytes of a frame that has started: T_BLOCK plus twice
+  // their time on the wire, or at the Lisa's own sending speed (~2700
+  // bytes/s) if that is slower.
+  tBlock(n) {
+    const rate = Math.min((this.port.baud || 57600) / 10, 2700);
+    return T_BLOCK + 2000 * n / rate;
+  }
+
+  async readOr(n, timeoutMs) {
+    try {
+      return await this.port.read(n, timeoutMs);
+    } catch (e) {
+      if (e instanceof TimeoutError) return null;
+      throw e;
+    }
+  }
+
+  // PUT: read one framed chunk, the one numbered seq, and check it:
+  //   { kind: "ok", payload }        chunk seq, CRC good (an empty payload
+  //                                  is the end-of-file chunk)
+  //   { kind: "dup", seq }           an earlier chunk again
+  //   { kind: "bad", why, discard }  no good chunk (discard: bytes of a bad
+  //                                  frame may still be arriving)
+  //   { kind: "fail", line }         the client's FAIL line
+  // Throws PeerRestarted on a HELLO where a chunk should start.
+  async recvChunk(seq) {
+    const first = await this.readOr(1, T_FRAME);
+    if (!first) return { kind: "bad", why: `nothing arrived within ${T_FRAME / 1000} s -> NAK`, discard: false };
+    const b = first[0];
+    const outOfStep = { kind: "bad", discard: true,
+      why: `byte 0x${b.toString(16).padStart(2, "0")} where a chunk should start (out of step) -> discard, NAK` };
+    if (b === 0x48) {                                  // 'H': HELLO?
+      const rest = await this.readOr(4, T_BLOCK);
+      if (rest && fromWire(rest) === "ELLO") throw new PeerRestarted();
+      return outOfStep;
+    }
+    if (b === 0x46) {                                  // 'F': FAIL?
+      const line = "F" + await this.readRestOfLine();
+      return line.startsWith("FAIL") ? { kind: "fail", line } : outOfStep;
+    }
+    if (b !== 0x54) return outOfStep;                  // not 'T'
+    const head = await this.readOr(4, T_BLOCK);
+    if (!head) return { kind: "bad", why: "incomplete (bytes lost) -> discard, NAK", discard: true };
+    const gotSeq = (head[0] << 8) | head[1];
+    const gotLen = (head[2] << 8) | head[3];
+    if (gotLen > CHUNK)
+      return { kind: "bad", why: `impossible length ${gotLen} (out of step) -> discard, NAK`, discard: true };
+    const payload = gotLen ? await this.readOr(gotLen, this.tBlock(gotLen)) : new Uint8Array(0);
+    const crcBytes = payload && await this.readOr(2, T_BLOCK);
+    if (!crcBytes) return { kind: "bad", why: "incomplete (bytes lost) -> discard, NAK", discard: true };
+    const all = new Uint8Array(4 + gotLen);
+    all.set(head);
+    all.set(payload, 4);
+    const gotCrc = (crcBytes[0] << 8) | crcBytes[1];
+    const calc = crc16(all);
+    const wireSeq = seq % SEQ_MOD;
+    if (seqBehind(gotSeq, wireSeq)) return { kind: "dup", seq: gotSeq };
+    let why;
+    if (gotSeq !== wireSeq) why = `chunk ${gotSeq} arrived, expected ${seq}`;
+    else if (gotCrc !== calc) why = `bad CRC (received ${hex4(gotCrc)}, computed ${hex4(calc)})`;
+    else return { kind: "ok", payload };
+    return { kind: "bad", why: `rejected, ${why} -> NAK`, discard: true };
+  }
+
+  // The rest of a CRLF line whose first byte was read: '' on a timeout.
+  async readRestOfLine() {
+    const buf = [];
+    while (buf.length < MAX_IN_LINE) {
+      const b = await this.readOr(1, T_BLOCK);
+      if (!b || b[0] === 10) break;
+      if (b[0] !== 13) buf.push(b[0]);
+    }
+    return fromWire(Uint8Array.from(buf));
+  }
+
+  // After a bad chunk: drop the bytes still arriving until the line is
+  // quiet (the client waits for our reply, so they are the bad frame's).
+  async discardUntilQuiet() {
+    let n = 0;
+    while (n < 2 * (CHUNK + 7) && await this.readOr(1, T_QUIET)) n++;
+    if (n) this.dlog(`discarded ${n} stray byte(s)`);
+  }
+
+  async ack(seq) { await this.port.write(toWire(`A ${seq % SEQ_MOD}\r\n`)); }
+  async nak(seq) { await this.port.write(toWire(`N ${seq % SEQ_MOD}\r\n`)); }
+
+  // PUT: the client's OK/BAD after our DONE.  If it sends the end-of-file
+  // chunk (eofseq) again instead -- our ACK and DONE were lost -- ACK it
+  // and resend DONE rather than reading the frame as a garbled verdict.
+  async readVerdict(eofseq, done) {
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      const first = await this.readOr(1, T_COMMAND);
+      if (!first) return null;
+      if (first[0] !== 0x54) {
+        const line = (fromWire(first) + await this.readRestOfLine()).replace(/\r$/, "");
+        this.dlog("received: " + line);
+        return line;
+      }
+      const rest = await this.readOr(6, T_BLOCK);      // seq, length 0, CRC
+      if (rest && ((rest[0] << 8) | rest[1]) === eofseq % SEQ_MOD && rest[2] === 0 && rest[3] === 0
+          && ((rest[4] << 8) | rest[5]) === crc16(rest.subarray(0, 4))) {
+        this.dlog(`chunk ${eofseq}: end-of-file chunk received again -> ACK and DONE again`);
+        await this.ack(eofseq);
+        await this.sendLine(done);
+      } else {
+        this.dlog("unexpected bytes instead of the verdict -> discarded");
+        await this.discardUntilQuiet();
+      }
+    }
+    return null;
+  }
+
   // a name from the wire, decoded and checked (the source checks '..')
   remoteName(s) {
     const name = nameFromWire(s.trim());
@@ -529,6 +765,8 @@ export class LisaFtpServer {
       QUIT: () => this.cmdQuit(),
       GET: a => this.cmdGet(a),
       SUM: a => this.cmdSum(a),
+      PUT: a => this.cmdPut(a),
+      DELETE: a => this.cmdDelete(a),
       LIST: a => this.cmdList(a),
     }[cmd];
     try {

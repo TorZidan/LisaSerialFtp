@@ -46,6 +46,7 @@ function makeLink() {
       if (b) toClient.push(Uint8Array.from(b));
     },
     flushInput: () => toServer.flush(),
+    baud: 57600,
   };
   return link;
 }
@@ -76,6 +77,69 @@ class FakeLisa {
     all.set(data, 4);
     return { seq, data: Uint8Array.from(data), crcOk: crc16(all) === crc };
   }
+  sendFrame(seq, data, spoil = false) {
+    const f = new Uint8Array(7 + data.length);
+    f[0] = 0x54; f[1] = seq >> 8; f[2] = seq & 0xFF;
+    f[3] = data.length >> 8; f[4] = data.length & 0xFF;
+    f.set(data, 5);
+    const crc = crc16(f.subarray(1, 5 + data.length));
+    f[5 + data.length] = crc >> 8; f[6 + data.length] = crc & 0xFF;
+    if (spoil) f[5] ^= 0xFF;                  // a data byte (or the CRC)
+    this.sendRaw(f);
+  }
+
+  // the client side of a PUT.  opts:
+  //   spoil: Set of chunks whose first try is corrupted (the server NAKs)
+  //   loseAck: Set of chunks whose first ACK is "lost": sent again
+  //   failAfter: send FAIL instead of this chunk
+  //   loseDone: the DONE is "lost": the end-of-file chunk is sent again
+  //   verdict: what to answer instead of the right OK
+  //   announce: the size named in the PUT line, if not the real one
+  async put(name, data, opts = {}) {
+    const { spoil = new Set(), loseAck = new Set() } = opts;
+    this.send(`PUT ${name} ${opts.announce ?? data.length}`);
+    const ok = await this.line();
+    if (ok !== "OK") return { reply: ok };
+    let seq = 0;
+    for (let off = 0; ; off += CHUNK, seq++) {
+      const chunk = data.subarray(off, Math.min(off + CHUNK, data.length));
+      if (opts.failAfter === seq) {
+        this.send("FAIL cancelled by the user");
+        const failReply = await this.line();
+        await this.sync();
+        return { failReply };
+      }
+      this.sendFrame(seq, chunk, spoil.delete(seq));
+      for (;;) {
+        const r = await this.line(20000);
+        if (r === `N ${seq}`) { this.sendFrame(seq, chunk); continue; }
+        if (r !== `A ${seq}`) return { reply: r };
+        if (loseAck.delete(seq)) { this.sendFrame(seq, chunk); continue; }   // the server re-ACKs
+        break;
+      }
+      if (!chunk.length) break;
+    }
+    let done = await this.line();
+    if (opts.loseDone) {
+      this.sendFrame(seq, new Uint8Array(0));
+      const a = await this.line();
+      done = await this.line();
+      if (a !== `A ${seq}`) return { reply: a };
+    }
+    const crc = crc16(data).toString(16).padStart(4, "0");
+    this.send(opts.verdict ?? (done === `DONE ${data.length} ${crc}` ? done.replace("DONE", "OK") : "BAD"));
+    await this.sync();
+    return { done };
+  }
+
+  // wait until the server has finished the last command (it has served
+  // this HELLO, so it is back in its command loop)
+  async sync() {
+    this.send("HELLO");
+    const b = await this.line();
+    if (!b.startsWith("Hi from")) throw new Error("sync: " + b);
+  }
+
   // the client side of a LIST: the entry lines, answering NEXT to MORE.
   // stopAt: send this line instead of NEXT at the first MORE
   async list(dir = "", stopAt = null) {
@@ -139,6 +203,21 @@ function memorySource(files) {
       if (!f) throw new ProtocolError(11, "no such file on server: " + name);
       return f;
     },
+    writable: true,
+    async openWrite(name) {
+      const key = splitName(name).join("/");
+      const parts = [];
+      return {
+        write: async b => { parts.push(...b); },
+        commit: async () => { files[key] = Uint8Array.from(parts); },
+        abort: async () => {},
+      };
+    },
+    async deleteFile(name) {
+      const key = splitName(name).join("/");
+      if (!files[key]) throw new ProtocolError(11, "no such file on server: " + name);
+      delete files[key];
+    },
     async list(name) {
       const pre = splitName(name, true).join("/");
       const top = pre ? pre + "/" : "";
@@ -193,8 +272,8 @@ lisa.send("HELLO");
 check((await lisa.line()).startsWith("Hi from"), "HELLO -> banner");
 lisa.send("DEBUG OFF");
 check(await lisa.line() === "OK debug off", "DEBUG OFF -> OK debug off");
-lisa.send("DELETE x");
-check(await lisa.line() === "ERR 99 unknown command", "DELETE -> ERR 99 (not in the prototype yet)");
+lisa.send("CAL");
+check(await lisa.line() === "ERR 99 unknown command", "CAL -> ERR 99 (not in the prototype yet)");
 
 for (const name of ["empty.bin", "one.bin", "big.bin"]) {
   const r = await lisa.get(name);
@@ -326,6 +405,76 @@ check((await lisa.line()).startsWith("ERR 1 usage"), "GET with 3 arguments -> ER
   await lisa.frame();
   lisa.send("HELLO");
   check((await lisa.line()).startsWith("Hi from"), "HELLO mid-transfer -> a fresh banner");
+}
+
+// PUT
+const same = (a, b) => a && b && a.length === b.length && a.every((x, i) => x === b[i]);
+{
+  const up = randomBytes(CHUNK * 3 + 7, 3);
+  const r = await lisa.put("up/new.bin", up);
+  check(r.done && same(files["up/new.bin"], up), `PUT of ${up.length} bytes: ${r.done}, stored`);
+}
+{
+  const up = randomBytes(CHUNK * 2, 4);
+  const r = await lisa.put("up/new.bin", up, { spoil: new Set([0, 2]), loseAck: new Set([1]) });
+  check(r.done && same(files["up/new.bin"], up),
+    "PUT over a file, with corrupted chunks (NAK) and a lost ACK (re-ACK)");
+}
+{
+  const up = randomBytes(500, 5);
+  const r = await lisa.put("up/lostdone.bin", up, { loseDone: true });
+  check(r.done && same(files["up/lostdone.bin"], up),
+    "PUT with a lost DONE: the end-of-file chunk again -> ACK and DONE again");
+}
+{
+  const old = files["up/new.bin"];
+  const r = await lisa.put("up/new.bin", randomBytes(3000, 6), { failAfter: 1 });
+  check(r.failReply === "OK" && files["up/new.bin"] === old, "PUT aborted by the client: OK, the old file kept");
+}
+{
+  const old = files["up/new.bin"];
+  const r = await lisa.put("up/new.bin", randomBytes(100, 7), { verdict: "BAD 100 0000" });
+  check(r.done && files["up/new.bin"] === old, "PUT with a BAD verdict: the old file kept");
+}
+{
+  const r = await lisa.put("up/short.bin", randomBytes(100, 8), { announce: 200 });
+  check(r.done && r.done.startsWith("ERR 5 size mismatch") && !files["up/short.bin"],
+    "PUT with fewer bytes than announced: ERR 5, not stored");
+}
+{
+  const r = await lisa.put("empty-up.bin", new Uint8Array(0));
+  check(r.done === "DONE 0 ffff" && same(files["empty-up.bin"], new Uint8Array(0)), "PUT of an empty file");
+}
+lisa.send("PUT x.bin");
+check((await lisa.line()).startsWith("ERR 1 usage"), "PUT without a size -> ERR 1 usage");
+lisa.send("PUT ../x.bin 5");
+check(await lisa.line() === "ERR 2 bad name", "PUT ../x -> ERR 2 bad name");
+
+// DELETE
+lisa.send("DELETE empty-up.bin");
+check(await lisa.line() === "OK deleted" && !("empty-up.bin" in files), "DELETE a file -> OK deleted");
+lisa.send("DELETE empty-up.bin");
+check((await lisa.line()).startsWith("ERR 11 "), "DELETE a missing file -> ERR 11");
+lisa.send("DELETE");
+check((await lisa.line()).startsWith("ERR 1 usage"), "DELETE without a name -> ERR 1 usage");
+
+// a read-only source
+{
+  const ro = makeLink();
+  const src = memorySource({ "a.bin": new Uint8Array(3) });
+  src.writable = false;
+  const srv = new LisaFtpServer(ro.serverPort, src, quietLog);
+  const run2 = srv.run().catch(e => { if (!srv.stopped) throw e; });
+  const lisa2 = new FakeLisa(ro);
+  await lisa2.line();
+  lisa2.send("PUT b.bin 3");
+  const p = await lisa2.line();
+  lisa2.send("DELETE a.bin");
+  const d = await lisa2.line();
+  check(p === "ERR 20 server is read-only" && d === p, "read-only source: PUT and DELETE -> ERR 20");
+  srv.stop();
+  ro.toServer.fail(new Error("stopped"));
+  await run2;
 }
 
 lisa.send("QUIT");

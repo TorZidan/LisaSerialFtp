@@ -71,7 +71,10 @@ function setStatus(text, cls = "") {
 
 $("pickFolder").addEventListener("click", async () => {
   try {
-    folderHandle = await window.showDirectoryPicker({ mode: "read" });
+    // with uploads allowed, the browser asks for write access here (it
+    // must be asked during a click; Start's click is for the port picker)
+    folderHandle = await window.showDirectoryPicker({
+      mode: $("allowWrite").checked ? "readwrite" : "read" });
     $("folderName").textContent = folderHandle.name;
     document.querySelector('input[name=src][value=folder]').checked = true;
   } catch (e) {
@@ -79,11 +82,18 @@ $("pickFolder").addEventListener("click", async () => {
   }
 });
 
-function makeSource() {
+async function makeSource() {
   const kind = document.querySelector("input[name=src]:checked").value;
   if (kind === "folder") {
     if (!folderHandle) throw new Error("choose a folder first");
-    return new FolderSource(folderHandle);
+    let writable = false;
+    if ($("allowWrite").checked) {
+      writable = (await folderHandle.queryPermission({ mode: "readwrite" })) === "granted";
+      if (!writable)
+        log.say("no write access to the folder: put and delete are refused."
+          + " Choose the folder again to allow them.");
+    }
+    return new FolderSource(folderHandle, writable);
   }
   const url = $("baseUrl").value.trim();
   if (!/^https:\/\//i.test(url)) throw new Error("the address must start with https://");
@@ -93,7 +103,7 @@ function makeSource() {
 $("start").addEventListener("click", async () => {
   let source;
   try {
-    source = makeSource();
+    source = await makeSource();
   } catch (e) {
     log.say(e.message);
     return;
@@ -118,7 +128,7 @@ $("start").addEventListener("click", async () => {
   server.debugDefault = server.debugOn = $("debug").checked;
   $("start").disabled = true;
   $("stop").disabled = false;
-  setStatus(`running at ${port.baud} baud`, "ok");
+  setStatus(`running at ${port.baud} baud` + (source.writable ? "" : ", read only"), "ok");
   try {
     await server.run();
   } catch (e) {

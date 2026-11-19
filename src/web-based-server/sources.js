@@ -2,10 +2,13 @@
 //
 // A source turns a remote name ('docs/a.txt', already decoded from the
 // wire) into the file's bytes (readFile: GET, SUM) and a folder name into
-// its entries (list: LIST; '' is the top).  Two kinds:
+// its entries (list: LIST; '' is the top).  A writable one also takes
+// uploads (openWrite: PUT) and deletes files (deleteFile: DELETE); see
+// the source interface in protocol.js.  Two kinds:
 //   FolderSource -- a folder on this computer, picked with the File System
 //                   Access API (showDirectoryPicker; Chrome / Edge)
-//   WebSource    -- files on the web under a base URL, read with fetch().
+//                   Writable if the user allowed it.
+//   WebSource    -- files on the web (read only) under a base URL, read with fetch().
 //                   The web server must allow it (CORS); GitHub's
 //                   raw.githubusercontent.com does.  Web servers cannot
 //                   list a folder, so LIST uses the GitHub API for a
@@ -30,9 +33,78 @@ function noDir(name) {
 }
 
 export class FolderSource {
-  constructor(dirHandle) {
+  // writable: PUT and DELETE allowed (the page has readwrite permission)
+  constructor(dirHandle, writable = false) {
     this.dir = dirHandle;
     this.label = dirHandle.name;
+    this.writable = writable;
+  }
+
+  // the folder that holds name, and name's last part
+  async _parent(name) {
+    const parts = splitName(name);
+    let dir = this.dir;
+    try {
+      for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p);
+    } catch (e) {
+      if (e.name === "TypeError") throw new ProtocolError(2, "bad name");
+      throw new ProtocolError(10, "no such directory");
+    }
+    return [dir, parts[parts.length - 1]];
+  }
+
+  async _isFolder(dir, last) {
+    try { await dir.getDirectoryHandle(last); return true; } catch { return false; }
+  }
+
+  // PUT: createWritable() writes into a hidden swap file next to the file
+  // (Chrome: '<name>.crswap'), and only close() replaces the file with it;
+  // abort() throws it away.  getFileHandle(create) makes an empty file at
+  // once if there was none, so abort() removes that too: a failed upload
+  // leaves nothing behind.
+  async openWrite(name) {
+    const [dir, last] = await this._parent(name);
+    if (await this._isFolder(dir, last))
+      throw new ProtocolError(13, `cannot create ${name}: it is a folder`);
+    let existed = true;
+    try { await dir.getFileHandle(last); } catch { existed = false; }
+    let w;
+    try {
+      const fh = await dir.getFileHandle(last, { create: true });
+      w = await fh.createWritable({ keepExistingData: false });
+    } catch (e) {
+      if (!existed) { try { await dir.removeEntry(last); } catch {} }
+      if (e.name === "TypeError") throw new ProtocolError(2, "bad name");
+      if (e.name === "NotAllowedError")
+        throw new ProtocolError(13, `cannot create ${name}: no permission to write to the folder`);
+      throw new ProtocolError(13, `cannot create ${name}: ${e.message}`);
+    }
+    return {
+      write: bytes => w.write(bytes),
+      commit: () => w.close(),
+      abort: async () => {
+        try { await w.abort(); } catch {}
+        if (!existed) { try { await dir.removeEntry(last); } catch {} }
+      },
+    };
+  }
+
+  // DELETE: one file, never a folder
+  async deleteFile(name) {
+    const [dir, last] = await this._parent(name);
+    if (await this._isFolder(dir, last))
+      throw new ProtocolError(12, "is a folder, not deleted: " + name);
+    try {
+      await dir.getFileHandle(last);
+    } catch (e) {
+      if (e.name === "TypeError") throw new ProtocolError(2, "bad name");
+      throw new ProtocolError(11, "no such file on server: " + name);
+    }
+    try {
+      await dir.removeEntry(last);
+    } catch (e) {
+      throw new ProtocolError(13, `cannot delete ${name}: ${e.message}`);
+    }
   }
 
   async readFile(name) {
@@ -89,6 +161,7 @@ export class WebSource {
   constructor(baseUrl) {
     this.base = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
     this.label = this.base;
+    this.writable = false;
     const m = RAW_GITHUB.exec(this.base);
     this.github = m ? { owner: m[1], repo: m[2], ref: m[3], prefix: m[4] } : null;
   }

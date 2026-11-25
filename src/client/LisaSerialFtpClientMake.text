@@ -12,13 +12,20 @@ ${copy of this file, run the client and type}
 ${  get LisaSerialFtpClientMake.text}
 $
 ${Fetch the newest sources from the server with the current client}
-${(LisaSerialFtpServer.py must be running; get replaces the old files)}
+${(LisaSerialFtpServer.py must be running; get replaces the old files).}
+${The LisaSerialFtp*.text files are shared with the Office System client.}
 ${The server must share THIS folder (src/client of the repository): the}
 ${names below are relative to it.  E.g., in the repository folder:}
 ${  python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 --home_dir src/client}
 R{un}LisaSerialFtpClient.OBJ
 get -c tests/LisaSerialFtpTest.text LisaSerialFtpTest.text
 get -c LisaSerialFtpClientInclude.text
+get -c LisaSerialFtpDecl.text
+get -c LisaSerialFtpUtil.text
+get -c LisaSerialFtpSerial.text
+get -c LisaSerialFtpProto.text
+get -c LisaSerialFtpXfer.text
+get -c LisaSerialFtpCmds.text
 get -c LisaSerialFtpClientAsm.text
 get -c LisaSerialFtpClient.text
 quit
@@ -46,11 +53,5 @@ Y{es, delete it}
 D{elete}LisaSerialFtpClientAsm.OBJ
 Y{es, delete it}
 Q{uit}
-$
-{Upload the produced LisaSerialFtpClient.OBJ executable to the server.}
-R{un}LisaSerialFtpClient.OBJ
-put LisaSerialFtpClient.OBJ LisaSerialFtpClient.obj
-quit
-$DOIT
 $
 $ENDEXEC

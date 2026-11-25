@@ -1,0 +1,10 @@
+; LosSerialFtpClientAsm.text -- the 68000 routines of LosSerialFtpClient
+; (the Lisa Office System client): CRC16A, SUM16A, MOVEB and DECODEP.
+;
+; They are the same routines the Lisa Workshop client uses, so this file
+; only includes LisaSerialFtpClientAsm.text (keep both on the same
+; volume).  It is assembled to LosSerialFtpClientAsm.OBJ, the name
+; LosSerialFtpClientMake.text links; the object is the same as
+; LisaSerialFtpClientAsm.OBJ.
+
+        .INCLUDE LisaSerialFtpClientAsm.text

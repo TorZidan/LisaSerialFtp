@@ -259,9 +259,13 @@ test shell, `nwshell`):
 
 | Segment | Contents |
 |---|---|
-| blank (default) | the serial port routines, the CRC, the chunk protocol (`SendChunk`, `RecvChunk`, `ReadFrame`) and the main program: the code every transfer runs all the time |
-| `CmdSeg` | paging, `list`, `!list` and `!delete` (the whole include file [`LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text)), `help`, `baud`, port setup, the timeout-factor measurement, `hello`, `debug` and the other commands |
-| `XferSeg` | the `get` and `put` transfers (`DoGet`, `DoPut`) and the end-of-transfer verification |
+| blank (default) | the serial port routines (`LisaSerialFtpSerial.text`), the CRC and the chunk protocol (`SendChunk`, `RecvChunk`, `ReadFrame`: `LisaSerialFtpProto.text`) and the main program: the code every transfer runs all the time |
+| `CmdSeg` | paging, `!list`, `!delete` and `!volume` (the whole include file [`LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text)), `help`, port setup, and the server commands `list`, `baud`, the timeout-factor measurement, `hello`, `debug`, `delete` (`LisaSerialFtpCmds.text`) |
+| `XferSeg` | the `get` and `put` transfers (`DoGet`, `DoPut`), the end-of-transfer verification and the name helpers (`LisaSerialFtpXfer.text`) |
+
+The `LisaSerialFtp*.text` files are shared with the Office System client
+(`LosSerialFtpClient.text`), which includes them too, in segments of its
+own (`FtpProto`, `FtpXfer`, `FtpCmd`, ...).
 
 A `{$S CmdSeg  }` or `{$S XferSeg }` line in the source starts putting
 the following routines into that segment, and `{$S          }` (a blank

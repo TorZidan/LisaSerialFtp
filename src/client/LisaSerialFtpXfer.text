@@ -1,0 +1,1001 @@
+{****************************************************************************}
+{ LisaSerialFtpXfer.text -- the file transfer engine of both LisaSerialFtp   }
+{ clients: get, put and the -c check, .TEXT decoding, temp files and         }
+{ local names (ParseCmd .. PutCmd).                                          }
+{                                                                            }
+{ Included by both clients: LisaSerialFtpClient.text (Lisa Workshop) and     }
+{ LosSerialFtpClient.text (Lisa Office System), with the I directive         }
+{ (file inclusion).  NOT a standalone unit: no PROGRAM, no USES, no END.     }
+{                                                                            }
+{ Include it after LisaSerialFtpProto.text.  The including program must      }
+{ declare first: OpenText (create a Lisa .TEXT file), FullPath (a typed      }
+{ local name -> its pathname), AskYes, PageStart / PageMore, ReadyLink and   }
+{ DoHello (FORWARD is enough), and the constants TmpBin / TmpText (the       }
+{ temp file names of a get).                                                 }
+{****************************************************************************}
+
+procedure ParseCmd(LINE: Str255; var CMD, A, B: Str255);
+var j, n: integer;
+begin
+   CMD := ''; A := ''; B := '';
+   j := 1;
+   while (j <= length(LINE)) and (LINE[j] = ' ') do j := j + 1;
+   while (j <= length(LINE)) and (LINE[j] <> ' ') do begin
+      AddChar(CMD, LINE[j]);
+      j := j + 1;
+   end;
+   UpperStr(CMD);
+   while (j <= length(LINE)) and (LINE[j] = ' ') do j := j + 1;
+   while (j <= length(LINE)) and (LINE[j] <> ' ') do begin
+      AddChar(A, LINE[j]);
+      j := j + 1;
+   end;
+   while (j <= length(LINE)) and (LINE[j] = ' ') do j := j + 1;
+   n := length(LINE);
+   while (n >= j) and (LINE[n] = ' ') do n := n - 1;
+   if n >= j then B := copy(LINE, j, n - j + 1);
+end;
+
+function TakeFlags(var A, B: Str255): boolean;
+var u, x: Str255; more: boolean;
+begin
+   cFlag := false;
+   bFlag := false;
+   tFlag := false;
+   more := true;
+   while more do begin
+      u := A;
+      UpperStr(u);
+      more := (u = '-C') or (u = '-B') or (u = '-T');
+      if more then begin
+         if u = '-C' then cFlag := true
+         else if u = '-B' then bFlag := true
+         else tFlag := true;
+         ParseCmd(concat('X ', B), x, A, B);
+      end;
+   end;
+   TakeFlags := not (bFlag and tFlag);
+end;
+
+procedure BaseName(SRC: Str255; var DST: Str255);
+var j: integer;
+begin
+   j := length(SRC);
+   while (j > 0) and (SRC[j] <> '/') do j := j - 1;
+   if j = 0 then DST := SRC
+   else DST := copy(SRC, j + 1, length(SRC) - j);
+end;
+
+procedure LocalLeaf(SRC: Str255; var DST: Str255);
+var j: integer;
+begin
+   j := length(SRC);
+   while (j > 0) and (SRC[j] <> '-') do j := j - 1;
+   if j = 0 then DST := SRC
+   else DST := copy(SRC, j + 1, length(SRC) - j);
+end;
+
+procedure TmpNameOf(target: pathname; binary: boolean; var tmp: pathname);
+var j: integer; tStr, pfx: Str255;
+begin
+   tStr := target;
+   if binary then pfx := TmpBin
+   else pfx := TmpText;
+   j := length(tStr);
+   while (j > 1) and (tStr[j] <> '-') do j := j - 1;
+   if (j > 1) and (tStr[j] = '-') then
+      tmp := concat(copy(tStr, 1, j), pfx)
+   else
+      tmp := pfx;
+end;
+
+procedure LeafNameOf(src: pathname; var leaf: e_name);
+var j, n: integer; s: Str255;
+begin
+   s := src;
+   n := length(s);
+   j := n;
+   while (j > 1) and (s[j] <> '-') do j := j - 1;
+   if (j >= 1) and (s[j] = '-') and (j < n) then begin
+      if n - j > MaxEName then leaf := copy(s, j + 1, MaxEName)
+      else leaf := copy(s, j + 1, n - j);
+   end
+   else begin
+      if n > MaxEName then leaf := copy(s, 1, MaxEName)
+      else leaf := s;
+   end;
+end;
+
+function LeafLen(src: pathname): integer;
+var j, n: integer; s: Str255;
+begin
+   s := src;
+   n := length(s);
+   j := n;
+   while (j > 1) and (s[j] <> '-') do j := j - 1;
+   if (j >= 1) and (s[j] = '-') and (j < n) then LeafLen := n - j
+   else LeafLen := n;
+end;
+
+function IsTextName(name: Str255): boolean;
+var n: integer; ext: Str255;
+begin
+   n := length(name);
+   if n < 5 then IsTextName := false
+   else begin
+      ext := copy(name, n - 4, 5);
+      UpperStr(ext);
+      IsTextName := (ext = '.TEXT');
+   end;
+end;
+
+procedure StripExt(SRC: Str255; var DST: Str255);
+var j: integer;
+begin
+   j := length(SRC);
+   while (j > 0) and (SRC[j] <> '.') do j := j - 1;
+   if j <= 1 then DST := SRC
+   else DST := copy(SRC, 1, j - 1);
+end;
+
+function MatchesVer(V, W: Str255; N: longint; C: integer): boolean;
+var vw, va, vb, sn, sc: Str255;
+begin
+   ParseCmd(V, vw, va, vb);
+   UpperStr(vb);
+   IntToStr(N, sn);
+   IntToHex(C, sc);
+   MatchesVer := (vw = W) and (va = sn) and (vb = sc);
+end;
+
+function GetVerdict(E: longint; D: Str255; var V: Str255): boolean;
+var ch: char;
+    w, got, tries, c: integer;
+    h: array [1..6] of ByteT;
+    rs, cr, cu: longint;
+    r: Str255;
+begin
+   GetVerdict := false;
+   for tries := 1 to MaxRetry do begin
+      w := WaitChar(ch, TmoCmd, true);
+      if w <> WaitOK then begin
+         NoServer(w);
+         exit(GetVerdict);
+      end;
+      if ch <> 'T' then begin
+         V := '';
+         if ch <> chr(10) then begin
+            w := WaitLine(r, TmoLine, true);
+            if w = WaitAbt then begin
+               NoServer(w);
+               exit(GetVerdict);
+            end;
+            if ch = chr(13) then V := r
+            else begin
+               AddChar(V, ch);
+               V := concat(V, r);
+            end;
+         end;
+         ShowRx(V);
+         GetVerdict := true;
+         exit(GetVerdict);
+      end;
+      got := TryGetBlk(@h[1], 6, TmoBlock);
+      rs := ByteVal(h[1]);
+      rs := rs * 256 + ByteVal(h[2]);
+      cr := ByteVal(h[5]);
+      cr := cr * 256 + ByteVal(h[6]);
+      c := $FFFF;
+      Crc16(@h[1], 4, c);
+      cu := c;
+      if cu < 0 then cu := cu + 65536;
+      if (got = 6) and (rs = E) and (h[3] = 0) and (h[4] = 0) and (cu = cr) then begin
+         if debugOn then begin
+            ConWr('    chunk ');
+            ConWrNum(E);
+            ConWrLn(': EOF chunk repeated -> ACK and DONE again');
+         end;
+         SendACK(E);
+         SendLine(D);
+      end
+      else begin
+         if debugOn then ConWrLn('    unexpected bytes before verdict -> discarded');
+         DiscardQuiet;
+      end;
+   end;
+   ConWrLn('no verdict from the server');
+end;
+
+procedure TxFlush;
+begin
+   if xf.ok and (xf.len > 0) then begin
+      Crc16(@buf[1], xf.len, xf.crc);
+      xf.total := xf.total + xf.len;
+      if xf.mode = 2 then
+         Sum16(@buf[1], xf.len, xf.bsum)
+      else begin
+         xf.ok := SendChunk(xf.seq, @buf, xf.len);
+         if xf.ok then NextSeq(xf.seq);
+      end;
+   end;
+   xf.len := 0;
+end;
+
+procedure TxBytes(n: integer);
+var k, m: integer;
+begin
+   if xf.mode = 0 then
+      xf.size := xf.size + n
+   else if xf.mode = 2 then begin
+      Crc16(@dbuf[1], n, xf.crc);
+      Sum16(@dbuf[1], n, xf.bsum);
+      xf.total := xf.total + n;
+   end
+   else begin
+      k := 0;
+      while xf.ok and (k < n) do begin
+         m := ChunkSz - xf.len;
+         if m > n - k then m := n - k;
+         MoveBytes(@dbuf[k + 1], @buf[xf.len + 1], m);
+         xf.len := xf.len + m;
+         k := k + m;
+         if xf.len = ChunkSz then TxFlush;
+      end;
+   end;
+end;
+
+function TextPass(fref: integer): boolean;
+var n, pg, pe, p, at, dl: integer;
+    first, done: boolean;
+begin
+   TextPass := false;
+   xf.lines := 0;
+   first := true;
+   done := false;
+   repeat
+      if UserAbort then begin
+         xf.ok := false;
+         exit(TextPass);
+      end;
+      ecode := 0;
+      actual := 0;
+      BeginIO;
+      READ_DATA(ecode, fref, ord4(@big.pgbuf[1]), ReadBufSz, actual, sequential, 0);
+      EndIO;
+      if (ecode = 848) or (ecode = 881) or (ecode = 883) or (ecode = 956) then begin
+         ecode := 0;
+         done := true;
+      end;
+      if ecode > 0 then begin
+         ProgEnd;
+         ConWr('file read error: ');
+         ConWrNum(ecode);
+         ConNewLn;
+         exit(TextPass);
+      end;
+      n := actual;
+      if n = 0 then done := true;
+      pg := 0;
+      while xf.ok and (pg < n) do begin
+         pe := pg + TextPgSz;
+         if pe > n then pe := n;
+         if first then
+            first := false
+         else begin
+            p := 0;
+            at := 1;
+            repeat
+               dl := 0;
+               DECODEP(@big.pgbuf[pg + 1], pe - pg, p, at, @dbuf[1], DecMaxSz, dl, xf.lines);
+               if dl > 0 then TxBytes(dl);
+            until (p >= pe - pg) or (not xf.ok);
+         end;
+         pg := pg + TextPgSz;
+      end;
+   until done or (not xf.ok);
+   TextPass := true;
+end;
+
+function LocalSum(lname: pathname; binary, isget: boolean): boolean;
+var fref: integer; done: boolean;
+begin
+   LocalSum := false;
+   xf.crc := $FFFF;
+   xf.total := 0;
+   xf.bsum := 0;
+   xf.len := 0;
+   xf.ok := true;
+   xf.mode := 2;
+   ecode := 0;
+   BeginIO;
+   OPEN(ecode, lname, fref, [dread]);
+   EndIO;
+   if ecode > 0 then begin
+      if isget then ConWrLn('no local file to compare, so getting the file')
+      else ConWrLn('no local file');
+      exit(LocalSum);
+   end;
+   if binary then begin
+      done := false;
+      repeat
+         if UserAbort then xf.ok := false
+         else begin
+            ecode := 0;
+            actual := 0;
+            BeginIO;
+            READ_DATA(ecode, fref, ord4(@big.pgbuf[1]), ReadBufSz, actual, sequential, 0);
+            EndIO;
+            if (ecode = 848) or (ecode = 881) or (ecode = 883) or (ecode = 956) then begin
+               ecode := 0;
+               done := true;
+            end;
+            if ecode > 0 then begin
+               ConWr('file read error: ');
+               ConWrNum(ecode);
+               ConNewLn;
+               xf.ok := false;
+            end
+            else begin
+               if actual = 0 then done := true;
+               if actual > 0 then begin
+                  Crc16(@big.pgbuf[1], actual, xf.crc);
+                  Sum16(@big.pgbuf[1], actual, xf.bsum);
+                  xf.total := xf.total + actual;
+               end;
+            end;
+         end;
+      until done or (not xf.ok);
+   end
+   else begin
+      if not TextPass(fref) then xf.ok := false;
+      TxFlush;
+   end;
+   ecode := 0;
+   BeginIO;
+   CLOSE_OBJECT(ecode, fref);
+   EndIO;
+   LocalSum := xf.ok;
+end;
+
+procedure OutFlush(fref: integer);
+begin
+   if (opos > 0) and (opErr = 0) then begin
+      ecode := 0;
+      BeginIO;
+      WRITE_DATA(ecode, fref, ord4(@big.obuf[1]), opos, actual, absolute, ooff);
+      EndIO;
+      if ecode > 0 then opErr := ecode;
+      ooff := ooff + opos;
+   end;
+   opos := 0;
+end;
+
+function SameFile(rname: Str255; lname: pathname; binary, isget: boolean): boolean;
+var t1, t2, t3, want, ls: Str255; si: integer;
+begin
+   SameFile := false;
+   ls := lname;
+   ConWr(concat('-c: checking if ', ls, ' matches ... '));
+   if debugOn then ConNewLn;
+   if not LocalSum(lname, binary, isget) then exit(SameFile);
+   if binary then SendLine(concat('SUM ', rname, ' B'))
+   else SendLine(concat('SUM ', rname, ' T'));
+   if not GetResponse(srvReply) then exit(SameFile);
+   if (length(srvReply) = 0) or (srvReply[1] <> 'O') then begin
+      if pos('ERR 11 ', srvReply) = 1 then begin
+         if isget then ConWrLn('no copy on the server')
+         else ConWrLn('no copy on the server, so sending the file');
+      end
+      else
+         ConWrLn(concat('server: ', srvReply));
+      exit(SameFile);
+   end;
+   IntToStr(xf.total, t1);
+   IntToHex(xf.crc, t2);
+   if xf.bsum >= 32768 then si := xf.bsum - 65536 else si := xf.bsum;
+   IntToHex(si, t3);
+   want := concat('OK ', t1, ' ', t2, ' ', t3);
+   UpperStr(srvReply);
+   if srvReply = want then begin
+      SameFile := true;
+      if isget then ConWrLn('unchanged: local copy is the same -- not fetched')
+      else ConWrLn('unchanged: server copy is the same -- not sent');
+   end
+   else begin
+      ConWrLn('the two copies differ: transferring it');
+      if debugOn then ConWrLn(concat('    local: ', want, '  server: ', srvReply));
+   end;
+end;
+
+function OpenGetFile(lname: pathname; binary: boolean;
+                     var tmpname: pathname; var fref: integer): boolean;
+var ts: Str255;
+begin
+   OpenGetFile := false;
+   TmpNameOf(lname, binary, tmpname);
+   ts := tmpname;
+   ecode := 0;
+   BeginIO;
+   KILL_OBJECT(ecode, tmpname);
+   EndIO;
+   if binary then begin
+      ecode := 0;
+      BeginIO;
+      MAKE_FILE(ecode, tmpname, 0);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('cannot create ', ts, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         SendLine('FAIL cannot create the local file');
+         exit(OpenGetFile);
+      end;
+      ecode := 0;
+      BeginIO;
+      OPEN(ecode, tmpname, fref, [dwrite]);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('cannot open local file ', ts, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         SendLine('FAIL cannot open the local file');
+         exit(OpenGetFile);
+      end;
+      opos := 0;
+      ooff := 0;
+      opErr := 0;
+   end
+   else begin
+      if not OpenText(tmpname, fref) then begin
+         SendLine('FAIL cannot create the local file');
+         exit(OpenGetFile);
+      end;
+   end;
+   OpenGetFile := true;
+end;
+
+procedure EndGet(lname: pathname; binary: boolean; tmpname: pathname;
+                 fref: integer; eofseq: longint);
+var t1, t2, dline, ls, ts: Str255;
+    vok: boolean;
+    leaf: e_name;
+begin
+   ls := lname;
+   ts := tmpname;
+   if xf.ok then begin
+      OutFlush(fref);
+      if opErr > 0 then begin
+         ConWr('file write error: ');
+         ConWrNum(opErr);
+         ConNewLn;
+         xf.ok := false;
+      end;
+   end;
+   if xf.ok then begin
+      IntToStr(xf.total, t1);
+      IntToHex(xf.crc, t2);
+      dline := concat('DONE ', t1, ' ', t2);
+      SendLine(dline);
+      vok := false;
+      if GetVerdict(eofseq, dline, srvReply) then begin
+         vok := MatchesVer(srvReply, 'OK', xf.total, xf.crc);
+         if not vok then begin
+            ConWr('VERIFY FAILED: received ');
+            ConWrNum(xf.total);
+            ConWrLn(concat(' bytes, CRC ', t2, '; server says: ', srvReply));
+         end;
+      end;
+      ecode := 0;
+      BeginIO;
+      CLOSE_OBJECT(ecode, fref);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('error closing ', ts, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         ecode := 0;
+         BeginIO;
+         KILL_OBJECT(ecode, tmpname);
+         EndIO;
+         SetStatus('Transfer failed (close error)');
+         exit(EndGet);
+      end;
+      if not vok then begin
+         ecode := 0;
+         BeginIO;
+         KILL_OBJECT(ecode, tmpname);
+         EndIO;
+         ConWrLn(concat('get failed: ', ls, ' was not written'));
+         SetStatus('Transfer failed (verification mismatch)');
+         exit(EndGet);
+      end;
+      ecode := 0;
+      BeginIO;
+      KILL_OBJECT(ecode, lname);
+      LeafNameOf(lname, leaf);
+      RENAME_ENTRY(ecode, tmpname, leaf);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr('received ');
+         ConWrNum(xf.total);
+         ConWr(concat(' bytes, but rename to ', ls, ' failed: '));
+         ConWrNum(ecode);
+         ConWrLn(concat(' -- data in ', ts));
+         SetStatus('Rename failed after download');
+      end
+      else begin
+         xferfail := false;               { the only way a get succeeds }
+         if binary then begin
+            ConWr('received ');
+            ConWrNum(xf.total);
+            ConWr(' of ');
+            ConWrNum(xf.size);
+            ConWrLn(concat(' bytes into ', ls, ', verified (CRC ', t2, ')'));
+         end
+         else begin
+            ConWr('received ');
+            ConWrNum(xf.total div TextPgSz);
+            ConWrLn(concat(' pages of Lisa text into ', ls, ', verified (CRC ', t2, ')'));
+         end;
+         SetStatus(concat('Downloaded ', ls, ' (verified CRC ', t2, ')'));
+      end;
+   end
+   else begin
+      ecode := 0;
+      BeginIO;
+      CLOSE_OBJECT(ecode, fref);
+      ecode := 0;
+      KILL_OBJECT(ecode, tmpname);
+      EndIO;
+      AbortXfer('get aborted');
+      if aborted then begin
+         ConWrLn('transfer stopped (Apple-period)');
+         SetStatus('Download cancelled (Apple-period)');
+      end
+      else begin
+         ConWrLn('transfer failed');
+         SetStatus('Download failed');
+      end;
+   end;
+end;
+
+procedure DoGet(rname: Str255; lname: pathname; binary, skipsame: boolean);
+var fref, want: integer;
+    tmpname: pathname;
+    eofseq: longint;
+    ls: Str255;
+begin
+   ls := lname;
+   if binary then
+      ConWrLn(concat('get ', rname, ' -> ', ls, '  (byte-exact)'))
+   else
+      ConWrLn(concat('get ', rname, ' -> ', ls, '  (text file, line endings -> CR)'));
+   if skipsame then begin
+      if SameFile(rname, lname, binary, true) then begin
+         xferfail := false;
+         SetStatus(concat('Unchanged: ', ls, ' skipped'));
+         exit(DoGet);
+      end;
+      if aborted or (not connected) then exit(DoGet);
+   end;
+   SetStatus(concat('Downloading ', rname, ' -> ', ls, '  (Apple-. stops)'));
+   if binary then SendLine(concat('GET ', rname))
+   else SendLine(concat('GET ', rname, ' T'));
+   if not GetResponse(srvReply) then exit(DoGet);
+   if (length(srvReply) > 0) and (srvReply[1] <> 'O') then begin
+      ConWrLn(srvReply);
+      SetStatus(concat('Server: ', srvReply));
+      exit(DoGet);
+   end;
+   xf.size := StrToInt(copy(srvReply, 4, length(srvReply) - 3));
+   ProgStart(xf.size);
+   if not OpenGetFile(lname, binary, tmpname, fref) then begin
+      ProgEnd;
+      exit(DoGet);
+   end;
+   xf.seq := 0;
+   xf.crc := $FFFF;
+   xf.total := 0;
+   linkDead := false;
+   holdAck := true;
+   ackDue := false;
+   SendLine('GO');
+   repeat
+      eofseq := xf.seq;
+      if xf.size - xf.total >= ChunkSz then want := ChunkSz
+      else if xf.size - xf.total > 0 then want := xf.size - xf.total
+      else want := 0;
+      xf.ok := RecvChunk(xf.seq, xf.len, @buf[1], want);
+      if xf.ok then begin
+         if xf.len > 0 then
+            if opos + xf.len > WriteBlkSz then OutFlush(fref);
+         AckNow;
+         if xf.len > 0 then begin
+            MoveBytes(@buf[1], @big.obuf[opos + 1], xf.len);
+            opos := opos + xf.len;
+            if opErr > 0 then begin
+               ProgEnd;
+               ConWr('file write error: ');
+               ConWrNum(opErr);
+               ConNewLn;
+               xf.ok := false;
+            end;
+            if xf.ok then begin
+               Crc16(@buf[1], xf.len, xf.crc);
+               xf.total := xf.total + xf.len;
+            end;
+         end;
+      end;
+   until (not xf.ok) or (xf.len = 0);
+   holdAck := false;
+   ackDue := false;
+   ProgEnd;
+   EndGet(lname, binary, tmpname, fref, eofseq);
+end;
+
+function LooksText(lname: pathname): boolean;
+var fref, j, e, endp: integer; ls: Str255;
+begin
+   LooksText := false;
+   ls := lname;
+   ecode := 0;
+   BeginIO;
+   LOOKUP(ecode, lname, finfo);
+   EndIO;
+   if ecode > 0 then begin
+      ConWr(concat('cannot stat ', ls, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      exit(LooksText);
+   end;
+   if (finfo.size < TextPgSz) or (finfo.size mod TextPgSz <> 0) then begin
+      ConWr(concat(ls, ' is not a Lisa text file ('));
+      ConWrNum(finfo.size);
+      ConWrLn(' bytes, not whole 1024-byte pages)');
+      exit(LooksText);
+   end;
+   if finfo.size = TextPgSz then begin
+      LooksText := true;
+      exit(LooksText);
+   end;
+   ecode := 0;
+   BeginIO;
+   OPEN(ecode, lname, fref, [dread]);
+   EndIO;
+   if ecode > 0 then begin
+      ConWr(concat('cannot open local file ', ls, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      exit(LooksText);
+   end;
+   actual := 0;
+   BeginIO;
+   READ_DATA(ecode, fref, ord4(@big.pgbuf[1]), 2 * TextPgSz, actual, sequential, 0);
+   e := 0;
+   CLOSE_OBJECT(e, fref);
+   EndIO;
+   if actual <> 2 * TextPgSz then begin
+      ConWr(concat('cannot read ', ls, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      exit(LooksText);
+   end;
+   endp := 0;
+   j := TextPgSz + 1;
+   while (endp = 0) and (j < 2 * TextPgSz) do begin
+      if big.pgbuf[j] = 0 then j := 2 * TextPgSz
+      else if (big.pgbuf[j] = 13) and (big.pgbuf[j + 1] = 0) then endp := j + 1
+      else j := j + 1;
+   end;
+   if endp > 0 then begin
+      j := endp + 1;
+      while (j <= 2 * TextPgSz) and (endp > 0) do begin
+         if big.pgbuf[j] <> 0 then endp := 0;
+         j := j + 1;
+      end;
+   end;
+   if endp = 0 then
+      ConWrLn(concat(ls, ' is not a Lisa text file (pages are not lines of text)'))
+   else
+      LooksText := true;
+end;
+
+function PutSize(lname: pathname; binary: boolean): boolean;
+var fref: integer; vok: boolean; ls: Str255;
+begin
+   PutSize := false;
+   ls := lname;
+   xf.ok := true;
+   ecode := 0;
+   if binary then begin
+      BeginIO;
+      LOOKUP(ecode, lname, finfo);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('cannot stat ', ls, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         exit(PutSize);
+      end;
+      xf.size := finfo.size;
+   end
+   else begin
+      BeginIO;
+      OPEN(ecode, lname, fref, [dread]);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('cannot open local file ', ls, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         exit(PutSize);
+      end;
+      xf.mode := 0;
+      xf.size := 0;
+      vok := TextPass(fref);
+      ecode := 0;
+      BeginIO;
+      CLOSE_OBJECT(ecode, fref);
+      EndIO;
+      if (not vok) or (not xf.ok) then exit(PutSize);
+   end;
+   PutSize := true;
+end;
+
+procedure SendBinary(lname: pathname; fref: integer);
+var k, got: integer; ls: Str255;
+begin
+   ls := lname;
+   atEnd := false;
+   repeat
+      if UserAbort then xf.ok := false
+      else begin
+         ecode := 0;
+         actual := 0;
+         BeginIO;
+         READ_DATA(ecode, fref, ord4(@big.pgbuf[1]), 4 * ChunkSz, actual, sequential, 0);
+         EndIO;
+         if (ecode = 848) or (ecode = 881) or (ecode = 883) or (ecode = 956) then begin
+            ecode := 0;
+            atEnd := true;
+         end;
+         if ecode > 0 then begin
+            ProgEnd;
+            ConWr('file read error: ');
+            ConWrNum(ecode);
+            ConNewLn;
+            xf.ok := false;
+         end
+         else begin
+            got := actual;
+            if got = 0 then atEnd := true;
+            k := 0;
+            while xf.ok and (k < got) do begin
+               xf.len := got - k;
+               if xf.len > ChunkSz then xf.len := ChunkSz;
+               Crc16(@big.pgbuf[k + 1], xf.len, xf.crc);
+               xf.total := xf.total + xf.len;
+               xf.ok := SendChunk(xf.seq, @big.pgbuf[k + 1], xf.len);
+               if xf.ok then NextSeq(xf.seq);
+               k := k + xf.len;
+            end;
+         end;
+      end;
+   until (not xf.ok) or atEnd;
+   if xf.ok and (xf.total <> xf.size) then begin
+      ProgEnd;
+      ConWr('read ');
+      ConWrNum(xf.total);
+      ConWr(concat(' bytes of ', ls, ', expected '));
+      ConWrNum(xf.size);
+      ConNewLn;
+      xf.ok := false;
+   end;
+   if xf.ok then begin
+      xf.ok := SendChunk(xf.seq, @buf, 0);
+      if xf.ok then NextSeq(xf.seq);
+   end;
+end;
+
+procedure EndPut(lname: pathname; binary: boolean);
+var t1, t2, ls: Str255; vok, gotl: boolean;
+begin
+   ls := lname;
+   if xf.ok then begin
+      if eofDone then begin
+         srvReply := doneLine;
+         ShowRx(srvReply);
+         gotl := true;
+      end
+      else
+         gotl := GetSrvLine(srvReply);
+      if gotl then begin
+         vok := MatchesVer(srvReply, 'DONE', xf.total, xf.crc);
+         IntToStr(xf.total, t1);
+         IntToHex(xf.crc, t2);
+         if vok then SendLine(concat('OK ', t1, ' ', t2))
+         else SendLine(concat('BAD ', t1, ' ', t2));
+         if vok then begin
+            xferfail := false;            { the only way a put succeeds }
+            if binary then begin
+               ConWr('sent ');
+               ConWrNum(xf.total);
+               ConWrLn(concat(' bytes from ', ls, ', verified (CRC ', t2, ')'));
+            end
+            else begin
+               ConWr('sent ');
+               ConWrNum(xf.lines);
+               ConWr(' lines (');
+               ConWrNum(xf.total);
+               ConWrLn(concat(' bytes) from ', ls, ', verified (CRC ', t2, ')'));
+            end;
+            SetStatus(concat('Uploaded ', ls, ' (verified CRC ', t2, ')'));
+         end
+         else begin
+            ConWr('VERIFY FAILED: sent ');
+            ConWrNum(xf.total);
+            ConWrLn(concat(' bytes, CRC ', t2, '; server says: ', srvReply));
+            ConWrLn('put failed: server deletes its copy');
+            SetStatus('Upload failed (verification mismatch)');
+         end;
+      end;
+   end
+   else begin
+      AbortXfer('put aborted');
+      if aborted then begin
+         ConWrLn('transfer stopped (Apple-period)');
+         SetStatus('Upload cancelled (Apple-period)');
+      end
+      else begin
+         ConWrLn('transfer failed');
+         SetStatus('Upload failed');
+      end;
+   end;
+end;
+
+procedure DoPut(lname: pathname; rname: Str255; binary, skipsame: boolean);
+var fref: integer; t1, ls: Str255;
+begin
+   ls := lname;
+   if binary then
+      ConWrLn(concat('put ', ls, ' -> ', rname, '  (byte-exact)'))
+   else
+      ConWrLn(concat('put ', ls, ' -> ', rname, '  (text file, line endings -> LF)'));
+   if skipsame then begin
+      if SameFile(rname, lname, binary, false) then begin
+         xferfail := false;
+         SetStatus(concat('Unchanged: ', ls, ' skipped'));
+         exit(DoPut);
+      end;
+      if aborted or (not connected) then exit(DoPut);
+   end;
+   if not PutSize(lname, binary) then exit(DoPut);
+   SetStatus(concat('Uploading ', ls, ' -> ', rname, '  (Apple-. stops)'));
+   IntToStr(xf.size, t1);
+   ProgStart(xf.size);
+   SendLine(concat('PUT ', rname, ' ', t1));
+   if not GetResponse(srvReply) then begin
+      ProgEnd;
+      exit(DoPut);
+   end;
+   if (length(srvReply) > 0) and (srvReply[1] <> 'O') then begin
+      ProgEnd;
+      ConWrLn(srvReply);
+      SetStatus(concat('Server: ', srvReply));
+      exit(DoPut);
+   end;
+   ecode := 0;
+   BeginIO;
+   OPEN(ecode, lname, fref, [dread]);
+   EndIO;
+   if ecode > 0 then begin
+      ProgEnd;
+      ConWr(concat('cannot open local file ', ls, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      AbortXfer('put aborted');
+      exit(DoPut);
+   end;
+   xf.seq := 0;
+   linkDead := false;
+   eofDone := false;
+   xf.ok := true;
+   xf.crc := $FFFF;
+   xf.total := 0;
+   if binary then
+      SendBinary(lname, fref)
+   else begin
+      xf.mode := 1;
+      xf.len := 0;
+      if not TextPass(fref) then xf.ok := false;
+      TxFlush;
+      if xf.ok then begin
+         xf.ok := SendChunk(xf.seq, @buf, 0);
+         if xf.ok then NextSeq(xf.seq);
+      end;
+   end;
+   ProgEnd;
+   EndPut(lname, binary);
+   ecode := 0;
+   BeginIO;
+   CLOSE_OBJECT(ecode, fref);
+   EndIO;
+end;
+
+procedure GetCmd(a, b: Str255);
+var local: pathname;
+    remote, tname, sname: Str255;
+    j: integer;
+begin
+   xferfail := true;                      { until DoGet says it was verified }
+   if not TakeFlags(a, b) then
+      ConWrLn('get: -b (binary) and -t (text) cannot both be given')
+   else if a = '' then begin
+      ConWrLn('usage: get [-c] [-b | -t] <remote> [local]');
+      ConWrLn('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+   end
+   else begin
+      remote := a;
+      if b = '' then begin
+         BaseName(remote, tname);
+         if pos('-', tname) > 0 then begin
+            sname := tname;
+            for j := 1 to length(sname) do
+               if sname[j] = '-' then sname[j] := '_';
+            ConWrLn(concat('error: ', tname, ' has ''-'', which Lisa reads as a path separator'));
+            ConWrLn(concat('give a local name without ''-'', e.g.: get ', remote, ' ', sname));
+            exit(GetCmd);
+         end;
+         FullPath(tname, local);
+      end
+      else
+         FullPath(b, local);
+
+      if LeafLen(local) > MaxEName then begin
+         ConWr('error: Lisa file name is ');
+         ConWrNum(LeafLen(local));
+         ConWr(' chars (max ');
+         ConWrNum(MaxEName);
+         ConWrLn('): give a shorter local name');
+      end
+      else if tFlag or ((not bFlag) and (IsTextName(local) or IsTextName(remote))) then begin
+         tname := local;
+         if not IsTextName(tname) then begin
+            LocalLeaf(tname, sname);
+            StripExt(sname, sname);
+            ConWrLn('error: text downloads must use a .TEXT local filename, e.g.:');
+            ConWrLn(concat('  get ', remote, ' ', sname, '.TEXT   (or get -b for binary)'));
+         end
+         else if ReadyLink then
+            DoGet(remote, local, false, cFlag);
+      end
+      else if ReadyLink then
+         DoGet(remote, local, true, cFlag);
+   end;
+end;
+
+procedure PutCmd(a, b: Str255);
+var local: pathname; remote, locStr: Str255;
+begin
+   xferfail := true;                      { until DoPut says it was verified }
+   if not TakeFlags(a, b) then
+      ConWrLn('put: -b (binary) and -t (text) cannot both be given')
+   else if a = '' then begin
+      ConWrLn('usage: put [-c] [-b | -t] <local> [remote]');
+      ConWrLn('       (.TEXT: as text, else byte-exact; -b binary, -t text)');
+   end
+   else begin
+      FullPath(a, local);
+      locStr := local;
+      remote := b;
+      if remote = '' then LocalLeaf(locStr, remote);
+      if bFlag then begin
+         if ReadyLink then DoPut(local, remote, true, cFlag);
+      end
+      else if tFlag then begin
+         if LooksText(local) then
+            if ReadyLink then DoPut(local, remote, false, cFlag);
+      end
+      else if ReadyLink then
+         DoPut(local, remote, not IsTextName(locStr), cFlag);
+   end;
+end;

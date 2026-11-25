@@ -1,6 +1,6 @@
 # Lisa Serial FTP — file transfer between an Apple Lisa and a modern computer over a serial cable
 
-The client: a terminal-like Pascal-based program [**LisaSerialFtpClient.obj**](./src/client/LisaSerialFtpClient.obj) that runs in the Apple Lisa Workshop 3.0 development environment.
+The client: a terminal-like Pascal-based program **LisaSerialFtpClient.obj** (on the floppy disk image [`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42)) that runs in the Apple Lisa Workshop 3.0 development environment.
 All user interaction happens here. It supports downloading and uploading both text and binary files (note: the
 Lisa OS stores them differently), listing and deleting files on both sides. It
 transfers data in retryable chunks; every chunk is verified and, if needed,
@@ -42,8 +42,9 @@ floppy disk drive is named "LOWER", and the hard disk is "UPPER" in Workshop.
 Press `q` to exit to the main Workshop menu.
 
 * **Option 2**: Most people use a ProFile hardware emulator on their Lisa-s such as ESProfile (the most popular one) and others; the hard disk image files sit on a micro-SD card.
-Plug the SD card in your PC, and use the "copy" command of my [LisaFileSystemTool](https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files)
-to copy file [`LisaSerialFtpClient.obj`](src/client/LisaSerialFtpClient.obj) onto your desired disk image, then move the micro-SD card back into the ProFile hardware emulator.
+Plug the SD card in your PC, and use my [LisaFileSystemTool](https://github.com/TorZidan/LisaFileSystemTool#12-lisafilesystemtoolperfilepy---adding-replacing-deleting-and-getting-files)
+to copy file `LisaSerialFtpClient.obj` from the floppy disk image [`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42) onto your desired disk image
+(`get-binary` it from the floppy image, then `put` it onto the hard disk image), then move the micro-SD card back into the ProFile hardware emulator.
 
 * **Option 3**: Just copy the
   [profile-5MB-LOSAndWorkshop3-UseWith88iorom.image](./profile-5MB-LOSAndWorkshop3-UseWith88iorom.image)
@@ -210,8 +211,8 @@ Below is a sample client session.
 ```
 LisaSerialFtpClient v1.0 (build 2026-11-18 16:52)
 file transfer over RS232B at 57600 baud
-commands: list, !list, get, put, delete, !delete, baud, hello, timeout-factor,
-          debug, repeat, help, quit
+commands: list, !list, get, put, delete, !delete, !volume, baud, hello,
+          timeout-factor, debug, repeat, help, quit
 
 > help
 commands:
@@ -229,6 +230,8 @@ commands:
       -b: send as binary (byte-exact) / -t: send as a text file
   delete <remote>       delete a file on the server (asks Y/N); also del
   !delete <local>       delete a file on the Lisa (asks Y/N); also !del
+  !volume [<n> | -vol-] list the mounted Lisa volumes, or make one the
+                        working volume for local files; also !vol
   baud [rate]           show or change the baud rate, here and on the server
   hello                 (re-)send HELLO, wait for the server banner
   timeout-factor [<n> | auto]  show/set timeout multiplier (auto = measure)
@@ -305,6 +308,14 @@ The client app supports the following commands:
   Y/N confirmation (any other key is ignored). The server refuses to delete a
   folder, and nothing at all with `--read-only`.
 
+* **`!volume`** (or `!vol`) lists the mounted Lisa volumes (the working
+  volume first, then the built-in and attached disks: `-#12-`, `-#2#1-`,
+  `-UPPER-`, `-LOWER-`, ...), numbered, with their free blocks.
+  **`!volume <n>`** or **`!volume -name-`** makes that volume the working
+  volume, so local names without a volume (`!list`, `!delete`, `get`,
+  `put`) are on it.  This lasts until the client quits; the Workshop's own
+  working volume does not change.
+
 * **`list`** and **`!list`** list files on the server and locally.
   They paginate (stop) after every 30 lines with `Type SPACE to
   continue, CLEAR to exit`.
@@ -317,10 +328,19 @@ This step is needed only if you made changes to the client app and want to recom
 
 [`LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) is a plain Lisa Pascal console program (`USES syscall`),
 with a few small routines in 68000 assembly ([`LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text)).
-Assemble that file, compile the program, and link the two objects with
+Most of its code is shared with the Lisa Office System client (`LosSerialFtpClient.text`, the
+desktop tool "Serial FTP") and is in six files it includes with `{$I ...}`: `LisaSerialFtpDecl.text`,
+`LisaSerialFtpUtil.text`, `LisaSerialFtpSerial.text`, `LisaSerialFtpProto.text`,
+`LisaSerialFtpXfer.text` and `LisaSerialFtpCmds.text` (see [`src/client/README.md`](src/client/README.md)), so keep
+them on the same volume.
+Assemble the assembly file, compile the program, and link the two objects with
 `IOSPASLIB.OBJ`. It uses only stock OS file APIs (`OPEN`, `READ_DATA`,
 `WRITE_DATA`, `DEVICE_CONTROL`, `MAKE_FILE`, ... from the `syscall`
 unit).
+
+On a PC, [`src/client/make.sh`](src/client/make.sh) builds both clients with the
+[Lisa Pascal cross-compiler](https://github.com/TorZidan/LisaPascalCrossCompiler)
+(`./make.sh workshop` builds only this one, into `src/client/build/`).
 
 The Workshop macro / exec file [`LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) does all
 of it, after fetching the newest sources (which requires having a compiled `LisaSerialFtpClient.obj` on the
@@ -342,11 +362,14 @@ At the end, upon success, it will just exit to the Workshop main menu.
 |---|---|---|
 | [`src/server/LisaSerialFtpServer.py`](src/server/LisaSerialFtpServer.py) | Linux, macOS, Windows | serial **server**; shares a directory |
 | [`src/web-based-server/`](src/web-based-server) | Chrome / Edge ([live page](https://torzidan.github.io/LisaSerialFtp/src/web-based-server/)) | the same **server** as a web page (Web Serial); shares a folder or files on the web |
-| [`src/client/LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) | the Lisa (Lisa Pascal) | console **client**; talks to the built-in RS-232 driver |
-| [`src/client/LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text) | the Lisa (Lisa Pascal) | part of the client (`!list`, `!delete`), included with `{$I ...}`; keep it on the same volume |
-| [`src/client/LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text) | the Lisa (68000 assembly) | part of the client: CRC-16, byte sum, byte copy and the text decoder, 10-15 times faster than Pascal |
+| [`src/client/LisaSerialFtpClient.text`](src/client/LisaSerialFtpClient.text) | the Lisa (Lisa Pascal) | console **client** for the Workshop; talks to the built-in RS-232 driver |
+| [`src/client/LisaSerialFtpClientInclude.text`](src/client/LisaSerialFtpClientInclude.text) | the Lisa (Lisa Pascal) | part of the Workshop client (`!list`, `!delete`, `!volume`), included with `{$I ...}`; keep it on the same volume |
+| `src/client/LisaSerialFtp{Decl,Util,Serial,Proto,Xfer,Cmds}.text` | the Lisa (Lisa Pascal) | the code both clients share (the serial port, the CRC, the chunk protocol, `get`/`put`, the server commands), included with `{$I ...}`; keep them on the same volume |
+| [`src/client/LisaSerialFtpClientAsm.text`](src/client/LisaSerialFtpClientAsm.text) | the Lisa (68000 assembly) | part of both clients: CRC-16, byte sum, byte copy and the text decoder, 10-15 times faster than Pascal |
+| [`src/client/LosSerialFtpClient.text`](src/client/LosSerialFtpClient.text) | the Lisa Office System (Lisa Pascal) | the **Serial FTP** desktop tool: the same client with a window, menus and a progress bar (see [`src/client/README.md`](src/client/README.md)) |
+| [`src/client/make.sh`](src/client/make.sh) | Linux/macOS | builds both clients on a PC with the Lisa Pascal cross-compiler, and installs Serial FTP on `LisaSerialFtpClient.dc42` |
 | [`src/client/LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) | the Lisa (Workshop exec file) | fetches the client's sources with the current client (the server must share `src/client`), assembles, compiles and links the new one |
-| [`src/server/tests/*.py`](src/server/tests) | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks the client for Lisa Pascal's 8-character name limit |
+| [`src/server/tests/*.py`](src/server/tests) | Linux/macOS | Python tests of the server, with no hardware needed (each file starts with a description of what it tests); `audit_8char.py` checks both clients for Lisa Pascal's 8-character name limit (with the Lisa Pascal cross-compiler's `pascal/audit_8char.py`) |
 | [`src/client/tests/LisaSerialFtpTest.text`](src/client/tests/LisaSerialFtpTest.text) | the Lisa (Workshop exec file) | round-trip test on a real Lisa / LisaEm: get, put, get again, DIFF (the server must share `src/client`) |
 | [`src/client/tests/LisaSourceFilesGetAll.text`](src/client/tests/LisaSourceFilesGetAll.text) | the Lisa (Workshop exec file) | `get -c` of the 860 Lisa OS source files that LisaSourceCompilation's `upload_files.sh` uploads |
 

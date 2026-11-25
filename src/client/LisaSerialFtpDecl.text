@@ -1,0 +1,221 @@
+{****************************************************************************}
+{ LisaSerialFtpDecl.text -- the declarations both LisaSerialFtp clients      }
+{ share: the protocol constants, the transfer types, the serial/protocol     }
+{ engine's globals, and the 68000 assembly routines (EXTERNAL, in            }
+{ LisaSerialFtpClientAsm.text).                                              }
+{                                                                            }
+{ Included by both clients: LisaSerialFtpClient.text (Lisa Workshop) and     }
+{ LosSerialFtpClient.text (Lisa Office System), with the I directive         }
+{ (file inclusion).  NOT a standalone unit: no PROGRAM, no USES, no END.     }
+{                                                                            }
+{ Lisa Pascal allows several CONST / TYPE / VAR sections, so the program     }
+{ includes this where it fits its own declarations (the Office System        }
+{ client after its own globals, so that their order in memory stays as it    }
+{ was).  The program must declare, in its own sections:                      }
+{   Str255     the string type (STRING[255]; UnitStd's, in the Office System) }
+{   ProgCols   progress marks per screen line                                }
+{   NoSrvHint  what to do when the server does not answer (NoServer)         }
+{   TmpBin, TmpText  the temp files a get receives into (TmpNameOf)          }
+{   barActive, barPct  the progress bar's state (ProgStart .. ProgEnd)       }
+{ and the routines the other shared files list in their headers.            }
+{****************************************************************************}
+
+const
+   DefBaud    = 57600;         { default baud rate on Serial Port B (the most) }
+   FtpVer     = 'v1.0';        { the client's version; the 1 is the MAJOR version.
+                                 The server's banner names its own, after ProtoNam
+                                 ('LISA-SERIAL-FTP/v1.0'); if its major version
+                                 differs, HELLO connects but warns.  Before v1.0
+                                 the protocol was LISA-FTP/2..5 }
+   ProtoNam   = 'LISA-SERIAL-FTP/';  { the protocol name in the banner, before the version }
+   ChunkSz    = 1016;          { payload bytes per frame; equals CHUNK in
+                                 LisaSerialFtpServer.py; also MaxFrame and
+                                 RxQueueSz below.  A whole frame (1023 bytes) must
+                                 fit the type-ahead buffer (1024, the most): at
+                                 57600 baud a real Lisa copies a frame to the
+                                 waiting READ_DATA more slowly than it arrives,
+                                 so most of it piles up there; a byte past 1024
+                                 is lost and fails the read (1024-byte chunks
+                                 worked at 19200 but never at 57600) }
+   MaxRetry   = 10;            { give up a chunk after this many failed tries;
+                                 equals MAX_RETRIES in LisaSerialFtpServer.py }
+   MaxLine    = 255;           { Lisa Pascal's max string length }
+   MaxEName   = 32;            { the longest Lisa file name (max_ename in syscall) }
+
+   { Loss-recovery timeouts, in REAL seconds.  DEVICE_CONTROL code 14 takes
+     the timeout in (emulated) SECONDS (the RS232 driver multiplies it by
+     1000 for its ms alarm -- see source-rs232, dcontrol 14); every timeout
+     here is multiplied by the timeout-factor (tfactor) before it is passed
+     to the driver (see Calibrate).  The protocol is stop-and-wait: while the
+     sender waits for a reply the line is quiet, so a byte lost in a chunk
+     leaves the receiver short of bytes and its read times out.  The
+     receiver then discards the partial block, waits for the line to go
+     quiet, and NAKs; the sender retransmits the same chunk.  A lost reply
+     makes the sender time out and retransmit anyway; the receiver
+     recognises the repeated sequence number and re-ACKs it.  TmoFrame must
+     exceed TmoReply so a retransmit of a fully lost chunk is still caught. }
+   TmoFrame   = 15;            { first byte of a chunk (receiver) }
+   TmoBlock   = 1;             { mid-chunk bytes (receiver) }
+   TmoQuiet   = 1;             { discard-until-quiet (receiver) }
+   TmoReply   = 10;            { wait for A/N reply (sender) }
+   TmoCmd     = 30;            { wait for the reply to a command (LIST/GET/PUT/DONE) }
+   TmoLine    = 5;             { rest of a line, once its first byte arrived }
+   TmoHello   = 5;             { wait for the banner, per line (10 lines max) }
+   CalSecs    = 2;             { the server answers CAL after this many real seconds }
+   CalMax     = 400;           { give up CAL after this many 1-s timeouts (factor 200) }
+   MaxTFact   = 1000;          { upper limit for 'timeout-factor <n>' }
+
+   { A chunk frame: 'T', seq (2 bytes), len (2 bytes), len data bytes, CRC
+     (2 bytes).  Plain numbers: Lisa Pascal has no expressions in CONST. }
+   FrmStart   = 84;            { 'T': the first byte of a chunk frame }
+   FrmHdr     = 5;             { the header: 'T' + seq + len }
+   FrmRest    = 6;             { a frame's bytes besides its data, after the 'T' }
+   FrmOvh     = 7;             { a frame's bytes besides its data: FrmHdr + 2 }
+   MaxFrame   = 1023;          { a whole chunk frame: FrmOvh + ChunkSz }
+   MaxStale   = 4;             { put: stale replies skipped per try of a chunk }
+   MaxAbort   = 20;            { AbortXfer: lines read while waiting for the
+                                 peer's FAIL / OK }
+
+   { WaitChar / ReplyLine result codes }
+   WaitOK     = 0;             { got it }
+   WaitTmo    = 1;             { timed out (no server, or the link is dead) }
+   WaitAbt    = 2;             { the user pressed Apple-period }
+
+   { ReadFrame result codes }
+   RfFrame    = 0;             { a whole frame (RecvChunk checks its number) }
+   RfBad      = 1;             { no usable frame: discard and NAK }
+   RfFail     = 2;             { the server sent FAIL (answered OK) }
+   RfAbort    = 3;             { the user pressed Apple-period }
+
+   { Buffer and file sizes }
+   ListBufSz  = 8192;          { bytes of a remote listing kept for paging }
+   TextPgSz   = 1024;          { a Lisa .TEXT file is 1024-byte pages (the first is a header) }
+   ReadBufSz  = 4096;          { bytes per READ_DATA when reading a file: each call
+                                 costs a disk access (~100 ms), whatever its size }
+   WriteBlkSz = 4096;          { bytes per WRITE_DATA when writing a file (a binary
+                                 block, or 4 text pages) }
+   DecMaxSz   = 2048;          { DECODEP's output buffer (dbuf) }
+   RxQueueSz  = 1040;          { the read-ahead queue: at least a whole chunk
+                                 frame after its 'T' (FrmRest + ChunkSz = 1022) }
+
+type
+   { Raw bytes must NOT be kept in an unpacked ARRAY OF CHAR: on the Lisa
+     each such element is a 16-bit word.  A -128..127 subrange is one byte
+     (the same as FnByte in fnbus.pas and Byte in the OS Reference Manual). }
+   ByteT      = -128..127;
+   ByteBuf    = array [1..ChunkSz] of ByteT;
+   BytePtr    = ^ByteT;        { Lisa Pascal: named type required in param lists }
+   BufPtr     = ^ByteBuf;      { pointer to the whole chunk buffer }
+
+   { The transfer under way (get, put, and the -c check): set up by DoGet,
+     DoPut and LocalSum, and shared with the routines they call (RecvChunk
+     and SendChunk get theirs as parameters; TextPass, TxBytes and TxFlush
+     use these). }
+   XferState  = record
+                   ok    : boolean;   { no error so far (FALSE stops it) }
+                   seq   : longint;   { the chunk number to send / expect next,
+                                        0..65535 (wraps) }
+                   size  : longint;   { the size announced: OK <size> (get), or
+                                        counted by TextPass (put of text) }
+                   total : longint;   { bytes sent / received / checked so far }
+                   crc   : integer;   { the CRC-16 of those bytes }
+                   bsum  : longint;   { -c: their byte sum MOD 65536 }
+                   len   : integer;   { bytes collected in buf }
+                   mode  : integer;   { what TextPass does with a decoded text
+                                        byte: 0 = count it in size, 1 = send it,
+                                        2 = add it to the -c check (crc, total,
+                                        bsum) }
+                   lines : longint;   { text: lines decoded by TextPass }
+                end;
+
+var
+   {---------------------------------------- serial & protocol engine ------}
+   devName    : e_name;        { 'RS232B': Port B only (hard-coded) }
+   dcPath     : pathname;      { '-RS232B', for DEVICE_CONTROL }
+   ecode      : integer;
+   portRef    : integer;       { the open port }
+   portOpen   : boolean;       { SetupPort has opened it }
+   cparm      : dctype;
+   finfo      : fs_info;
+   actual     : longint;
+   xf         : XferState;
+   linkDead   : boolean;
+   curBaud    : longint;       { current serial baud rate (up to 57600: needs longint) }
+   atEnd      : boolean;       { binary put: the last (empty) chunk was read }
+   cmdLine    : Str255;
+   lastCmd    : Str255;        { the last command line, for 'repeat' ('' = none) }
+   cmdKnown   : boolean;       { the command just run was a known one (for lastCmd) }
+   cmdWord    : Str255;
+   argA       : Str255;
+   argB       : Str255;
+   srvReply   : Str255;        { the last reply line read from the server }
+   buf        : ByteBuf;
+   txLine     : array [1..257] of ByteT;   { SendRaw: a line + CR LF, sent with
+                                 one WRITE_DATA; GLOBAL, as txFrame, so it stays
+                                 put while the driver sends it }
+   rxq        : array [1..RxQueueSz] of ByteT;  { read-ahead queue: bytes
+                                 already read from the port (ReplyLine,
+                                 RecvChunk), not yet used }
+   rxqn       : integer;       { bytes in rxq }
+   rxqp       : integer;       { the next byte to take from rxq }
+   benchOh    : longint;       { bench: the cost of a measurement, in ms }
+   benchMs    : longint;       { bench: the last measurement, in ms }
+   rxb        : array [0..1] of ByteT;  { TryGetCh / WaitChar: the byte read;
+                                 RecvChunk: a chunk's 2 CRC bytes }
+   tfactor    : longint;       { timeout-factor: emulated seconds per real second
+                                 (1 = real Lisa) }
+   curTmo     : longint;       { input timeout now set in the driver (DCp 14),
+                                 -1 = unknown }
+   connected  : boolean;       { TRUE after a banner; FALSE after a failed HELLO
+                                 or a reply timeout }
+   aborted    : boolean;       { Apple-period seen during this command (sticky
+                                 until the prompt) }
+   dirty      : boolean;       { a wait was cut short: stale bytes may be on the line }
+   pgLines    : integer;       { lines printed since the last page prompt }
+   pageAll    : boolean;       { 'A' at page prompt: show rest without pause }
+   lbUsed     : integer;       { bytes used in lbuf }
+   pcol       : integer;       { progress marks on the current line }
+   pdone      : longint;       { progress: bytes done ... }
+   ptotal     : longint;       { ... of this many (0 = no percentage) }
+   txFrame    : array [1..MaxFrame] of ByteT;  { SendChunk: the frame being sent }
+   debugOn    : boolean;       { debug output: a line per protocol line and chunk }
+   dbSync     : boolean;       { the server has our debug setting }
+   eofDone    : boolean;
+   doneLine   : Str255;        { put: a DONE that came instead of the last ACK }
+   logRx      : boolean;
+
+   { Shared 8 KB buffer: a remote listing (DoList only), or the file blocks
+     of a transfer (pgbuf: file reads, 4 text pages; obuf: file writes, a
+     binary block or text pages, the last one being built) }
+   big        : record case integer of
+                   0: (lbuf  : array [1..ListBufSz] of ByteT);
+                   1: (pgbuf : array [1..ReadBufSz] of ByteT;
+                       obuf  : array [1..WriteBlkSz] of ByteT)
+                end;
+
+   holdAck    : boolean;       { get: RecvChunk keeps the ACK of a good chunk
+                                 (ackDue) for DoGet to send after its disk write }
+   ackDue     : boolean;       { an ACK is held: chunk ackNo }
+   ackNo      : longint;
+   opos       : integer;       { bytes used in obuf }
+   dbuf       : array [1..DecMaxSz] of ByteT;  { DECODEP's output }
+   ooff       : longint;       { file offset where obuf goes }
+   opErr      : integer;       { the first file write error (0 = none) }
+   cFlag      : boolean;       { get/put -c: skip it if unchanged }
+   bFlag      : boolean;       { get/put -b: binary (byte-exact), whatever the names }
+   tFlag      : boolean;       { get/put -t: text, whatever the names }
+   crcTab     : array [0..255] of integer;  { the CRC of byte i, for CRC16A;
+                                 built once by CrcInit (CrcSelfTest) }
+   xferfail   : boolean;       { the last get or put failed: set by GetCmd /
+                                 PutCmd, cleared when the file is verified }
+
+{ The 68000 routines (LisaSerialFtpClientAsm.text): the per-byte loops that
+  compiled Lisa Pascal does very slowly (the CRC-16 needs XOR, which Lisa
+  Pascal does not have).  CrcSelfTest checks them against known results at
+  startup. }
+procedure CRC16A(DATA: BytePtr; L: integer; var C: integer; TAB: longint); external;
+procedure SUM16A(DATA: BytePtr; L: integer; var S: longint); external;
+procedure MOVEB(SRC, DST: BytePtr; N: integer); external;
+procedure DECODEP(SRC: BytePtr; N: integer; var P: integer;
+                  var ATSTART: integer; DST: BytePtr; DMAX: integer;
+                  var DLEN: integer; var LINES: longint); external;

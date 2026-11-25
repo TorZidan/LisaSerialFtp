@@ -1,6 +1,8 @@
 # Python bytecode caches
 __pycache__/
 
+src/client/build
+
 update_images.sh
 profile-5MB-LOSAndWorkshop3-DoNotCommit-ForTesting.image
 lisaem.conf

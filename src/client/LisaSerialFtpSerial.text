@@ -1,0 +1,386 @@
+{****************************************************************************}
+{ LisaSerialFtpSerial.text -- the serial port primitives of both             }
+{ LisaSerialFtp clients: DEVICE_CONTROL (DCpTry, DCp, SetTmo), progress      }
+{ marks (ProgStart, ProgPct, ProgMark, ProgEnd), block and line I/O with     }
+{ the read-ahead queue (PutBlock, TryGetCh, TryGetBlk, WaitChar,             }
+{ ReplyLine, WaitLine, FlushRxBuf, DiscardQuiet, SendRaw, SendLine,          }
+{ ShowRx, NoServer, DrainInput, GetSrvLine, GetResponse).                    }
+{                                                                            }
+{ Included by both clients: LisaSerialFtpClient.text (Lisa Workshop) and     }
+{ LosSerialFtpClient.text (Lisa Office System), with the I directive         }
+{ (file inclusion).  NOT a standalone unit: no PROGRAM, no USES, no END.     }
+{                                                                            }
+{ Include it after LisaSerialFtpDecl.text and LisaSerialFtpUtil.text.  The   }
+{ including program must declare first: the console output ConWr, ConWrLn,   }
+{ ConWrNum, ConNewLn; BeginIO / EndIO around OS calls and LetOthersRun in    }
+{ waits (the Office System's scheduling; empty in the Workshop);             }
+{ UserAbort (Apple-period); the window hooks DrawHdrBar, DrawStatBar,        }
+{ SetStatus, SyncTitle (empty in the Workshop); barActive / barPct (the      }
+{ progress bar's state); and the constants ProgCols and NoSrvHint.           }
+{ SetTmo, PutBlock and the reads do nothing until SetupPort has opened the  }
+{ port (portOpen); DCpTry and DCp work before (SetupPort uses them).         }
+{****************************************************************************}
+
+function DCpTry(code: integer; d0, d1, d2: longint): integer;
+var e: integer;
+begin
+   cparm.dcversion := 2;
+   cparm.dccode := code;
+   cparm.dcdata[0] := d0;
+   cparm.dcdata[1] := d1;
+   cparm.dcdata[2] := d2;
+   e := 0;
+   BeginIO;
+   DEVICE_CONTROL(e, dcPath, cparm);
+   EndIO;
+   DCpTry := e;
+end;
+
+procedure DCp(code: integer; d0, d1, d2: longint);
+var e: integer;
+begin
+   e := DCpTry(code, d0, d1, d2);
+   if (e <> 0) and debugOn then begin
+      ConWr('    device_control ');
+      ConWrNum(code);
+      ConWr(' error: ');
+      ConWrNum(e);
+      ConNewLn;
+   end;
+end;
+
+procedure SetTmo(T: longint);
+begin
+   if portOpen and (T <> curTmo) then begin
+      DCp(14, T, 0, 0);
+      curTmo := T;
+   end;
+end;
+
+procedure ProgStart(total: longint);
+begin
+   pcol := 0;
+   pdone := 0;
+   ptotal := total;
+   barActive := (total > 0);
+   barPct := 0;
+   DrawStatBar;
+end;
+
+procedure ProgPct;
+var pct: longint; s: Str255;
+begin
+   if ptotal <= 0 then pct := 100
+   else if ptotal > 1000000 then pct := pdone div (ptotal div 100)
+   else pct := (pdone * 100) div ptotal;
+   if pct > 100 then pct := 100;
+   if pct < 0 then pct := 0;
+   IntToStr(pct, s);
+   ConWrLn(concat(' (', s, '% complete)'));
+   pcol := 0;
+end;
+
+procedure ProgMark(C: char; N: integer);
+var pct: longint; s1: string[1];
+begin
+   pdone := pdone + N;
+   if ptotal > 0 then begin
+      if ptotal > 1000000 then pct := pdone div (ptotal div 100)
+      else pct := (pdone * 100) div ptotal;
+      if pct > 100 then pct := 100;
+      if pct < 0 then pct := 0;
+      if pct <> barPct then begin
+         barPct := pct;
+         DrawStatBar;
+      end;
+   end;
+   if debugOn then exit(ProgMark);
+   s1 := ' ';
+   s1[1] := C;
+   ConWr(s1);
+   pcol := pcol + 1;
+   if pcol >= ProgCols then ProgPct;
+end;
+
+procedure ProgEnd;
+begin
+   if pcol > 0 then ProgPct;
+   if barActive then begin
+      barActive := false;
+      barPct := 0;
+      DrawStatBar;
+   end;
+end;
+
+function PutBlock(DATA: BytePtr; L: integer): boolean;
+var e: integer;
+begin
+   if not portOpen then begin
+      PutBlock := false;
+      exit(PutBlock);
+   end;
+   e := 0;
+   actual := 0;
+   BeginIO;
+   WRITE_DATA(e, portRef, ord4(DATA), L, actual, sequential, 0);
+   EndIO;
+   if (e > 0) or (actual <> L) then begin
+      ProgEnd;
+      ConWr('serial write error: ');
+      ConWrNum(e);
+      ConNewLn;
+      linkDead := true;
+      connected := false;
+      DrawHdrBar;
+      PutBlock := false;
+   end
+   else
+      PutBlock := true;
+end;
+
+function TryGetCh(var C: char; tmo: longint): boolean;
+var e, v: integer;
+begin
+   if rxqp <= rxqn then begin
+      C := chr(ByteVal(rxq[rxqp]));
+      rxqp := rxqp + 1;
+      TryGetCh := true;
+      exit(TryGetCh);
+   end;
+   if not portOpen then begin
+      TryGetCh := false;
+      exit(TryGetCh);
+   end;
+   e := 0;
+   actual := 0;
+   SetTmo(tmo * tfactor);
+   BeginIO;
+   READ_DATA(e, portRef, ord4(@rxb), 1, actual, sequential, 0);
+   EndIO;
+   if (e > 0) or (actual <> 1) then begin
+      TryGetCh := false;
+      exit(TryGetCh);
+   end;
+   v := rxb[0];
+   if v < 0 then v := v + 256;
+   C := chr(v);
+   TryGetCh := true;
+end;
+
+function TryGetBlk(DATA: BytePtr; L: integer; tmo: longint): integer;
+var e, q: integer;
+begin
+   q := rxqn - rxqp + 1;
+   if q > L then q := L;
+   if q > 0 then begin
+      MoveBytes(@rxq[rxqp], DATA, q);
+      rxqp := rxqp + q;
+      DATA := pointer(ord4(DATA) + q);
+   end
+   else
+      q := 0;
+   if (L - q <= 0) or (not portOpen) then begin
+      TryGetBlk := q;
+      exit(TryGetBlk);
+   end;
+   e := 0;
+   actual := 0;
+   SetTmo(tmo * tfactor);
+   BeginIO;
+   READ_DATA(e, portRef, ord4(DATA), L - q, actual, sequential, 0);
+   EndIO;
+   if e > 0 then actual := 0;
+   TryGetBlk := q + actual;
+end;
+
+function WaitChar(var C: char; secs: longint; abortable: boolean): integer;
+var e, v: integer; n, slices: longint;
+begin
+   WaitChar := WaitTmo;
+   if rxqp <= rxqn then begin
+      v := rxq[rxqp];
+      if v < 0 then v := v + 256;
+      C := chr(v);
+      rxqp := rxqp + 1;
+      WaitChar := WaitOK;
+      exit(WaitChar);
+   end;
+   if not portOpen then exit(WaitChar);
+   slices := secs * tfactor;
+   if slices < 1 then slices := 1;
+   SetTmo(1);
+   n := 0;
+   while n < slices do begin
+      if abortable then
+         if UserAbort then begin
+            WaitChar := WaitAbt;
+            exit(WaitChar);
+         end;
+      LetOthersRun;
+      e := 0;
+      actual := 0;
+      BeginIO;
+      READ_DATA(e, portRef, ord4(@rxb), 1, actual, sequential, 0);
+      EndIO;
+      if (e <= 0) and (actual = 1) then begin
+         v := rxb[0];
+         if v < 0 then v := v + 256;
+         C := chr(v);
+         WaitChar := WaitOK;
+         exit(WaitChar);
+      end;
+      n := n + 1;
+   end;
+end;
+
+function ReplyLine(var S: Str255; secs: longint; abortable: boolean;
+                   want: integer): integer;
+var c: char; n, w: integer; t: longint; first: boolean;
+begin
+   n := 0;
+   S := '';
+   t := secs;
+   first := true;
+   repeat
+      w := WaitChar(c, t, abortable);
+      if w <> WaitOK then begin
+         S[0] := chr(n);
+         ReplyLine := w;
+         exit(ReplyLine);
+      end;
+      if first then begin
+         first := false;
+         if (want > 1) and (rxqp > rxqn) then begin
+            rxqp := 1;
+            rxqn := 0;
+            if want - 1 > RxQueueSz then want := RxQueueSz + 1;
+            rxqn := TryGetBlk(@rxq[1], want - 1, TmoQuiet);
+         end;
+      end;
+      t := TmoLine;
+      if (c <> chr(10)) and (c <> chr(13)) and (n < MaxLine) then begin
+         n := n + 1;
+         S[n] := c;
+      end;
+   until c = chr(10);
+   S[0] := chr(n);
+   ReplyLine := WaitOK;
+end;
+
+function WaitLine(var S: Str255; secs: longint; abortable: boolean): integer;
+begin
+   WaitLine := ReplyLine(S, secs, abortable, 0);
+end;
+
+procedure FlushRxBuf;
+var e: integer;
+begin
+   rxqn := 0;
+   rxqp := 1;
+   if not portOpen then exit(FlushRxBuf);
+   e := DCpTry(9, -1, -2, -2);
+   if debugOn then
+      if e <> 0 then begin
+         ConWr('    (flushing type-ahead failed: ');
+         ConWrNum(e);
+         ConWrLn(')');
+      end
+      else
+         ConWrLn('    (type-ahead buffer flushed)');
+end;
+
+procedure DiscardQuiet;
+var ch: char; n: integer;
+begin
+   n := 0;
+   while (n < 2 * MaxFrame) and TryGetCh(ch, TmoQuiet) do
+      n := n + 1;
+   FlushRxBuf;
+end;
+
+procedure SendRaw(S: Str255);
+var j, n, v: integer;
+begin
+   n := length(S);
+   for j := 1 to n do begin
+      v := ord(S[j]);
+      if v > 127 then v := v - 256;
+      txLine[j] := v;
+   end;
+   txLine[n + 1] := 13;
+   txLine[n + 2] := 10;
+   if PutBlock(@txLine[1], n + 2) then ;
+end;
+
+procedure SendLine(S: Str255);
+begin
+   if debugOn then begin
+      ProgEnd;
+      ConWrLn(concat('    sent: ', S));
+   end;
+   SendRaw(S);
+end;
+
+procedure ShowRx(S: Str255);
+begin
+   if debugOn and logRx then begin
+      ProgEnd;
+      ConWrLn(concat('    received: ', S));
+   end;
+end;
+
+procedure NoServer(w: integer);
+begin
+   dirty := true;
+   if w = WaitAbt then begin
+      ConWrLn('stopped -- back to prompt');
+      SetStatus('Stopped (Apple-period)');
+   end
+   else begin
+      connected := false;
+      DrawHdrBar;
+      SyncTitle;
+      ConWrLn('no reply from the server.');
+      ConWrLn(NoSrvHint);
+      SetStatus('No reply from server -- start server and choose Transfer > Connect');
+   end;
+end;
+
+procedure DrainInput;
+begin
+   if dirty then begin
+      DiscardQuiet;
+      dirty := false;
+   end;
+end;
+
+function GetSrvLine(var S: Str255): boolean;
+var w: integer;
+begin
+   w := WaitLine(S, TmoCmd, true);
+   if w <> WaitOK then begin
+      NoServer(w);
+      GetSrvLine := false;
+   end
+   else begin
+      ShowRx(S);
+      GetSrvLine := true;
+   end;
+end;
+
+function GetResponse(var S: Str255): boolean;
+var nb: integer; banner: boolean; ns: Str255;
+begin
+   nb := 0;
+   GetResponse := false;
+   repeat
+      if not GetSrvLine(S) then exit(GetResponse);
+      banner := (length(S) > 0) and (S[1] = 'H');
+      if banner then nb := nb + 1;
+   until not banner;
+   if nb > 0 then begin
+      IntToStr(nb, ns);
+      ConWrLn(concat('note: skipped ', ns, ' stale banner line(s) -- server restarted?'));
+   end;
+   GetResponse := true;
+end;

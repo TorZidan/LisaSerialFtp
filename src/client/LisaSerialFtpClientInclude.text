@@ -3,107 +3,26 @@
 { Lisa Pascal file-inclusion directive (the "I" directive) naming this     }
 { file.                                                                    }
 {                                                                          }
-{ Holds all the code for the local-file commands '!list' (local volume     }
-{ listing) and '!delete':                                                  }
-{   EntryKind  -- name for a catalog entry type (Q_Info.etype)             }
-{   Pad2       -- a number as two digits ('07')                            }
-{   DateStr    -- a file time stamp as MM/DD/YY-HH:MM                      }
+{ Holds the Workshop client's code for the local-file commands '!list'    }
+{ (local volume listing), '!delete' and '!volume' (the Office System       }
+{ client has its own, in LosSerialFtpClient.text); EntryKind, Pad2 and     }
+{ DateStr are in LisaSerialFtpUtil.text, shared by both:                   }
 {   DoListVol  -- the '!list' handler itself                               }
 {   AskYes     -- a Y/N question (also used by 'delete', later in          }
 {                 LisaSerialFtpClient.text)                                }
 {   DoDelLocal -- the '!delete' handler                                    }
+{   DoVolCmd   -- the '!volume' handler (list the mounted volumes, or      }
+{                 make one the working volume)                             }
 {                                                                          }
 { This is NOT a standalone program: no PROGRAM statement, no USES, no      }
 { final END.  It is included at the point of the I-inclusion directive     }
 { in LisaSerialFtpClient.text -- after all program-scope declarations,     }
 { so string255 is in scope -- and uses the syscall unit's                  }
-{ GET_WORKING_DIR / LOOKUP / RESET_CATALOG / LOOKUP_NEXT_ENTRY /           }
-{ KILL_OBJECT, and the program's kbd and ecode.  Works                     }
+{ GET_WORKING_DIR / SET_WORKING_DIR / LOOKUP / RESET_CATALOG /             }
+{ LOOKUP_NEXT_ENTRY / KILL_OBJECT, and the program's kbd, ecode,           }
+{ IntToStr, StrToInt and UpperStr.  Works                                  }
 { purely locally: no serial link or server needed.                         }
 {****************************************************************************}
-
-{ Name for a catalog entry type (Q_Info.etype).  Lisa Pascal forbids
-  string result types in functions (scalar/subrange/pointer only), so
-  this is a procedure with a VAR parameter, like BaseName/StripExt. }
-PROCEDURE EntryKind (t: entrytype; VAR s: string255);
-BEGIN
-  s := 'other';
-  IF t = catentry THEN s := 'catalog'
-  ELSE IF t = linkentry THEN s := 'link'
-  ELSE IF t = fileentry THEN s := 'file'
-  ELSE IF t = pipeentry THEN s := 'pipe'
-  ELSE IF t = ecentry THEN s := 'ec'
-  ELSE IF t = killedentry THEN s := 'killed';
-END;
-
-{ Append N (0..99) to S as two digits: 7 -> '07'. }
-PROCEDURE Pad2 (N: LONGINT; VAR S: string255);
-VAR t: string255;
-BEGIN
-  IntToStr(N, t);
-  IF N < 10 THEN t := concat('0', t);
-  S := concat(S, t);
-END;
-
-{ A file time stamp (Q_Info.DTM / DTC) as 'MM/DD/YY-HH:MM', the format of
-  the Workshop File Manager's listing.  The time stamp is an UNSIGNED
-  32-bit count of seconds since midnight, 1 January 1901 (libhw TIMERS,
-  TimeToDate), so dates after the mid 1960s have the sign bit set and
-  arrive here as negative LONGINTs.  The unsigned value is split into
-  T DIV 128 and T MOD 128 without overflow; then, as TimeToDate does,
-  128 * 675 = 86400 seconds per day and 1461 days per 4-year cycle (every
-  4th year is a leap year: right for 1901..2099).  TimeToDate is in the
-  hardware unit, which this program does not use, hence this copy. }
-PROCEDURE DateStr (T: LONGINT; VAR S: string255);
-VAR hi, lo, days, secs, cyc, dc, y, dd, year, m, ml: LONGINT;
-BEGIN
-  IF T < 0 THEN
-  BEGIN
-    { unsigned T = (T + 2^31) + 2^31, and 2^31 / 128 = 2^24 exactly }
-    T := (T + 1073741824) + 1073741824;   { now 0..2^31-1 }
-    hi := T DIV 128 + 16777216;
-  END
-  ELSE
-    hi := T DIV 128;
-  lo := T MOD 128;
-  days := hi DIV 675;                     { days since 1 Jan 1901 }
-  secs := (hi MOD 675) * 128 + lo;        { seconds into the day }
-  cyc := days DIV 1461;                   { 4-year cycles }
-  dc := days MOD 1461;
-  y := dc DIV 365;                        { year in the cycle, 0..3 }
-  dd := dc MOD 365;                       { day in the year, from 0 }
-  IF y = 4 THEN                           { 31 Dec of the leap year }
-  BEGIN
-    y := 3;
-    dd := 365;
-  END;
-  year := 1901 + cyc * 4 + y;
-  m := 1;
-  ml := 31;
-  WHILE dd >= ml DO                       { find the month }
-  BEGIN
-    dd := dd - ml;
-    m := m + 1;
-    IF m = 2 THEN
-    BEGIN
-      IF year MOD 4 = 0 THEN ml := 29 ELSE ml := 28;
-    END
-    ELSE IF (m = 4) OR (m = 6) OR (m = 9) OR (m = 11) THEN
-      ml := 30
-    ELSE
-      ml := 31;
-  END;
-  S := '';
-  Pad2(m, S);
-  S := concat(S, '/');
-  Pad2(dd + 1, S);
-  S := concat(S, '/');
-  Pad2(year MOD 100, S);
-  S := concat(S, '-');
-  Pad2(secs DIV 3600, S);
-  S := concat(S, ':');
-  Pad2((secs MOD 3600) DIV 60, S);
-END;
 
 { List the catalog of the default volume -- every file on it, not just
   one directory (the same scan UltraLOS's ListFile does).  Without an
@@ -197,7 +116,7 @@ BEGIN
     BEGIN
       n := n + 1;
       outl := q.name;                     { at most MAXNAME (32) characters }
-      FOR j := LENGTH(outl) + 1 TO MAXNAME DO
+      FOR j := LENGTH(outl) + 1 TO MaxEName DO
         outl := concat(outl, ' ');
       attr := '';
       IF q.etype <> fileentry THEN
@@ -267,4 +186,137 @@ BEGIN
     WRITELN('cannot delete ', name, ': error ', ecode)
   ELSE
     WRITELN('deleted ', name);
+END;
+
+{ '!volume [<n> | -vol-]' / '!vol': without an argument, list the
+  mounted Lisa volumes (the working volume first, then the usual device
+  names), numbered, with their free blocks; with a number from that list
+  or a volume name, make that volume the working volume (SET_WORKING_DIR).
+  Local file names without a volume ('!list', '!delete', get, put) are
+  then on that volume.  The working directory belongs to this program:
+  the Workshop's own working volume is unchanged after quit.  Volumes
+  with the same free count are marked, as they may be one disk under two
+  names.  The list is made again for each '!volume' command, so a number
+  always means the same volume as in the last listing (unless a disk was
+  mounted or removed in between). }
+PROCEDURE DoVolCmd (arg: string255);
+CONST
+  MaxVols = 10;                { at most this many volumes are listed }
+VAR
+  volList: ARRAY [1..MaxVols] OF e_name;    { '-#12-', '-UPPER-', ... }
+  volFree: ARRAY [1..MaxVols] OF LONGINT;
+  volCnt : integer;
+  workVol: e_name;             { the working volume, as '-name-' }
+  path   : pathname;
+  err, j : integer;
+  k      : LONGINT;
+  allDig : boolean;
+  choice : string255;
+
+  { add the volume pfx ('-name-') to the list if it is mounted and not
+    listed yet; print its line when show is true }
+  PROCEDURE ProbeVol (pfx: e_name; show: boolean);
+  VAR fsi: fs_info; ec, dup, m: integer; p: pathname; ns: string255;
+  BEGIN
+    IF volCnt >= MaxVols THEN EXIT(ProbeVol);
+    FOR m := 1 TO volCnt DO
+      IF volList[m] = pfx THEN EXIT(ProbeVol);
+    p := pfx;
+    ec := 0;
+    LOOKUP(ec, p, fsi);
+    IF ec <> 0 THEN EXIT(ProbeVol);
+    IF NOT fsi.mounted THEN EXIT(ProbeVol);
+    dup := 0;
+    FOR m := 1 TO volCnt DO
+      IF volFree[m] = fsi.freecount THEN dup := m;
+    volCnt := volCnt + 1;
+    volList[volCnt] := pfx;
+    volFree[volCnt] := fsi.freecount;
+    IF show THEN
+    BEGIN
+      WRITE('  ', volCnt:2, '  ', pfx, '  ', fsi.freecount, ' free blocks (~',
+            fsi.freecount DIV 2, ' KB)');
+      IF pfx = workVol THEN WRITE('  [working volume]');
+      IF dup > 0 THEN
+      BEGIN
+        IntToStr(dup, ns);
+        WRITE('  (same free count as #', ns, ')');
+      END;
+      WRITELN;
+    END;
+  END;
+
+  PROCEDURE ScanVols (show: boolean);
+  BEGIN
+    IF show THEN WRITELN('Mounted Lisa volumes:');
+    volCnt := 0;
+    ProbeVol(workVol, show);
+    ProbeVol('-#12-', show);
+    ProbeVol('-#2#1-', show);
+    ProbeVol('-#2#2-', show);
+    ProbeVol('-#3#1-', show);
+    ProbeVol('-#3#2-', show);
+    ProbeVol('-#1#1-', show);
+    ProbeVol('-#1#2-', show);
+    ProbeVol('-LOWER-', show);
+    ProbeVol('-UPPER-', show);
+  END;
+
+BEGIN
+  { the working volume: the first component of the working directory's
+    path, '-#12' or '-#12-SUBDIR' -> '-#12-' (as in DoListVol) }
+  err := 0;
+  path := '';
+  GET_WORKING_DIR(err, path);
+  IF (err <> 0) OR (LENGTH(path) = 0) THEN
+    workVol := '-'
+  ELSE
+  BEGIN
+    j := 2;
+    WHILE (j <= LENGTH(path)) AND (path[j] <> '-') DO j := j + 1;
+    workVol := concat(COPY(path, 1, j - 1), '-');
+  END;
+  IF arg = '' THEN
+  BEGIN
+    ScanVols(TRUE);
+    WRITELN('Current working volume: ', workVol,
+            '  (change with: !volume <number | -vol->)');
+    EXIT(DoVolCmd);
+  END;
+  { a number from the list }
+  allDig := TRUE;
+  FOR j := 1 TO LENGTH(arg) DO
+    IF (arg[j] < '0') OR (arg[j] > '9') THEN allDig := FALSE;
+  IF allDig THEN
+  BEGIN
+    ScanVols(FALSE);
+    k := StrToInt(arg);
+    IF (k < 1) OR (k > volCnt) THEN
+    BEGIN
+      WRITELN('not one of the listed volume numbers (see !volume)');
+      EXIT(DoVolCmd);
+    END;
+    choice := volList[k];
+  END
+  ELSE
+  BEGIN
+    { a volume name: 'UPPER', '-UPPER' or '-UPPER-' }
+    choice := arg;
+    IF choice[1] <> '-' THEN choice := concat('-', choice);
+    IF choice[LENGTH(choice)] <> '-' THEN choice := concat(choice, '-');
+    UpperStr(choice);
+    IF LENGTH(choice) > max_ename THEN
+    BEGIN
+      WRITELN('volume name too long');
+      EXIT(DoVolCmd);
+    END;
+  END;
+  { the working directory is the volume's path without the last '-' }
+  path := COPY(choice, 1, LENGTH(choice) - 1);
+  err := 0;
+  SET_WORKING_DIR(err, path);
+  IF err <> 0 THEN
+    WRITELN('cannot make ', choice, ' the working volume: error ', err)
+  ELSE
+    WRITELN('Working volume is now ', choice);
 END;

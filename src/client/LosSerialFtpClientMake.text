@@ -1,0 +1,90 @@
+$EXEC
+${=============================================================================}
+${ LosSerialFtpClientMake.text -- build driver for LosSerialFtpClient (LOS).   }
+${ Run it in the Workshop with R, then <LosSerialFtpClientMake                 }
+${   1. assemble LosSerialFtpClientAsm.text  -> LosSerialFtpClientAsm.OBJ      }
+${   2. compile LosSerialFtpClient.text      -> LosSerialFtpClientCompiled.OBJ }
+${   3. link with LosSerialFtpClientAsm, IOSPASLIB, SYS1LIB, SYS2LIB           }
+${                                           -> LosSerialFtpClient.OBJ         }
+${   4. copy executable and ICON.BIN to tool names T197001 Obj / ICON          }
+${   5. compile the phrase file (menus) to T197001PHRASE                       }
+${   6. InstallTool: register tool 197001 "Serial FTP Client" with the Lisa    }
+${      Office System.                                                                        }
+${ The tool number lives ONLY in this file (the program finds its own number   }
+${ from its pathname at run time).  To renumber, change every 197001 below.    }
+${ A line holding only a comment emits a bare [RETURN] -- used on purpose.     }
+${=============================================================================}
+${                                                                             }
+${ Optional: if LisaSerialFtpServer.py is sharing src/client and               }
+${ LisaSerialFtpClient.OBJ is on this disk, uncomment to fetch newest sources  }
+${ (LosSerialFtpClient.text includes the shared LisaSerialFtp*.text files, and }
+${ LosSerialFtpClientAsm.text includes LisaSerialFtpClientAsm.text):           }
+${ R{un}LisaSerialFtpClient.OBJ                                                }
+${ get -c LosSerialFtpClientAsm.text                                           }
+${ get -c LisaSerialFtpClientAsm.text                                          }
+${ get -c LisaSerialFtpDecl.text                                               }
+${ get -c LisaSerialFtpUtil.text                                               }
+${ get -c LisaSerialFtpSerial.text                                             }
+${ get -c LisaSerialFtpProto.text                                              }
+${ get -c LisaSerialFtpXfer.text                                               }
+${ get -c LisaSerialFtpCmds.text                                               }
+${ get -c LosSerialFtpClientAlerts.text                                        }
+${ get -c LosSerialFtpClient.text                                              }
+${ get -c -b ICON.BIN                                                          }
+${ quit                                                                        }
+${ $DOIT                                                                       }
+${                                                                             }
+${ Delete stale outputs first: a stale .OBJ silently poisons a build.          }
+F{ilemgr}D{elete}LosSerialFtpClientAsm.OBJ  Y{es}
+        D{elete}LosSerialFtpClientCompiled.OBJ  Y{es}
+        D{elete}LosSerialFtpClient.OBJ  Y{es}
+        Q{uit}
+${                                                                             }
+${ 1. Assemble the 68000 routines (CRC16A, SUM16A, MOVEB, DECODEP).            }
+A{ssemble}LosSerialFtpClientAsm.text
+{no listing file - this comment-only line IS the [RETURN] answer}
+LosSerialFtpClientAsm.OBJ
+${                                                                             }
+${ 2. Compile: source / no listing / object.                                   }
+P{ascal Compile}LosSerialFtpClient.text
+{no listing file - this comment-only line IS the [RETURN] answer}
+LosSerialFtpClientCompiled.OBJ
+${                                                                             }
+${ 3. Link.  QuickDraw, FontMgr, Events, Folders, Menus, AlertMgr, WML*,       }
+${ FilerComm resolve through INTRINSIC.LIB; IOSPASLIB is the Pascal runtime,   }
+${ SYS1LIB/SYS2LIB the Office System / Window Manager libraries.               }
+L{inker}LosSerialFtpClientCompiled.OBJ
+LosSerialFtpClientAsm.OBJ
+IOSPASLIB.OBJ
+SYS1LIB.OBJ
+SYS2LIB.OBJ
+{end of the input list - this comment-only line is the blank [RETURN] answer}
+{no listing file - second blank answer}
+LosSerialFtpClient.OBJ
+${                                                                             }
+${ 4. Install the executable and the desktop icon under the tool name.         }
+F{ilemgr}D{elete}~{T197001~}Obj
+Y{es}D{elete}~{T197001~}PHRASE
+Y{es}D{elete}~{T197001~}ICON
+Y{es}C{opy}LosSerialFtpClient.OBJ
+~{T197001~}Obj
+C{opy}ICON.BIN
+~{T197001~}ICON
+Q{uit}
+${                                                                             }
+${ 5. Compile the phrase file straight to its installed name (the Alert tool   }
+${ appends 'PHRASE' to the stem we give it).                                   }
+R{un}Alert
+LosSerialFtpClientAlerts.text
+~{T197001~}
+${                                                                             }
+${ 6. Register with the Office System (6 answers for a non-document tool).     }
+R{un}InstallTool
+Y              {1: overwrite an existing tool with the same number}
+{2: blank = the PARAPORT device -- this comment-only line is the [RETURN]}
+197001            {3: the tool number}
+N              {4: does NOT make documents}
+N              {5: no special opening rectangle}
+Serial FTP Client
+${ ^ 6: the name shown on the desktop.  Left bare: the name is read verbatim.  }
+$ENDEXEC

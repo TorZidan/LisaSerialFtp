@@ -1,0 +1,533 @@
+{****************************************************************************}
+{ LisaSerialFtpCmds.text -- the server commands of both LisaSerialFtp        }
+{ clients: DoList, Calibrate, SyncDebug, MajorOf, ChunkOf, DoHello,          }
+{ ReadyLink, BannerAt, DoBaud, DoTFactor, DoDebug, DoDelRemote, BenchStart,  }
+{ BenchMark.                                                                 }
+{                                                                            }
+{ Included by both clients: LisaSerialFtpClient.text (Lisa Workshop) and     }
+{ LosSerialFtpClient.text (Lisa Office System), with the I directive         }
+{ (file inclusion).  NOT a standalone unit: no PROGRAM, no USES, no END.     }
+{                                                                            }
+{ Include it after LisaSerialFtpXfer.text.  The including program must       }
+{ declare first: SetupPort (opens the port once, sets portOpen; FORWARD is   }
+{ enough), and the hook RefreshMenus (menu check marks; empty in the         }
+{ Workshop).  DoHello and ReadyLink are used before this file (by the        }
+{ transfer engine), so the program declares them FORWARD earlier.            }
+{****************************************************************************}
+
+procedure DoList(dir: Str255);
+var j, k, n, nl, np: integer; full: boolean;
+begin
+   SetStatus('Receiving server directory listing...');
+   if dir = '' then SendLine('LIST')
+   else SendLine(concat('LIST ', dir));
+   if not GetResponse(srvReply) then exit(DoList);
+   if (length(srvReply) = 0) or (srvReply[1] <> 'O') then begin
+      ConWrLn(srvReply);
+      SetStatus(concat('Server: ', srvReply));
+      exit(DoList);
+   end;
+   lbUsed := 0;
+   nl := 0;
+   np := 1;
+   full := false;
+   logRx := false;
+   repeat
+      if not GetSrvLine(srvReply) then begin
+         logRx := true;
+         exit(DoList);
+      end;
+      if srvReply = 'MORE' then begin
+         SendRaw('NEXT');
+         np := np + 1;
+         if not debugOn then begin
+            if np = 2 then ConWr('receiving a long listing ');
+            ConWr('.');
+         end;
+      end
+      else if srvReply <> 'DONE' then
+         if lbUsed + length(srvReply) + 1 <= ListBufSz then begin
+            nl := nl + 1;
+            lbUsed := lbUsed + 1;
+            big.lbuf[lbUsed] := ToByte(length(srvReply));
+            for j := 1 to length(srvReply) do begin
+               lbUsed := lbUsed + 1;
+               big.lbuf[lbUsed] := ToByte(ord(srvReply[j]));
+            end;
+         end
+         else
+            full := true;
+   until srvReply = 'DONE';
+   logRx := true;
+   if (np > 1) and (not debugOn) then begin
+      ConWr(' ');
+      ConWrNum(np);
+      ConWrLn(' pages');
+   end;
+   if debugOn then begin
+      ConWr('    received: ');
+      ConWrNum(nl);
+      ConWr(' entries in ');
+      ConWrNum(np);
+      ConWrLn(' page(s), then DONE');
+   end;
+   PageStart;
+   k := 0;
+   while k < lbUsed do begin
+      k := k + 1;
+      n := ByteVal(big.lbuf[k]);
+      for j := 1 to n do
+         srvReply[j] := chr(ByteVal(big.lbuf[k + j]));
+      srvReply[0] := chr(n);
+      k := k + n;
+      if not PageMore then exit(DoList);
+      ConWrLn(srvReply);
+   end;
+   if full then
+      if PageMore then begin
+         ConWr('(listing truncated at ');
+         ConWrNum(nl);
+         ConWrLn(' entries)');
+      end;
+   SetStatus('Ready');
+end;
+
+procedure Calibrate;
+var n: longint; e, v, sl: integer; c: char; s: Str255; done: boolean;
+begin
+   SetStatus('Measuring emulator timeout-factor (2 s)...  Apple-. cancels');
+   ConWr('measuring the timeout-factor (');
+   ConWrNum(CalSecs);
+   ConWrLn(' s)...');
+   SendLine('CAL');
+   SetTmo(1);
+   n := 0;
+   sl := 0;
+   done := false;
+   while not done do begin
+      if UserAbort then begin
+         ConWr('measurement stopped; timeout-factor stays ');
+         ConWrNum(tfactor);
+         ConNewLn;
+         dirty := true;
+         exit(Calibrate);
+      end;
+      LetOthersRun;
+      if n >= CalMax then begin
+         ConWr('no CAL reply from server; timeout-factor stays ');
+         ConWrNum(tfactor);
+         ConNewLn;
+         dirty := true;
+         exit(Calibrate);
+      end;
+      e := 0;
+      actual := 0;
+      BeginIO;
+      READ_DATA(e, portRef, ord4(@rxb), 1, actual, sequential, 0);
+      EndIO;
+      if (e > 0) or (actual <> 1) then
+         n := n + 1
+      else begin
+         v := rxb[0];
+         if v < 0 then v := v + 256;
+         c := chr(v);
+         if c = chr(10) then begin
+            s[0] := chr(sl);
+            if (sl >= 3) and (copy(s, 1, 3) = 'CAL') then
+               done := true
+            else if (sl >= 3) and (copy(s, 1, 3) = 'ERR') then begin
+               ConWrLn('server does not support CAL; set manually with timeout-factor <n>');
+               exit(Calibrate);
+            end;
+            sl := 0;
+         end
+         else if (c <> chr(13)) and (sl < MaxLine) then begin
+            sl := sl + 1;
+            s[sl] := c;
+         end;
+      end;
+   end;
+   tfactor := (n + CalSecs - 1) div CalSecs;
+   if tfactor < 1 then tfactor := 1;
+   DrawHdrBar;
+   ConWr('timeout-factor: ');
+   ConWrNum(tfactor);
+   ConWr('x (~');
+   ConWrNum(tfactor * 5);
+   ConWr(' MHz; ');
+   ConWrNum(n);
+   ConWr(' emulated s in ');
+   ConWrNum(CalSecs);
+   ConWrLn(' real s)');
+   SetStatus('Ready');
+end;
+
+function SyncDebug: boolean;
+begin
+   SyncDebug := false;
+   if debugOn then SendLine('DEBUG ON')
+   else SendLine('DEBUG OFF');
+   if not GetResponse(srvReply) then exit(SyncDebug);
+   if (length(srvReply) > 0) and (srvReply[1] = 'O') then
+      SyncDebug := true
+   else if debugOn then
+      ConWrLn(concat('server does not know DEBUG: ', srvReply));
+end;
+
+procedure MajorOf(S: Str255; var M: Str255);
+var k: integer;
+begin
+   M := '';
+   k := pos(ProtoNam, S);
+   if k = 0 then exit(MajorOf);
+   k := k + length(ProtoNam);
+   if k > length(S) then exit(MajorOf);
+   if (S[k] <> 'v') and (S[k] <> 'V') then exit(MajorOf);
+   k := k + 1;
+   while k <= length(S) do begin
+      if (S[k] < '0') or (S[k] > '9') then exit(MajorOf);
+      AddChar(M, S[k]);
+      k := k + 1;
+   end;
+end;
+
+function ChunkOf(S: Str255): longint;
+var k: integer; n: longint;
+begin
+   ChunkOf := -1;
+   k := pos('chunk_size=', S);
+   if k = 0 then exit(ChunkOf);
+   k := k + 11;
+   n := 0;
+   if k > length(S) then exit(ChunkOf);
+   if (S[k] < '0') or (S[k] > '9') then exit(ChunkOf);
+   while k <= length(S) do begin
+      if (S[k] < '0') or (S[k] > '9') then k := length(S)
+      else if n < 100000 then n := n * 10 + ord(S[k]) - ord('0');
+      k := k + 1;
+   end;
+   ChunkOf := n;
+end;
+
+function DoHello: boolean;
+var j, w: integer;
+    banner, mine, theirs: Str255;
+    sch: longint;
+begin
+   DoHello := false;
+   connected := false;
+   DrawHdrBar;
+   SyncTitle;
+   if not SetupPort then exit(DoHello);
+   DrainInput;
+   SetStatus('Connecting to server (HELLO)...  Apple-. cancels');
+   ConWrLn('sending HELLO, waiting for the server...  (Apple-. cancels)');
+   SendLine('HELLO');
+   for j := 1 to 10 do begin
+      w := WaitLine(srvReply, TmoHello, true);
+      if w <> WaitOK then begin
+         NoServer(w);
+         exit(DoHello);
+      end;
+      if (length(srvReply) = 0) or (srvReply[1] <> 'H') then
+         ConWrLn(concat('server line: [', srvReply, ']'))
+      else begin
+         banner := srvReply;
+         connected := true;
+         SetTmo(0);
+         dbSync := SyncDebug;
+         DrawHdrBar;
+         SyncTitle;
+         if connected then begin
+            ConWrLn(concat('Connected. [', banner, ']'));
+            SetStatus(concat('Connected -- ', banner));
+            MajorOf(concat(ProtoNam, FtpVer), mine);
+            MajorOf(banner, theirs);
+            { another major version (or none: an older server) may not
+              speak the same protocol: connect anyway, but say so }
+            if theirs <> mine then begin
+               if theirs = '' then theirs := 'unknown';
+               ConWrLn(concat('WARNING: this client (', ProtoNam, FtpVer, ', major version ',
+                              mine, ') may not be compatible'));
+               ConWrLn(concat('with this server (major version ', theirs,
+                              '). Use LisaSerialFtpServer.py and a client'));
+               ConWrLn('of the same major version.');
+            end;
+            { the chunk size is fixed at compile time on both sides: another
+              one makes every get and put fail (chunks rejected as too long,
+              or not the size the other side expects) }
+            sch := ChunkOf(banner);
+            if sch <> ChunkSz then begin
+               if sch < 0 then
+                  ConWr('WARNING: the server does not name its chunk size;')
+               else begin
+                  ConWr('WARNING: the server''s chunk size is ');
+                  ConWrNum(sch);
+                  ConWr(',');
+               end;
+               ConWr(' this client''s is ');
+               ConWrNum(ChunkSz);
+               ConWrLn('.');
+               ConWrLn('get and put will fail: use LisaSerialFtpServer.py and a');
+               ConWrLn('client with the same chunk size.');
+            end;
+         end;
+         DoHello := connected;
+         exit(DoHello);
+      end;
+   end;
+   ConWrLn('no banner from server -- is LisaSerialFtpServer.py running?');
+   NoServer(WaitTmo);
+end;
+
+function ReadyLink: boolean;
+begin
+   if not SetupPort then begin
+      ReadyLink := false;
+      exit(ReadyLink);
+   end;
+   if connected then begin
+      DrainInput;
+      ReadyLink := true;
+   end
+   else
+      ReadyLink := DoHello;
+end;
+
+function BannerAt: boolean;
+var j, w: integer;
+begin
+   BannerAt := false;
+   FlushRxBuf;
+   SendLine('HELLO');
+   for j := 1 to 3 do begin
+      w := WaitLine(srvReply, TmoHello, true);
+      if w <> WaitOK then exit(BannerAt);
+      if (length(srvReply) > 0) and (srvReply[1] = 'H') then begin
+         BannerAt := true;
+         exit(BannerAt);
+      end;
+   end;
+end;
+
+procedure DoBaud(arg: Str255);
+var j: integer; nb, old: longint; t: Str255; ch: char;
+begin
+   TrimStr(arg);
+   if arg = '' then begin
+      ConWr('baud rate is ');
+      ConWrNum(curBaud);
+      ConNewLn;
+      ConWrLn('supported: 300 600 1200 2400 4800 9600 19200 38400 57600');
+      exit(DoBaud);
+   end;
+   for j := 1 to length(arg) do
+      if (arg[j] < '0') or (arg[j] > '9') then begin
+         ConWrLn(concat('error: baud rate must be a number: ', arg));
+         exit(DoBaud);
+      end;
+   if length(arg) > 6 then nb := 0 else nb := StrToInt(arg);
+   if (nb <> 300) and (nb <> 600) and (nb <> 1200) and (nb <> 2400) and
+      (nb <> 4800) and (nb <> 9600) and (nb <> 19200) and (nb <> 38400) and
+      (nb <> 57600) then begin
+      ConWrLn(concat('error: unsupported baud rate: ', arg));
+      ConWrLn('supported: 300 600 1200 2400 4800 9600 19200 38400 57600');
+      exit(DoBaud);
+   end;
+   if not connected then begin
+      if portOpen then DCp(5, nb, 0, 0);
+      curBaud := nb;
+      RefreshMenus;
+      DrawHdrBar;
+      ConWr('baud rate set to ');
+      ConWrNum(nb);
+      ConWrLn(' locally (not connected): match on server, then hello');
+      exit(DoBaud);
+   end;
+   DrainInput;
+   IntToStr(nb, t);
+   SendLine(concat('BAUD ', t));
+   if not GetResponse(srvReply) then exit(DoBaud);
+   if srvReply <> concat('OK ', t) then begin
+      ConWrLn(concat('server: ', srvReply));
+      exit(DoBaud);
+   end;
+   if nb = curBaud then begin
+      ConWr('baud rate stays ');
+      ConWrNum(nb);
+      ConNewLn;
+      exit(DoBaud);
+   end;
+   old := curBaud;
+   ConWr('switching to ');
+   ConWrNum(nb);
+   ConWrLn(' baud on server and Lisa...');
+   if TryGetCh(ch, 1) then ;
+   DCp(5, nb, 0, 0);
+   curBaud := nb;
+   RefreshMenus;
+   DrawHdrBar;
+   if BannerAt then begin
+      SetTmo(0);
+      dbSync := SyncDebug;
+      if connected then begin
+         ConWr('baud rate set to ');
+         ConWrNum(nb);
+         ConWrLn(' (here and on the server)');
+         SetStatus(concat('Connected at ', t, ' baud'));
+      end;
+      exit(DoBaud);
+   end;
+   ConWr('no answer at ');
+   ConWrNum(nb);
+   ConWr(', reverting to ');
+   ConWrNum(old);
+   ConNewLn;
+   DCp(5, old, 0, 0);
+   curBaud := old;
+   RefreshMenus;
+   DrawHdrBar;
+   SendLine('HELLO');
+   if TryGetCh(ch, 2) then ;
+   DiscardQuiet;
+   if BannerAt then begin
+      SetTmo(0);
+      dbSync := SyncDebug;
+      ConWr('baud rate remains ');
+      ConWrNum(old);
+      ConNewLn;
+   end
+   else begin
+      SetTmo(0);
+      connected := false;
+      DrawHdrBar;
+      SyncTitle;
+      ConWrLn('disconnected -- check server baud rate and choose Connect');
+   end;
+end;
+
+procedure DoTFactor(arg: Str255);
+var j: integer; n: longint; ua: Str255;
+begin
+   TrimStr(arg);
+   if arg = '' then begin
+      ConWr('timeout-factor is ');
+      ConWrNum(tfactor);
+      ConWrLn('x (use: timeout-factor auto  or  timeout-factor 1..1000)');
+      exit(DoTFactor);
+   end;
+   ua := arg;
+   UpperStr(ua);
+   if ua = 'AUTO' then begin
+      if ReadyLink then begin
+         Calibrate;
+         SetTmo(0);
+      end;
+      exit(DoTFactor);
+   end;
+   for j := 1 to length(arg) do
+      if (arg[j] < '0') or (arg[j] > '9') then begin
+         ConWrLn('usage: timeout-factor [<n> | auto]   (n = 1..1000)');
+         exit(DoTFactor);
+      end;
+   if length(arg) > 4 then n := MaxTFact + 1 else n := StrToInt(arg);
+   if (n < 1) or (n > MaxTFact) then begin
+      ConWrLn('error: timeout-factor must be 1..1000');
+      exit(DoTFactor);
+   end;
+   tfactor := n;
+   DrawHdrBar;
+   ConWr('timeout-factor set to ');
+   ConWrNum(tfactor);
+   ConWrLn('x');
+end;
+
+procedure DoDebug(arg: Str255);
+var ua, st: Str255; wasCon: boolean;
+begin
+   ua := arg;
+   TrimStr(ua);
+   UpperStr(ua);
+   if ua = '' then begin
+      if debugOn then ConWrLn('debug output is on  (change with: debug on | off)')
+      else ConWrLn('debug output is off  (change with: debug on | off)');
+      exit(DoDebug);
+   end;
+   if (ua <> 'ON') and (ua <> 'OFF') then begin
+      ConWrLn('usage: debug [on | off]');
+      exit(DoDebug);
+   end;
+   debugOn := (ua = 'ON');
+   RefreshMenus;
+   DrawHdrBar;
+   if debugOn then st := 'on' else st := 'off';
+   if not portOpen then begin
+      ConWrLn(concat('debug output ', st, ' locally'));
+      exit(DoDebug);
+   end;
+   wasCon := connected;
+   if not ReadyLink then begin
+      ConWrLn(concat('debug output ', st, ' locally (no server)'));
+      exit(DoDebug);
+   end;
+   if wasCon then dbSync := SyncDebug;
+   if connected and dbSync then
+      ConWrLn(concat('debug output ', st, ' (here and on server)'))
+   else
+      ConWrLn(concat('debug output ', st, ' locally'));
+end;
+
+procedure DoDelRemote(name: Str255);
+begin
+   TrimStr(name);
+   if name = '' then begin
+      ConWrLn('usage: delete <remote>   (or del)');
+      exit(DoDelRemote);
+   end;
+   if not AskYes(concat('Delete ', name, ' on the server?')) then begin
+      ConWrLn('not deleted');
+      exit(DoDelRemote);
+   end;
+   if not ReadyLink then exit(DoDelRemote);
+   SendLine(concat('DELETE ', name));
+   if GetResponse(srvReply) then
+      if (length(srvReply) > 0) and (srvReply[1] = 'O') then begin
+         ConWrLn(concat('deleted ', name, ' on the server'));
+         SetStatus(concat('Deleted ', name, ' on server'));
+      end
+      else
+         ConWrLn(concat('server: ', srvReply));
+end;
+
+procedure BenchStart;
+begin
+   SendRaw('MARK -');
+   if GetResponse(srvReply) then ;
+end;
+
+procedure BenchMark(what: Str255; n: longint);
+var ms: longint;
+begin
+   SendRaw(concat('MARK ', what));
+   if not GetResponse(srvReply) then exit(BenchMark);
+   if (length(srvReply) < 4) or (srvReply[1] <> 'O') then begin
+      ConWrLn(concat('server: ', srvReply));
+      exit(BenchMark);
+   end;
+   benchMs := StrToInt(copy(srvReply, 4, length(srvReply) - 3));
+   ms := benchMs - benchOh;
+   if ms < 0 then ms := 0;
+   ConWr(concat('  ', what, ': '));
+   if n > 0 then begin
+      ConWrNum(n);
+      ConWr(' bytes in ');
+   end;
+   ConWrNum(ms);
+   ConWr(' ms');
+   if (ms > 0) and (n > 0) then begin
+      ConWr(' = ');
+      ConWrNum((n * 1000) div ms);
+      ConWr(' bytes/s');
+   end;
+   ConNewLn;
+end;

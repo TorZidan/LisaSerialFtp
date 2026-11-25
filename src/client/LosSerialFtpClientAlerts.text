@@ -1,0 +1,110 @@
+; =============================================================================
+;  LosSerialFtpClientAlerts.text -- phrase-file source for LosSerialFtpClient.
+;
+;  Compiled by the Workshop 'Alert' tool into the binary <tool>PHRASE file
+;  that InitMP reads at run time (see LosSerialFtpClientMake.text).  Format rules:
+;    - a comment must occupy its OWN line;
+;    - blank lines are STRUCTURAL: one ends the button block, one ends each
+;      alert's text, one ends each menu block -- do not add extras;
+;    - alert numbers strictly ascending; #1 and #2 are REQUIRED;
+;    - the alert section and the menu section each end with a lone 0.
+;
+;  Menu ids and item positions MUST match the m*/mi* constants in
+;  LosSerialFtpClient.text -- a '-' separator line COUNTS as an item.
+; =============================================================================
+;
+; Version stamp: must equal alertVerNum (= 1) in LosSerialFtpClient.text.
+1
+; cacheSize and cacheBytes for InitAlerts.
+4
+2000
+; The five icon strings: ask, wait, stop, note, caution.
+?
+Wait
+Stop
+Note
+Caution
+; Button captions: index 0 MUST be Cancel, index 1 MUST be OK.
+Cancel
+OK
+
+; ==== ALERTS =================================================================
+;
+; -- #1 REQUIRED: shown for an alert number that is not in this file.
+1 note alert
+Serial FTP could not find the message that should appear here.  If you
+are unable to proceed, mention the number ^N.
+
+; -- #2 REQUIRED: the "Swan Song", kept in cache for disk/memory failures.
+2 stop alert
+Serial FTP is having technical difficulties accessing the disk that
+contains the Serial FTP tool.^L^L
+Put away your documents one at a time, or push the on-off button to save
+them all.
+
+0
+; ==== MENUS ==================================================================
+; Read by InitMP into myMenus[1..5].  Each block: menuId, title, one item per
+; line ('/X' = Apple-key equivalent, '-' = separator), ended by a blank line.
+1
+File
+Set Aside Everything
+Set Aside "Serial FTP"
+-
+Save & Put Away
+-
+Clear Screen/K
+-
+Exit Serial FTP/Q
+
+2
+Transfer
+Connect (Hello)/H
+Repeat Last Command/R
+-
+Get File .../G
+Get If Changed (-c) ...
+Put File .../P
+Put If Changed (-c) ...
+-
+List Server Files/L
+List Server Directory ...
+-
+Delete Server File ...
+
+3
+Local
+List Local Files/D
+List Matching Prefix ...
+-
+Delete Local File ...
+-
+Working Volume .../V
+
+4
+Baud
+300
+600
+1200
+2400
+4800
+9600
+19200
+38400
+57600
+
+5
+Options
+Auto Timeout-Factor/T
+Set Timeout-Factor ...
+-
+Debug Output
+-
+20 Pitch (Small Font)
+15 Pitch (Medium Font)
+12 Pitch (Large Font)
+-
+Command Help
+About Serial FTP
+
+0

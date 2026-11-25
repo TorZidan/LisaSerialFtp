@@ -42,7 +42,9 @@ def is_banner(line):
     return line.startswith("H") and "LISA-SERIAL-FTP/v1.0" in line
 
 
-CLIENT = os.path.join(REPO, "src", "client", "LisaSerialFtpClient.text")
+# the constants both Lisa clients share (LisaSerialFtpClient.text and
+# LosSerialFtpClient.text include this file)
+CLIENT = os.path.join(REPO, "src", "client", "LisaSerialFtpDecl.text")
 
 
 def major_of(s):
@@ -63,10 +65,10 @@ def major_of(s):
 
 
 def client_version():
-    """VERSION = 'v...' in LisaSerialFtpClient.text."""
+    """FtpVer = 'v...' in LisaSerialFtpDecl.text."""
     import re
     with open(CLIENT) as f:
-        return re.search(r"^\s*VERSION\s*=\s*'([^']*)'", f.read(), re.M).group(1)
+        return re.search(r"^\s*FtpVer\s*=\s*'([^']*)'", f.read(), re.M | re.I).group(1)
 
 
 def chunk_of(s):
@@ -86,10 +88,10 @@ def chunk_of(s):
 
 
 def client_chunk():
-    """CHUNK = n in LisaSerialFtpClient.text."""
+    """ChunkSz = n in LisaSerialFtpDecl.text."""
     import re
     with open(CLIENT) as f:
-        return int(re.search(r"^\s*CHUNK\s*=\s*(\d+)\s*;", f.read(), re.M).group(1))
+        return int(re.search(r"^\s*ChunkSz\s*=\s*(\d+)\s*;", f.read(), re.M | re.I).group(1))
 
 
 def crc16(data, crc=0xFFFF):

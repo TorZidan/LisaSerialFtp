@@ -1,0 +1,521 @@
+{****************************************************************************}
+{ LisaSerialFtpProto.text -- the CRC-16 and the chunk protocol of both       }
+{ LisaSerialFtp clients: Crc16, Sum16, CrcInit, CrcSelfTest, NextSeq,        }
+{ SeqBehind, ParseReply, SendChunk, SendNAK, SendACK, AckNow, FrameTmo,      }
+{ ReadFrame, RecvChunk, AbortXfer.                                           }
+{                                                                            }
+{ Included by both clients: LisaSerialFtpClient.text (Lisa Workshop) and     }
+{ LosSerialFtpClient.text (Lisa Office System), with the I directive         }
+{ (file inclusion).  NOT a standalone unit: no PROGRAM, no USES, no END.     }
+{                                                                            }
+{ Include it after LisaSerialFtpSerial.text.                                 }
+{****************************************************************************}
+
+procedure Crc16(DATA: BytePtr; L: integer; var C: integer);
+begin
+   if L > 0 then CRC16A(DATA, L, C, ord4(@crcTab));
+end;
+
+procedure Sum16(DATA: BytePtr; L: integer; var S: longint);
+begin
+   if L > 0 then SUM16A(DATA, L, S);
+end;
+
+procedure CrcInit;
+var i, a, b, k, r, bit, x, y, top: integer;
+    crchi: array [0..255] of integer;
+    crclo: array [0..255] of integer;
+    nibhi: array [0..255] of ByteT;
+    niblo: array [0..255] of ByteT;
+    nibxor: array [0..15, 0..15] of ByteT;
+
+   procedure One(n, h, lo: integer);
+   begin
+      crchi[n] := h;
+      crclo[n] := lo;
+   end;
+
+   function X8(p, q: integer): integer;
+   begin
+      X8 := nibxor[nibhi[p], nibhi[q]] * 16 + nibxor[niblo[p], niblo[q]];
+   end;
+
+begin
+   for i := 0 to 255 do begin
+      nibhi[i] := i div 16;
+      niblo[i] := i mod 16;
+   end;
+   for a := 0 to 15 do
+      for b := 0 to 15 do begin
+         r := 0;
+         bit := 1;
+         x := a;
+         y := b;
+         for k := 1 to 4 do begin
+            if odd(x) <> odd(y) then r := r + bit;
+            x := x div 2;
+            y := y div 2;
+            bit := bit * 2;
+         end;
+         nibxor[a, b] := r;
+      end;
+   One(0, 0, 0);
+   One(1, $10, $21);
+   One(2, $20, $42);
+   One(4, $40, $84);
+   One(8, $81, $08);
+   One(16, $12, $31);
+   One(32, $24, $62);
+   One(64, $48, $C4);
+   One(128, $91, $88);
+   top := 1;
+   for i := 2 to 255 do
+      if i = top * 2 then
+         top := i
+      else begin
+         crchi[i] := X8(crchi[i - top], crchi[top]);
+         crclo[i] := X8(crclo[i - top], crclo[top]);
+      end;
+   for i := 0 to 255 do
+      if crchi[i] >= 128 then
+         crcTab[i] := (crchi[i] - 256) * 256 + crclo[i]
+      else
+         crcTab[i] := crchi[i] * 256 + crclo[i];
+end;
+
+function CrcSelfTest: boolean;
+var j, c1, c2, p, at, dl: integer; s1, s2, ln: longint; same: boolean;
+
+   procedure Pg(k, v: integer);
+   begin
+      big.pgbuf[k] := v;
+   end;
+
+begin
+   CrcInit;
+   for j := 1 to ChunkSz do
+      buf[j] := ToByte(((j mod 256) * 73 + 11) mod 256);
+   c1 := -1081;
+   c2 := $FFFF;
+   CRC16A(@buf[1], ChunkSz, c2, ord4(@crcTab));
+   same := (c1 = c2);
+   c1 := -22727;
+   c2 := $1234;
+   CRC16A(@buf[7], 1, c2, ord4(@crcTab));
+   same := same and (c1 = c2);
+   c2 := $4321;
+   CRC16A(@buf[1], 0, c2, ord4(@crcTab));
+   same := same and (c2 = $4321);
+   s1 := 64264;
+   s2 := 100;
+   SUM16A(@buf[1], ChunkSz, s2);
+   same := same and (s1 = s2);
+   MOVEB(@buf[1], @big.obuf[1], 100);
+   for j := 1 to 100 do
+      if big.obuf[j] <> buf[j] then same := false;
+
+   for j := 1 to 32 do Pg(j, 0);
+   Pg(1, 97); Pg(2, 98); Pg(3, 13); Pg(4, 16); Pg(5, 35); Pg(6, 120); Pg(7, 13);
+   p := 0; at := 1; dl := 0; ln := 0;
+   DECODEP(@big.pgbuf[1], 32, p, at, @dbuf[1], DecMaxSz, dl, ln);
+   same := same and (p = 32) and (dl = 8) and (ln = 2);
+   if dl = 8 then
+      same := same and (dbuf[1] = 97) and (dbuf[2] = 98) and (dbuf[3] = 10)
+              and (dbuf[4] = 32) and (dbuf[5] = 32) and (dbuf[6] = 32)
+              and (dbuf[7] = 120) and (dbuf[8] = 10);
+
+   for j := 1 to 9 do buf[j] := 48 + j;
+   c2 := $FFFF;
+   Crc16(@buf[1], 9, c2);
+   same := same and (c2 = $29B1);
+   CrcSelfTest := same;
+end;
+
+procedure NextSeq(var S: longint);
+begin
+   S := S + 1;
+   if S > 65535 then S := 0;
+end;
+
+function SeqBehind(R, S: longint): boolean;
+var d: longint;
+begin
+   d := S - R;
+   if d < 0 then d := d + 65536;
+   SeqBehind := (d >= 1) and (d <= 32767);
+end;
+
+function ParseReply(R: Str255; var K: char; var N: longint): boolean;
+var j: integer;
+begin
+   ParseReply := false;
+   if length(R) < 3 then exit(ParseReply);
+   if ((R[1] <> 'A') and (R[1] <> 'N')) or (R[2] <> ' ') then exit(ParseReply);
+   if length(R) > 7 then exit(ParseReply);
+   for j := 3 to length(R) do
+      if (R[j] < '0') or (R[j] > '9') then exit(ParseReply);
+   K := R[1];
+   N := StrToInt(copy(R, 3, length(R) - 2));
+   ParseReply := (N <= 65535);
+end;
+
+function SendChunk(S: longint; DATA: BufPtr; L: integer): boolean;
+var c: integer;
+    cu, sn, n: longint;
+    attempt, w, nstale, want: integer;
+    r, ns: Str255;
+    k: char;
+    valid, stale, got: boolean;
+begin
+   r := '';
+   sn := S;
+   NextSeq(sn);
+   IntToStr(S, r);
+   want := length(r) + 4;
+   r := '';
+   for attempt := 1 to MaxRetry do begin
+      if UserAbort then begin
+         SendChunk := false;
+         exit(SendChunk);
+      end;
+      LetOthersRun;
+      txFrame[1] := FrmStart;
+      txFrame[2] := ToByte(S div 256);
+      txFrame[3] := ToByte(S mod 256);
+      txFrame[4] := ToByte(L div 256);
+      txFrame[5] := ToByte(L mod 256);
+      if L > 0 then
+         MoveBytes(@DATA^[1], @txFrame[6], L);
+      c := $FFFF;
+      Crc16(@txFrame[2], 4 + L, c);
+      cu := c;
+      if cu < 0 then cu := cu + 65536;
+      txFrame[FrmHdr + L + 1] := ToByte(cu div 256);
+      txFrame[FrmHdr + L + 2] := ToByte(cu mod 256);
+      if not PutBlock(@txFrame[1], FrmOvh + L) then begin
+         SendChunk := false;
+         exit(SendChunk);
+      end;
+      nstale := 0;
+      repeat
+         w := ReplyLine(r, TmoReply, true, want);
+         if w = WaitAbt then begin
+            SendChunk := false;
+            exit(SendChunk);
+         end;
+         stale := false;
+         valid := false;
+         if w = WaitOK then begin
+            valid := ParseReply(r, k, n);
+            if valid then stale := SeqBehind(n, S);
+         end;
+         if stale then begin
+            nstale := nstale + 1;
+            if debugOn then begin
+               IntToStr(S, ns);
+               ConWrLn(concat('    chunk ', ns, ': stale reply [', r, '] skipped'));
+            end;
+         end;
+      until (not stale) or (nstale >= MaxStale);
+
+      got := valid and (not stale) and
+             (((k = 'A') and (n = S)) or ((k = 'N') and (n = sn)));
+      if (not got) and (L = 0) and (w = WaitOK) and (length(r) >= 4) then
+         if copy(r, 1, 4) = 'DONE' then begin
+            got := true;
+            eofDone := true;
+            doneLine := r;
+         end;
+      if debugOn then begin
+         ConWr('    chunk ');
+         ConWrNum(S);
+         if L > 0 then begin
+            ConWr(': ');
+            ConWrNum(L);
+            ConWr(' bytes sent');
+         end
+         else
+            ConWr(': end-of-file chunk sent');
+         if attempt > 1 then begin
+            ConWr(' (try ');
+            ConWrNum(attempt);
+            ConWr(')');
+         end;
+         ConWr(' -> ');
+         if w <> WaitOK then
+            ConWrLn('no reply, resending')
+         else if eofDone then
+            ConWrLn('DONE instead of ACK -> accepted')
+         else if got and (k = 'A') then
+            ConWrLn('accepted (ACK)')
+         else if got then
+            ConWrLn('NAK for next chunk -> accepted')
+         else if stale then
+            ConWrLn('only stale replies, resending')
+         else if valid and (k = 'N') and (n = S) then
+            ConWrLn('rejected by server (NAK), resending')
+         else if (length(r) > 0) and (r[1] = 'F') then
+            ConWrLn('server gave up')
+         else
+            ConWrLn(concat('unexpected reply [', r, '], resending'));
+      end;
+      if got then begin
+         ProgMark('.', L);
+         SendChunk := true;
+         exit(SendChunk);
+      end;
+      if (w = WaitOK) and (length(r) > 0) and (r[1] = 'F') then begin
+         ProgEnd;
+         ConWrLn(concat('server: ', r));
+         SendLine('OK');
+         linkDead := true;
+         SendChunk := false;
+         exit(SendChunk);
+      end;
+      ProgMark('x', 0);
+   end;
+   ProgEnd;
+   if length(r) > 0 then
+      ConWrLn(concat('last server reply: [', r, ']'))
+   else
+      ConWrLn('no reply from server (link dead?)');
+   SendChunk := false;
+end;
+
+procedure SendNAK(S: longint);
+var t: Str255;
+begin
+   IntToStr(S, t);
+   SendRaw(concat('N ', t));
+end;
+
+procedure SendACK(S: longint);
+var t: Str255;
+begin
+   IntToStr(S, t);
+   SendRaw(concat('A ', t));
+end;
+
+procedure AckNow;
+begin
+   if ackDue then begin
+      ackDue := false;
+      SendACK(ackNo);
+   end;
+end;
+
+function FrameTmo(n: integer): longint;
+begin
+   if curBaud > 0 then
+      FrameTmo := TmoBlock + (ord4(n) * 20) div curBaud
+   else
+      FrameTmo := TmoBlock;
+end;
+
+function ReadFrame(want: integer; DATA: BytePtr; var rseq: longint;
+                   var rlen: integer; var crcok: boolean;
+                   var why: Str255): integer;
+var hdr: array [1..FrmHdr] of ByteT;
+    c, ci, got, w: integer;
+    cu, ccrc: longint;
+    ch: char;
+    r, n1, n2: Str255;
+    eol: boolean;
+begin
+   why := '';
+   crcok := false;
+   ReadFrame := RfBad;
+   w := WaitChar(ch, TmoFrame, true);
+   if w = WaitAbt then begin
+      ReadFrame := RfAbort;
+      exit(ReadFrame);
+   end;
+   if w <> WaitOK then begin
+      if debugOn then begin
+         IntToStr(TmoFrame, n1);
+         why := concat('nothing arrived within ', n1, ' s');
+      end;
+      exit(ReadFrame);
+   end;
+   if ch <> 'T' then begin
+      r := '';
+      AddChar(r, ch);
+      eol := false;
+      while not eol do begin
+         if not TryGetCh(ch, TmoBlock) then eol := true
+         else if ch = chr(10) then eol := true
+         else if ch <> chr(13) then AddChar(r, ch);
+      end;
+      if (length(r) > 0) and (r[1] = 'F') then begin
+         ProgEnd;
+         ConWrLn(concat('server: ', r));
+         SendLine('OK');
+         linkDead := true;
+         ReadFrame := RfFail;
+         exit(ReadFrame);
+      end;
+      if debugOn then why := concat('line instead of chunk: [', r, ']');
+      exit(ReadFrame);
+   end;
+
+   if (want >= 0) and (rxqp > rxqn) then begin
+      rxqp := 1;
+      rxqn := 0;
+      rxqn := TryGetBlk(@rxq[1], want + FrmRest, FrameTmo(want + FrmRest));
+   end;
+   got := TryGetBlk(@hdr[2], 4, TmoBlock);
+   if got < 4 then begin
+      if debugOn then begin
+         IntToStr(got, n1);
+         why := concat('incomplete: ', n1, ' of 4 header bytes');
+      end;
+      exit(ReadFrame);
+   end;
+   hdr[1] := FrmStart;
+   rseq := ByteVal(hdr[2]);
+   rseq := rseq * 256 + ByteVal(hdr[3]);
+   rlen := ByteVal(hdr[4]) * 256 + ByteVal(hdr[5]);
+   if rlen > ChunkSz then begin
+      if debugOn then begin
+         IntToStr(rlen, n1);
+         why := concat('impossible length ', n1);
+      end;
+      exit(ReadFrame);
+   end;
+   if rlen > 0 then begin
+      got := TryGetBlk(DATA, rlen, FrameTmo(rlen));
+      if got < rlen then begin
+         if debugOn then begin
+            IntToStr(got, n1);
+            IntToStr(rlen, n2);
+            why := concat('incomplete: ', n1, ' of ', n2, ' bytes');
+         end;
+         exit(ReadFrame);
+      end;
+   end;
+   got := TryGetBlk(@rxb, 2, TmoBlock);
+   if got < 2 then begin
+      if debugOn then why := 'incomplete: missing CRC';
+      exit(ReadFrame);
+   end;
+   ccrc := ByteVal(rxb[0]);
+   ccrc := ccrc * 256 + ByteVal(rxb[1]);
+   c := $FFFF;
+   Crc16(@hdr[2], 4, c);
+   if rlen > 0 then Crc16(DATA, rlen, c);
+   cu := c;
+   if cu < 0 then cu := cu + 65536;
+   crcok := (cu = ccrc);
+   if (not crcok) and debugOn then begin
+      if ccrc > 32767 then ci := ccrc - 65536 else ci := ccrc;
+      IntToHex(ci, n1);
+      IntToHex(c, n2);
+      why := concat('bad CRC (got ', n1, ', calc ', n2, ')');
+   end;
+   ReadFrame := RfFrame;
+end;
+
+function RecvChunk(var S: longint; var L: integer; DATA: BytePtr;
+                   want: integer): boolean;
+var rseq: longint;
+    rlen, res, attempt: integer;
+    crcok, nak, ok: boolean;
+    why, n1, n2: Str255;
+begin
+   attempt := 0;
+   ok := false;
+   while (not ok) and (attempt < MaxRetry) do begin
+      if UserAbort then begin
+         SetTmo(0);
+         RecvChunk := false;
+         exit(RecvChunk);
+      end;
+      LetOthersRun;
+      attempt := attempt + 1;
+      res := ReadFrame(want, DATA, rseq, rlen, crcok, why);
+      if (res = RfAbort) or (res = RfFail) then begin
+         SetTmo(0);
+         RecvChunk := false;
+         exit(RecvChunk);
+      end;
+      nak := (res = RfBad);
+      if not nak then begin
+         if SeqBehind(rseq, S) then begin
+            if debugOn then begin
+               ConWr('    chunk ');
+               ConWrNum(rseq);
+               ConWrLn(': duplicate -> ACK again');
+            end;
+            SendACK(rseq);
+         end
+         else if (rseq = S) and crcok then begin
+            if debugOn then begin
+               ConWr('    chunk ');
+               ConWrNum(S);
+               if rlen > 0 then begin
+                  ConWr(': ');
+                  ConWrNum(rlen);
+                  ConWrLn(' bytes received, CRC ok -> ACK');
+               end
+               else
+                  ConWrLn(': end-of-file chunk received -> ACK');
+            end;
+            if holdAck then begin
+               ackDue := true;
+               ackNo := S;
+            end
+            else
+               SendACK(S);
+            ProgMark('.', rlen);
+            NextSeq(S);
+            L := rlen;
+            ok := true;
+         end
+         else begin
+            nak := true;
+            if debugOn and (rseq <> S) then begin
+               IntToStr(rseq, n1);
+               IntToStr(S, n2);
+               why := concat('chunk ', n1, ' arrived, expected ', n2);
+            end;
+         end;
+      end;
+      if nak then begin
+         if debugOn then begin
+            ConWr('    chunk ');
+            ConWrNum(S);
+            ConWrLn(concat(': rejected, ', why, ' -> NAK'));
+         end;
+         ProgMark('x', 0);
+         DiscardQuiet;
+         SendNAK(S);
+      end;
+   end;
+   SetTmo(0);
+   RecvChunk := ok;
+end;
+
+procedure AbortXfer(what: Str255);
+var j, w: integer; done: boolean;
+begin
+   if not linkDead then begin
+      SendLine(concat('FAIL ', what));
+      done := false;
+      j := 0;
+      while (not done) and (j < MaxAbort) do begin
+         j := j + 1;
+         w := WaitLine(srvReply, TmoReply, false);
+         if w = WaitOK then ShowRx(srvReply);
+         if w <> WaitOK then
+            j := MaxAbort
+         else if (length(srvReply) >= 4) and (copy(srvReply, 1, 4) = 'FAIL') then begin
+            SendLine('OK');
+            done := true;
+         end
+         else if srvReply = 'OK' then
+            done := true;
+      end;
+      if not done then NoServer(WaitTmo);
+   end;
+   dirty := true;
+end;

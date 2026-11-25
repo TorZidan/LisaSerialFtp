@@ -1,0 +1,2473 @@
+{==============================================================================}
+{                                                                              }
+{  LosSerialFtpClient.text -- Serial port file transfer desktop client         }
+{  application for the vintage Apple Lisa computer. Runs in the Apple Lisa     } 
+{  Office System (LOS 3.1) desktop environment.                                }
+{  Transfers text and binary files, lists directories, and deletes files       }
+{  between an Apple Lisa (Serial Port B, RS232B) and a modern computer         }
+{  running LisaSerialFtpServer.py or the web-based server.                     }
+{                                                                              }
+{  FEATURE PARITY with the LisaSerialFtpClient.text which runs in the Workshop }
+{  environment.                                                                }
+{                                                                              }
+{  SHARED CODE: the serial port routines, the CRC, the chunk protocol, the     }
+{  transfer engine and the server commands are shared with the Lisa Workshop   }
+{  client (LisaSerialFtpClient.text), in LisaSerialFtpDecl.text,               }
+{  LisaSerialFtpUtil.text, LisaSerialFtpSerial.text, LisaSerialFtpProto.text,  }
+{  LisaSerialFtpXfer.text and LisaSerialFtpCmds.text, included with the I      }
+{  directive (keep them on the same volume).  This file holds the Office       }
+{  System side, and what the shared code calls (ConWr, SetStatus, ...).        }
+{                                                                              }
+{  THE OFFICE SYSTEM & QUICKDRAW SIDE                                          }
+{    - Filer handshake (InitGraf, OpenWM, Initialize, TakeWindow, TellFiler,   }
+{      SYS_TERMINATE -> ImDying);                                              }
+{    - Pull-down menus + alerts loaded from <tool>PHRASE via InitMP;           }
+{    - Window Manager dialog band (DialogFolder / DialogHeight) for menu       }
+{      prompts, Y/N confirmations, and listing pagination;                     }
+{    - QuickDraw window with:                                                  }
+{        * top info header bar with rounded CONNECTED / OFFLINE status pill,   }
+{          baud rate, working volume, and timeout multiplier;                  }
+{        * scrollable monospaced console pane (240 lines in a private data     }
+{          segment) with interactive '> ' command prompt, blinking XOR caret,  }
+{          command history (Up/Down), vertical scroll bar (WMLsb), and         }
+{          resizable grow box (WMLgrow);                                       }
+{        * bottom status bar with live QuickDraw graphical progress bar        }
+{          during file transfers;                                              }
+{    - Event-queue polling during waits and transfers so Apple-period aborts   }
+{      cleanly while window updates and Filer events stay alive.               }
+{                                                                              }
+{  THE PROTOCOL SIDE                                                           }
+{    - Speaks LISA-SERIAL-FTP/v1.0 over RS232B (up to 57600 baud, 8N1);        }
+{    - Stop-and-wait 1016-byte CRC-16 chunks, automatic NAK/retransmit loss    }
+{      recovery, held ACKs around disk writes, atomic temp-file rename on      }
+{      verified GET, 68000 assembly CRC16A / SUM16A / MOVEB / DECODEP.         }
+{                                                                              }
+{                                                                              }
+{                                                                              }
+{==============================================================================}
+
+program LosSerialFtpClient;
+
+uses (*$U UnitStd.obj *)    UnitStd,     { base types, CMin/CMax             }
+     (*$U UnitHz.obj *)     UnitHz,      { heap zones                        }
+     (*$U Storage.obj *)    Storage,     { InitHeap, theHeap                 }
+     (*$U QuickDraw.obj *)  QuickDraw,   { ALL window drawing                }
+     (*$U Fontmgr.obj *)    FontMgr,     { font families and metrics         }
+     (*$U SysCall.obj *)    SysCall,     { RS232B, files, catalogs, segments }
+     (*$U wm.events.obj *)  Events,      { GetEvent, EventAvail, ImActive    }
+     (*$U wm.folders.obj *) Folders,     { OpenWM, TakeWindow, DialogHeight  }
+     (*$U wm.menus.obj *)   Menus,       { MenuSelect, MenuKey, CheckItem    }
+     (*$U AlertMgr.obj *)   AlertMgr,    { InitMP: menus from phrase file    }
+     (*$U WMLstd.obj *)     WMLstd,      { window-library declarations       }
+     (*$U WMLgrow.obj *)    WMLgrow,     { the grow box (size control)       }
+     (*$U WMLsb.obj *)      WMLsb,       { the scroll bars                   }
+     (*$U WMlCrs.obj *)     WMLCrs,      { cursors: I-beam / arrow           }
+     (*$U FilerComm.obj *)  FilerComm;   { TellFiler, DoFilingCmd            }
+
+{$R-}
+{$D-}
+
+const
+   FtpBuild   = '2026-11-25';
+   ProgCols   = 50;            { progress '.' marks per console line         }
+   { used by the shared code (LisaSerialFtpSerial / LisaSerialFtpXfer.text): }
+   { what to do when the server does not answer, and the temp files a get    }
+   { receives into                                                           }
+   NoSrvHint  =
+      'start LisaSerialFtpServer.py (same baud rate), then choose Connect / hello';
+   TmpBin     = 'LosSerialFtpClientTemp.BIN';
+   TmpText    = 'LosSerialFtpClientTemp.TEXT';
+
+   {----------------------------------------------- LOS & QuickDraw layout ---}
+   AlertVer   = 1;             { must match line 1 of LosSerialFtpClientAlerts }
+   MaxHeapW   = 5000;          { private heap in integers (10 KB)            }
+   ConLDSN    = 2;             { LDSN for private scrollback data segment    }
+   ConSegBytes = 32768;        { 32 KB scratch segment for console lines     }
+   ConMaxLn   = 240;           { scrollback capacity in data segment         }
+   ConFallLn  = 40;            { fallback capacity in heap if disk is full   }
+   ConCols    = 132;           { max characters stored per console line      }
+
+   DefWinW    = 640;           { initial window width (fits 88+ cols)        }
+   DefWinH    = 312;           { initial window height                       }
+   MinWinW    = 340;           { minimum window width when resizing          }
+   MinWinH    = 150;           { minimum window height when resizing         }
+   HdrBarH    = 22;            { QuickDraw top info banner height            }
+   PadH       = 6;             { horizontal text inset inside console        }
+   PadV       = 4;             { vertical text inset inside console          }
+   MaxVols    = 10;            { max mounted volumes listed                  }
+
+   { Character constants                                                     }
+   KbdBS      = chr(8);
+   KbdCR      = chr(13);
+   KbdEnter   = chr(3);
+   KbdClear   = chr(27);
+   KbdUp      = chr(30);
+   KbdDown    = chr(31);
+
+   { Menus: ids and item numbers MUST match LosSerialFtpClientAlerts.text.   }
+   { Every '-' separator line counts as an item number!                      }
+   mFile      = 1;
+      miAsdAll  = 1;           { Set Aside Everything                        }
+      miAside   = 2;           { Set Aside "Serial FTP"                      }
+      miPutAway = 4;           { Save & Put Away                             }
+      miClear   = 6;           { Clear Screen/K                              }
+      miExit    = 8;           { Exit Serial FTP/Q                           }
+
+   mXfer      = 2;
+      miConnect = 1;           { Connect (Hello)/H                           }
+      miRepeat  = 2;           { Repeat Last Command/R                       }
+      miGet     = 4;           { Get File .../G                              }
+      miGetChg  = 5;           { Get If Changed (-c) ...                     }
+      miPut     = 6;           { Put File .../P                              }
+      miPutChg  = 7;           { Put If Changed (-c) ...                     }
+      miListSrv = 9;           { List Server Files/L                         }
+      miListDir = 10;          { List Server Directory ...                   }
+      miDelSrv  = 12;          { Delete Server File ...                      }
+
+   mLocal     = 3;
+      miListLoc = 1;           { List Local Files/D                          }
+      miListPfx = 2;           { List Matching Prefix ...                    }
+      miDelLoc  = 4;           { Delete Local File ...                       }
+      miWorkVol = 6;           { Working Volume .../V                        }
+
+   mBaud      = 4;
+      miB300    = 1;
+      miB600    = 2;
+      miB1200   = 3;
+      miB2400   = 4;
+      miB4800   = 5;
+      miB9600   = 6;
+      miB19200  = 7;
+      miB38400  = 8;
+      miB57600  = 9;
+
+   mOpts      = 5;
+      miAutoTmo = 1;           { Auto Timeout-Factor/T                       }
+      miSetTmo  = 2;           { Set Timeout-Factor ...                      }
+      miDebug   = 4;           { Debug Output (check-marked)                 }
+      miFont20  = 6;           { 20 Pitch (Small Font)                       }
+      miFont15  = 7;           { 15 Pitch (Medium Font)                      }
+      miFont12  = 8;           { 12 Pitch (Large Font)                       }
+      miHelp    = 10;          { Command Help                                }
+      miAbout   = 11;          { About Serial FTP                            }
+
+   LastMenu   = 5;
+
+   { .TEXT file header constants (for creating valid Workshop/LOS .TEXT)     }
+   TxtHdrVer  = 57;
+
+type
+
+   ConLine    = string[ConCols];
+   ConArray   = array [1..ConMaxLn] of ConLine;
+   ConArrPtr  = ^ConArray;
+
+   { Layout of the 64-byte core of a .TEXT header at offset 512 in page 0    }
+   TxtPlace   = record
+                   Ln : integer;
+                   Ch : integer;
+                end;
+   TxtRange   = record
+                   LeftPl  : TxtPlace;
+                   RightPl : TxtPlace;
+                end;
+   TxtHeader  = record
+                   Version     : integer;
+                   FontId      : TLFntId;
+                   Dummy1      : integer;
+                   FontName    : string[30];
+                   TabsIncr    : integer;
+                   LMargin     : integer;
+                   RMargin     : integer;
+                   ParaMargin  : integer;
+                   CmdChar     : char;
+                   DocPosn     : integer;
+                   ElevPosn    : integer;
+                   Select      : TxtRange;
+                   Dirty       : boolean;
+                   TimeWritten : longint;
+                   NumMarkers  : integer;
+                end;
+   TxtHdrPtr  = ^TxtHeader;
+
+
+var
+   {--------------------------------------------------- LOS application ---}
+   theEvent   : EventRecord;
+   myWindow   : WindowPtr;
+   theFolder  : WindowPtr;
+   toldToDie  : boolean;
+   initing    : boolean;
+   isActive   : boolean;
+   needAutoCn : boolean;       { run initial port setup + HELLO on first idle }
+   myMenus    : array [1..LastMenu] of MenuInfo;
+   allAlerts  : TAlertFile;
+   myZone     : array [0..MaxHeapW] of integer;
+   myPrefix   : TParamAlert;
+   myVol      : e_name;        { volume prefix tool lives on, e.g. '-#12-'   }
+   curVol     : e_name;        { working volume for bare local file names    }
+   volList    : array [1..MaxVols] of e_name;
+   volFree    : array [1..MaxVols] of longint;
+   volCnt     : integer;
+   conSegPath : pathname;
+   conSegRef  : integer;
+   hasConSeg  : boolean;
+   ioNest     : integer;
+   schedErr   : integer;
+
+   {----------------------------------------- QuickDraw window & console ---}
+   conBuf     : ConArrPtr;     { scrollback lines in data segment or heap    }
+   conCap     : integer;       { ConMaxLn (300) or ConFallLn (40)            }
+   conCnt     : integer;       { lines currently used (1..conCap)            }
+   topLine    : integer;       { first visible scrollback line (1-based)     }
+   visRows    : integer;       { text rows fitting in termRect               }
+   fontChoice : integer;       { miFont20, miFont15 or miFont12              }
+   termFam    : integer;       { active QuickDraw font family                }
+   lineHt     : integer;       { ascent + descent + leading                  }
+   ascentPx   : integer;       { font ascent in pixels                       }
+   charW      : integer;       { character width in pixels                   }
+   hdrRect    : Rect;          { top QuickDraw info banner                   }
+   termRect   : Rect;          { scrollable console text area                }
+   statRect   : Rect;          { bottom status + progress bar                }
+   statOK     : boolean;       { statRect is valid on screen                 }
+   statMsg    : Str255;        { text shown on left side of statRect         }
+   barActive  : boolean;       { draw QuickDraw progress bar in statRect     }
+   barPct     : integer;       { 0..100 shown in graphical progress bar      }
+   docSBList  : TSBList;       { scroll bar list                             }
+   rightSBox  : THSB;          { vertical scroll bar                         }
+   sbMade     : boolean;
+   elevPos    : integer;       { thumb position 0..1000                      }
+   scrollRgn  : RgnHandle;     { scratch region for ScrollRect               }
+   origTitle  : Str255;        { Filer's original window title               }
+   shownTitle : Str255;        { title we last set                           }
+
+   { Interactive command line & caret                                        }
+   atPrompt   : boolean;       { bottom line is an active '> ' prompt        }
+   cmdInput   : Str255;        { characters typed at '> '                    }
+   caretVis   : boolean;       { blinking XOR caret currently drawn          }
+   blinkTime  : longint;       { next caret toggle tick                      }
+
+   { Dialog band (under the menu bar)                                        }
+   deskStyle  : TLFntId;
+   boxHeight  : integer;
+   boxHOff    : integer;
+   boxVOff    : integer;
+   promptPt   : Point;
+   dlgOpen    : boolean;
+   inModal    : boolean;       { inside ReadModalCh / CheckAbort             }
+
+
+{$I LisaSerialFtpDecl.text}    { shared: protocol constants, types, engine globals, assembly routines }
+
+
+
+
+
+{==============================================================================}
+{  Resident Callbacks & Forward Declarations                                   }
+{==============================================================================}
+
+{$S }
+
+function OutOfHeapSpace(hz: THz; bytesNeeded: integer): integer;
+begin
+   OutOfHeapSpace := 0;
+end;
+
+procedure AlertFailed;
+var err: integer;
+begin
+   if initing then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt;
+   end;
+end;
+
+{ SYS_TERMINATE handler: ImDying MUST run first so the Filer never hangs }
+procedure LastWishes(environPtr: p_env_blk; excepDataPtr: p_ex_data);
+begin
+   ImDying;
+   Halt;
+end;
+
+procedure BeginIO;
+begin
+   if ioNest = 0 then Sched_Class(schedErr, false);
+   ioNest := ioNest + 1;
+end;
+
+procedure EndIO;
+begin
+   ioNest := ioNest - 1;
+   if ioNest <= 0 then begin
+      ioNest := 0;
+      Sched_Class(schedErr, true);
+   end;
+end;
+
+procedure ProcessEvent(var e: EventRecord); forward;
+procedure DrawHdrBar; forward;
+procedure DrawStatBar; forward;
+procedure SetStatus(msg: Str255); forward;
+procedure SyncTitle; forward;
+procedure RefreshMenus; forward;
+procedure PutAwayDoc; forward;
+procedure ShutPort; forward;
+function SetupPort: boolean; forward;
+function DoHello: boolean; forward;
+function ReadyLink: boolean; forward;
+procedure RunCmdLine(line: Str255); forward;
+
+
+{==============================================================================}
+{  Small String & Number Helpers                                               }
+{==============================================================================}
+
+{$I LisaSerialFtpUtil.text}
+
+{ Resolve a user-typed local filename against curVol when bare }
+procedure FullPath(nm: Str255; var outPath: pathname);
+var s: Str255;
+begin
+   s := nm;
+   TrimStr(s);
+   if length(s) = 0 then
+      outPath := ''
+   else if s[1] = '-' then
+      outPath := s
+   else if s[1] = '#' then
+      outPath := concat('-', s)
+   else
+      outPath := concat(curVol, s);
+end;
+
+
+{==============================================================================}
+{  QuickDraw Port, Console Scrollback & Drawing                                }
+{==============================================================================}
+
+procedure InstallPort(folder: WindowPtr);
+begin
+   if folder <> nil then begin
+      theFolder := folder;
+      SetPort(theFolder);
+   end;
+end;
+
+function MaxTopLn: integer;
+var m: integer;
+begin
+   m := conCnt - visRows + 1;
+   if m < 1 then m := 1;
+   MaxTopLn := m;
+end;
+
+function CalcElev(lineNo: integer): integer;
+var travel: integer;
+begin
+   travel := MaxTopLn - 1;
+   if (lineNo <= 1) or (travel <= 0) then CalcElev := 0
+   else if lineNo - 1 >= travel then CalcElev := 1000
+   else CalcElev := (ord4(1000) * (lineNo - 1)) div travel;
+end;
+
+function CalcTopFromElev(elev: integer): integer;
+var travel: integer;
+begin
+   travel := MaxTopLn - 1;
+   if travel <= 0 then CalcTopFromElev := 1
+   else CalcTopFromElev := 1 + (ord4(travel) * elev) div 1000;
+end;
+
+procedure UseTermFont;
+var fId: TLFntId; fInfo: FontInfo; errNum: integer; fam: integer;
+begin
+   if fontChoice = miFont20 then fam := p20Tile
+   else if fontChoice = miFont12 then fam := p12Tile
+   else fam := p15Tile;
+
+   fId.Fam := fam;
+   fId.SetEFace := [];
+   fId.Dev := devScreen;
+   if not FMFontMetrics(fId, fInfo, errNum) then begin
+      fam := p12Tile;
+      fId.Fam := fam;
+      if not FMFontMetrics(fId, fInfo, errNum) then fam := sysText;
+   end;
+   termFam := fam;
+   if myWindow <> nil then begin
+      SetPort(myWindow);
+      TextFont(termFam);
+      TextFace([]);
+      GetFontInfo(fInfo);
+      lineHt := fInfo.ascent + fInfo.descent + fInfo.leading;
+      if lineHt < 8 then lineHt := 12;
+      ascentPx := fInfo.ascent;
+      charW := CharWidth('0');
+      if charW < 4 then charW := 7;
+   end;
+end;
+
+procedure RecompGeom;
+var body: Rect;
+begin
+   if myWindow = nil then exit(RecompGeom);
+   InstallPort(myWindow);
+   UseTermFont;
+
+   hdrRect := myWindow^.portRect;
+   hdrRect.bottom := hdrRect.top + HdrBarH;
+
+   body := myWindow^.portRect;
+   body.top := hdrRect.bottom;
+   body.right := body.right - (DhSbox - 1);
+   body.bottom := body.bottom - (DvSbox - 1);
+   if body.bottom < body.top + lineHt then
+      body.bottom := body.top + lineHt;
+   if body.right < body.left + 40 then
+      body.right := body.left + 40;
+
+   termRect := body;
+   InsetRect(termRect, PadH, PadV);
+   visRows := (termRect.bottom - termRect.top) div lineHt;
+   if visRows < 1 then visRows := 1;
+   termRect.bottom := termRect.top + visRows * lineHt;
+
+   if topLine > MaxTopLn then topLine := MaxTopLn;
+   if topLine < 1 then topLine := 1;
+end;
+
+procedure ClipTerm;
+begin
+   if myWindow <> nil then begin
+      SetPort(myWindow);
+      ClipRect(termRect);
+   end;
+end;
+
+procedure CaretPos(var pt: Point);
+var s: ConLine; row: integer;
+begin
+   row := conCnt - topLine;
+   pt.v := termRect.top + row * lineHt + ascentPx;
+   s := conBuf^[conCnt];
+   TextFont(termFam);
+   TextFace([]);
+   pt.h := termRect.left + StringWidth(s);
+   if pt.h > termRect.right - 2 then pt.h := termRect.right - 2;
+end;
+
+procedure CaretSet(wantVis: boolean);
+var pt: Point;
+begin
+   if (not isActive) or (myWindow = nil) or (not atPrompt) then begin
+      caretVis := false;
+      exit(CaretSet);
+   end;
+   if (conCnt < topLine) or (conCnt >= topLine + visRows) then begin
+      caretVis := false;
+      exit(CaretSet);
+   end;
+   if caretVis = wantVis then exit(CaretSet);
+   InstallPort(myWindow);
+   ClipTerm;
+   CaretPos(pt);
+   PenNormal;
+   PenMode(patXor);
+   MoveTo(pt.h, pt.v - ascentPx + 1);
+   Line(0, lineHt - 2);
+   PenNormal;
+   caretVis := wantVis;
+end;
+
+procedure SyncElev;
+var newElev: integer;
+begin
+   newElev := CalcElev(topLine);
+   if newElev <> elevPos then begin
+      elevPos := newElev;
+      if isActive and sbMade and (myWindow <> nil) then begin
+         InstallPort(myWindow);
+         SetupMvThumb(rightSBox);
+         ClipRect(myWindow^.portRect);
+         MoveThumb(elevPos);
+         PenRestore;
+         ClipTerm;
+      end;
+   end;
+end;
+
+procedure PaintRow(lnIdx: integer);
+var row, y: integer; band: Rect; s: ConLine;
+begin
+   if myWindow = nil then exit(PaintRow);
+   if (lnIdx < topLine) or (lnIdx >= topLine + visRows) then exit(PaintRow);
+   if lnIdx = conCnt then CaretSet(false);
+   InstallPort(myWindow);
+   ClipTerm;
+   TextFont(termFam);
+   TextFace([]);
+   row := lnIdx - topLine;
+   band := termRect;
+   band.top := termRect.top + row * lineHt;
+   band.bottom := band.top + lineHt;
+   EraseRect(band);
+   if (lnIdx >= 1) and (lnIdx <= conCnt) then begin
+      s := conBuf^[lnIdx];
+      if length(s) > 0 then begin
+         y := band.top + ascentPx;
+         MoveTo(termRect.left, y);
+         DrawString(s);
+      end;
+   end;
+end;
+
+procedure PaintTerm;
+var r, idx: integer; clrRect: Rect;
+begin
+   if myWindow = nil then exit(PaintTerm);
+   CaretSet(false);
+   InstallPort(myWindow);
+   clrRect := myWindow^.portRect;
+   clrRect.top := hdrRect.bottom;
+   clrRect.right := clrRect.right - (DhSbox - 1);
+   clrRect.bottom := clrRect.bottom - (DvSbox - 1);
+   ClipRect(clrRect);
+   EraseRect(clrRect);
+   ClipTerm;
+   TextFont(termFam);
+   TextFace([]);
+   for r := 0 to visRows - 1 do begin
+      idx := topLine + r;
+      if (idx >= 1) and (idx <= conCnt) then
+         if length(conBuf^[idx]) > 0 then begin
+            MoveTo(termRect.left, termRect.top + r * lineHt + ascentPx);
+            DrawString(conBuf^[idx]);
+         end;
+   end;
+end;
+
+procedure ScrollToLn(newTop: integer);
+var delta, k: integer;
+begin
+   if newTop > MaxTopLn then newTop := MaxTopLn;
+   if newTop < 1 then newTop := 1;
+   delta := newTop - topLine;
+   if delta = 0 then begin
+      SyncElev;
+      exit(ScrollToLn);
+   end;
+   CaretSet(false);
+   if (myWindow <> nil) and (abs(delta) < visRows) then begin
+      InstallPort(myWindow);
+      ClipTerm;
+      ScrollRect(termRect, 0, -delta * lineHt, scrollRgn);
+      topLine := newTop;
+      if delta > 0 then begin
+         for k := topLine + visRows - delta to topLine + visRows - 1 do
+            PaintRow(k);
+      end
+      else begin
+         for k := topLine to topLine + (-delta) - 1 do
+            PaintRow(k);
+      end;
+   end
+   else begin
+      topLine := newTop;
+      PaintTerm;
+   end;
+   SyncElev;
+end;
+
+procedure SnapBottom;
+begin
+   if topLine <> MaxTopLn then
+      ScrollToLn(MaxTopLn);
+end;
+
+{ Append text to the current console line (wrapping at ConCols) }
+procedure ConWr(s: Str255);
+var i, room, take: integer; cur: ConLine;
+begin
+   if length(s) = 0 then exit(ConWr);
+   CaretSet(false);
+   i := 1;
+   while i <= length(s) do begin
+      cur := conBuf^[conCnt];
+      room := ConCols - length(cur);
+      if room <= 0 then begin
+         { wrap onto a fresh line }
+         if conCnt < conCap then
+            conCnt := conCnt + 1
+         else begin
+            for take := 1 to conCap - 1 do
+               conBuf^[take] := conBuf^[take + 1];
+         end;
+         conBuf^[conCnt] := '';
+         cur := '';
+         room := ConCols;
+         if myWindow <> nil then ScrollToLn(MaxTopLn);
+      end;
+      take := length(s) - i + 1;
+      if take > room then take := room;
+      cur := concat(cur, copy(s, i, take));
+      conBuf^[conCnt] := cur;
+      i := i + take;
+      PaintRow(conCnt);
+   end;
+end;
+
+{ Advance to a new empty bottom line in the console }
+procedure ConNewLn;
+var j: integer; wasBot: boolean;
+begin
+   CaretSet(false);
+   wasBot := (topLine >= MaxTopLn);
+   if conCnt < conCap then begin
+      conCnt := conCnt + 1;
+      conBuf^[conCnt] := '';
+      if wasBot then begin
+         if conCnt > topLine + visRows - 1 then
+            ScrollToLn(MaxTopLn)
+         else
+            SyncElev;
+      end;
+   end
+   else begin
+      for j := 1 to conCap - 1 do
+         conBuf^[j] := conBuf^[j + 1];
+      conBuf^[conCap] := '';
+      if wasBot and (myWindow <> nil) then begin
+         InstallPort(myWindow);
+         ClipTerm;
+         ScrollRect(termRect, 0, -lineHt, scrollRgn);
+         PaintRow(conCap);
+         SyncElev;
+      end;
+   end;
+end;
+
+procedure ConWrLn(s: Str255);
+begin
+   if length(s) > 0 then ConWr(s);
+   ConNewLn;
+end;
+
+procedure ConWrNum(n: longint);
+var s: Str255;
+begin
+   IntToStr(n, s);
+   ConWr(s);
+end;
+
+procedure ShowPrompt;
+begin
+   if length(conBuf^[conCnt]) > 0 then ConNewLn;
+   cmdInput := '';
+   conBuf^[conCnt] := '> ';
+   atPrompt := true;
+   SnapBottom;
+   PaintRow(conCnt);
+   blinkTime := Time;
+end;
+
+procedure SetPromptTxt(s: Str255);
+begin
+   CaretSet(false);
+   if length(s) > ConCols - 2 then
+      cmdInput := copy(s, 1, ConCols - 2)
+   else
+      cmdInput := s;
+   conBuf^[conCnt] := concat('> ', cmdInput);
+   SnapBottom;
+   PaintRow(conCnt);
+end;
+
+procedure ConClear;
+begin
+   CaretSet(false);
+   conCnt := 1;
+   topLine := 1;
+   conBuf^[1] := '';
+   atPrompt := false;
+   if myWindow <> nil then begin
+      PaintTerm;
+      SyncElev;
+   end;
+   ShowPrompt;
+end;
+
+
+{==============================================================================}
+{  Dialog Band (Prompts & Confirmations) and Event-Aware Waiting               }
+{==============================================================================}
+
+{ Check the WM event queue during blocking serial waits / transfers.
+  Apple-period sets aborted := true.  Window updates, activations, and Filer
+  events are dispatched live so the desktop never freezes. }
+function UserAbort: boolean;
+var e: EventRecord; saveFldr: WindowPtr;
+begin
+   if not aborted then begin
+      while EventAvail and (not aborted) and (not toldToDie) do begin
+         GetEvent(e);
+         if e.what = keyDown then begin
+            if e.appleKey and (e.ascii = '.') then begin
+               aborted := true;
+               ConNewLn;
+               pcol := 0;
+               ConWrLn('*** Apple-period: stopping ***');
+            end;
+         end
+         else if (e.what = folderUpdate) or (e.what = folderActivate) or
+                 (e.what = folderDeactivate) or (e.what = filerEvent) then begin
+            saveFldr := theFolder;
+            inModal := true;
+            ProcessEvent(e);
+            inModal := false;
+            if (myWindow = nil) or toldToDie then
+               aborted := true
+            else if saveFldr <> nil then
+               InstallPort(saveFldr);
+         end;
+      end;
+   end;
+   UserAbort := aborted;
+end;
+
+procedure HideDlgBox;
+begin
+   if dlgOpen then begin
+      DialogHeight(0, false);
+      dlgOpen := false;
+   end;
+end;
+
+procedure DrawDlgBox(msg: Str255);
+var saveFldr: WindowPtr;
+begin
+   saveFldr := theFolder;
+   InstallPort(dialogFolder);
+   DialogHeight(boxHeight, false);
+   dlgOpen := true;
+   ClipRect(dialogFolder^.portRect);
+   EraseRect(dialogFolder^.portRect);
+   TextFont(sysText);
+   TextFace([]);
+   MoveTo(dialogFolder^.portRect.left + boxHOff,
+          dialogFolder^.portRect.top + boxVOff);
+   if length(msg) > 0 then
+      if msg[length(msg)] <> ' ' then msg := concat(msg, ' ');
+   DrawString(msg);
+   GetPen(promptPt);
+   if saveFldr <> nil then InstallPort(saveFldr);
+end;
+
+{ Wait for one key in the dialog band while keeping updates & Filer healthy }
+function ReadDlgCh(var ch: char): boolean;
+var e: EventRecord; saveFldr: WindowPtr; gotKey: boolean;
+begin
+   ReadDlgCh := false;
+   gotKey := false;
+   repeat
+      while not PeekEvent(e) do begin
+         if toldToDie or (myWindow = nil) then exit(ReadDlgCh);
+         LetOthersRun;
+      end;
+      if (e.what = buttonUp) or (e.what = folderUpdate) or
+         (e.what = folderMoved) or (e.what = filerEvent) then begin
+         GetEvent(e);
+         saveFldr := theFolder;
+         inModal := true;
+         ProcessEvent(e);
+         inModal := false;
+         if saveFldr <> nil then InstallPort(saveFldr);
+         if toldToDie or (myWindow = nil) then exit(ReadDlgCh);
+      end
+      else if e.what <> keyDown then
+         exit(ReadDlgCh)
+      else if e.appleKey then begin
+         GetEvent(e);
+         if e.ascii = '.' then begin
+            ch := KbdClear;
+            ReadDlgCh := false;
+         end;
+         exit(ReadDlgCh);
+      end
+      else begin
+         GetEvent(e);
+         ch := e.ascii;
+         gotKey := true;
+      end;
+   until gotKey;
+   ReadDlgCh := true;
+end;
+
+function AskDlgStr(prompt: Str255; defVal: Str255; allowEmpty: boolean;
+                   var ans: Str255): boolean;
+label 99;
+var saveFldr: WindowPtr; ch: char; s1: string[1]; sw: integer;
+    t: Rect; useDef: boolean; fullP: Str255;
+begin
+   AskDlgStr := false;
+   useDef := (length(defVal) > 0);
+   fullP := prompt;
+   if useDef then fullP := concat(prompt, ' [', defVal, '] ');
+   DrawDlgBox(fullP);
+   saveFldr := theFolder;
+   InstallPort(dialogFolder);
+   if useDef then GetPen(promptPt);
+   s1 := ' ';
+   ans := '';
+   repeat
+      if not ReadDlgCh(ch) then goto 99;
+      InstallPort(dialogFolder);
+      TextFont(sysText);
+      TextFace([]);
+      if ch = KbdBS then begin
+         if length(ans) > 0 then begin
+            ch := ans[length(ans)];
+            delete(ans, length(ans), 1);
+            sw := CharWidth(ch);
+            Move(-sw, 0);
+            SetRect(t, dialogFolder^.pnLoc.h, dialogFolder^.portRect.top,
+                    dialogFolder^.pnLoc.h + sw, dialogFolder^.portRect.bottom);
+            EraseRect(t);
+         end;
+      end
+      else if ch = KbdClear then
+         goto 99
+      else if ch >= ' ' then begin
+         if (length(ans) = 0) and useDef then begin
+            DrawDlgBox(prompt);
+            InstallPort(dialogFolder);
+            TextFont(sysText);
+            TextFace([]);
+            useDef := false;
+         end;
+         if length(ans) < 200 then begin
+            DrawChar(ch);
+            s1[1] := ch;
+            ans := concat(ans, s1);
+         end;
+      end;
+   until (ch = KbdCR) or (ch = KbdEnter);
+   if (length(ans) = 0) and useDef then ans := defVal;
+   TrimStr(ans);
+   AskDlgStr := allowEmpty or (length(ans) > 0);
+99:
+   HideDlgBox;
+   if saveFldr <> nil then InstallPort(saveFldr);
+end;
+
+function AskYes(question: Str255): boolean;
+var ch: char; ok: boolean;
+begin
+   ConWr(concat(question, ' (Y/N) '));
+   DrawDlgBox(concat(question, ' (Y or N) '));
+   ch := 'N';
+   repeat
+      ok := ReadDlgCh(ch);
+   until (not ok) or (ch in ['Y', 'y', 'N', 'n', KbdClear]);
+   HideDlgBox;
+   if ok and (ch in ['Y', 'y']) then begin
+      ConWrLn('Y');
+      AskYes := true;
+   end
+   else begin
+      ConWrLn('N');
+      AskYes := false;
+   end;
+end;
+
+
+{==============================================================================}
+{  Serial Port Primitives & Chunk Framing                                      }
+{==============================================================================}
+
+{$I LisaSerialFtpSerial.text}
+
+
+{==============================================================================}
+{  CRC-16, Assembly Wrappers & Chunk Protocol                                  }
+{==============================================================================}
+
+{$S FtpProto }
+
+{$I LisaSerialFtpProto.text}
+
+{$S }
+
+
+{==============================================================================}
+{  File Transfer Engine (GET, PUT, -c Check, .TEXT Decoding & Creation)        }
+{==============================================================================}
+
+{$S FtpXfer }
+
+{ Create a Lisa .TEXT file and prefill its 1024-byte header page in obuf[1..1024] }
+function OpenText(name: pathname; var fref: integer): boolean;
+var j: integer; hdr: TxtHdrPtr; ns: Str255;
+begin
+   OpenText := false;
+   ns := name;
+   ecode := 0;
+   BeginIO;
+   MAKE_FILE(ecode, name, 0);
+   EndIO;
+   if ecode > 0 then begin
+      ConWr(concat('cannot create ', ns, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      exit(OpenText);
+   end;
+   ecode := 0;
+   BeginIO;
+   OPEN(ecode, name, fref, [dwrite]);
+   EndIO;
+   if ecode > 0 then begin
+      ConWr(concat('cannot open local file ', ns, ': '));
+      ConWrNum(ecode);
+      ConNewLn;
+      exit(OpenText);
+   end;
+   { Build a clean Workshop/LOS .TEXT header page in obuf[1..1024] }
+   for j := 1 to TextPgSz do big.obuf[j] := 0;
+   hdr := pointer(ord4(@big.obuf[1]) + 512);
+   hdr^.Version := TxtHdrVer;
+   hdr^.FontId.Fam := p12Tile;
+   hdr^.FontId.SetEFace := [];
+   hdr^.FontId.Dev := devScreen;
+   hdr^.Dummy1 := 0;
+   hdr^.FontName := '';
+   hdr^.TabsIncr := 8;
+   hdr^.LMargin := 0;
+   hdr^.RMargin := 0;
+   hdr^.ParaMargin := 0;
+   hdr^.CmdChar := '^';
+   hdr^.DocPosn := 0;
+   hdr^.ElevPosn := 0;
+   hdr^.Select.LeftPl.Ln := 0;
+   hdr^.Select.LeftPl.Ch := 1;
+   hdr^.Select.RightPl := hdr^.Select.LeftPl;
+   hdr^.Dirty := false;
+   hdr^.TimeWritten := 0;
+   hdr^.NumMarkers := 0;
+   opos := TextPgSz;
+   ooff := 0;
+   opErr := 0;
+   OpenText := true;
+end;
+
+{$I LisaSerialFtpXfer.text}
+
+{$S }
+
+
+{==============================================================================}
+{  Local Disk, Working Volume & Pagination Commands                            }
+{==============================================================================}
+
+{$S FtpLocal }
+
+procedure PageStart;
+begin
+   pgLines := 0;
+   pageAll := false;
+end;
+
+function PageMore: boolean;
+var ch: char; ok: boolean; lim: integer;
+begin
+   PageMore := true;
+   if UserAbort then begin
+      PageMore := false;
+      exit(PageMore);
+   end;
+   if pageAll then exit(PageMore);
+   lim := visRows - 2;
+   if lim < 6 then lim := 6;
+   if pgLines >= lim then begin
+      pgLines := 0;
+      DrawDlgBox('SPACE / RETURN = next page,  A = show all,  CLEAR / Q = stop');
+      repeat
+         ok := ReadDlgCh(ch);
+      until (not ok) or (ch in [' ', KbdCR, KbdEnter, 'A', 'a', 'Q', 'q', KbdClear]);
+      HideDlgBox;
+      if (not ok) or (ch in ['Q', 'q', KbdClear]) then begin
+         ConWrLn('(listing stopped)');
+         PageMore := false;
+         exit(PageMore);
+      end;
+      if ch in ['A', 'a'] then pageAll := true;
+   end;
+   pgLines := pgLines + 1;
+end;
+
+
+procedure ShowVolFree(volPfx: e_name);
+var fsi: fs_info; p: pathname; ec: integer; vs: Str255;
+begin
+   p := volPfx;
+   vs := volPfx;
+   ec := 0;
+   BeginIO;
+   LOOKUP(ec, p, fsi);
+   EndIO;
+   if ec = 0 then begin
+      ConWr(concat('Volume ', vs, '  ('));
+      ConWrNum(fsi.freecount);
+      ConWr(' free blocks, ~');
+      ConWrNum(fsi.freecount div 2);
+      ConWrLn(' KB free)');
+   end;
+end;
+
+procedure DoListVol(arg: Str255);
+var err, j: integer;
+    catPath: pathname;
+    volPfx, prefix: e_name;
+    uarg, outl, tn, attr, dm, dcr, szStr, pszStr: Str255;
+    q: Q_Info;
+    n: longint;
+    more: boolean;
+begin
+   uarg := arg;
+   TrimStr(uarg);
+   volPfx := curVol;
+   { Allow '!list -UPPER-' or '!list -UPPER-FOO' to inspect another volume }
+   if (length(uarg) >= 2) and (uarg[1] = '-') then begin
+      j := 2;
+      while (j <= length(uarg)) and (uarg[j] <> '-') do j := j + 1;
+      if (j <= length(uarg)) and (uarg[j] = '-') then begin
+         if j <= MaxEName then volPfx := copy(uarg, 1, j);
+         uarg := copy(uarg, j + 1, length(uarg) - j);
+      end;
+   end;
+   if length(uarg) > 0 then
+      if uarg[length(uarg)] = '=' then
+         uarg := copy(uarg, 1, length(uarg) - 1);
+   if length(uarg) > MaxEName then
+      uarg := copy(uarg, 1, MaxEName);
+   prefix := uarg;
+   catPath := volPfx;
+   err := 0;
+   BeginIO;
+   RESET_CATALOG(err, catPath);
+   EndIO;
+   if err <> 0 then begin
+      outl := volPfx;
+      ConWr(concat('!list: cannot read catalog of ', outl, ': '));
+      ConWrNum(err);
+      ConNewLn;
+      exit(DoListVol);
+   end;
+   PageStart;
+   ShowVolFree(volPfx);
+   outl := volPfx;
+   if PageMore then
+      ConWrLn(concat('Contents of ', outl, uarg, '='));
+   if PageMore then
+      ConWrLn('Filename                            Size Psize   Last-Mod-Date  Creation-Date Attr')
+   else exit(DoListVol);
+   if PageMore then
+      ConWrLn('--------                            ---- -----   -------------  ------------- ----')
+   else exit(DoListVol);
+
+   n := 0;
+   more := true;
+   repeat
+      err := 0;
+      BeginIO;
+      LOOKUP_NEXT_ENTRY(err, prefix, q);
+      EndIO;
+      if err = 0 then begin
+         n := n + 1;
+         outl := q.name;
+         PadRight(outl, MaxEName);
+         attr := '';
+         if q.etype <> fileentry then begin
+            EntryKind(q.etype, tn);
+            attr := tn;
+         end;
+         if q.protected then
+            if attr = '' then attr := 'protected'
+            else attr := concat(attr, ' protected');
+         if attr <> '' then attr := concat(' ', attr);
+         DateStr(q.DTM, dm);
+         DateStr(q.DTC, dcr);
+         PadLeftNum(q.size, 8, szStr);
+         PadLeftNum((q.psize + 511) div 512, 6, pszStr);
+         more := PageMore;
+         if more then
+            ConWrLn(concat(outl, szStr, pszStr, '  ', dm, ' ', dcr, attr));
+      end;
+   until (err <> 0) or (not more);
+   if not more then exit(DoListVol);
+   if (err <> 848) and (err <> 0) then
+      if PageMore then begin
+         ConWr('!list: catalog error: ');
+         ConWrNum(err);
+         ConNewLn;
+      end;
+   if PageMore then begin
+      ConWrNum(n);
+      ConWrLn(' entries');
+   end;
+end;
+
+procedure DoDelLocal(name: Str255);
+var p: pathname; ps: Str255; j: integer;
+begin
+   TrimStr(name);
+   if name = '' then begin
+      ConWrLn('usage: !delete <local>   (or !del)');
+      exit(DoDelLocal);
+   end;
+   for j := 1 to length(name) do
+      if (name[j] = '{') or (name[j] = '}') then begin
+         ConWrLn(concat('refusing to delete ', name, ': Office System desktop/tool file'));
+         exit(DoDelLocal);
+      end;
+   FullPath(name, p);
+   ps := p;
+   if not AskYes(concat('Delete ', ps, ' on the Lisa?')) then begin
+      ConWrLn('not deleted');
+      exit(DoDelLocal);
+   end;
+   ecode := 0;
+   BeginIO;
+   KILL_OBJECT(ecode, p);
+   EndIO;
+   if ecode > 0 then begin
+      ConWr(concat('cannot delete ', ps, ': error '));
+      ConWrNum(ecode);
+      ConNewLn;
+   end
+   else begin
+      ConWrLn(concat('deleted ', ps));
+      SetStatus(concat('Deleted local file ', ps));
+   end;
+end;
+
+procedure ProbeVol(pfx: e_name);
+var fsi: fs_info; ec, dup, k: integer; path: pathname; s, ns: Str255;
+begin
+   if volCnt >= MaxVols then exit(ProbeVol);
+   for k := 1 to volCnt do
+      if volList[k] = pfx then exit(ProbeVol);
+   path := pfx;
+   ec := 0;
+   BeginIO;
+   LOOKUP(ec, path, fsi);
+   EndIO;
+   if ec <> 0 then exit(ProbeVol);
+   if not fsi.mounted then exit(ProbeVol);
+   dup := 0;
+   for k := 1 to volCnt do
+      if volFree[k] = fsi.freecount then dup := k;
+   volCnt := volCnt + 1;
+   volList[volCnt] := pfx;
+   volFree[volCnt] := fsi.freecount;
+   IntToStr(volCnt, ns);
+   s := pfx;
+   ConWr(concat('  ', ns, '  ', s, '  '));
+   ConWrNum(fsi.freecount);
+   ConWr(' free blocks (~');
+   ConWrNum(fsi.freecount div 2);
+   ConWr(' KB)');
+   if pfx = myVol then ConWr('  [tool volume]');
+   if dup > 0 then begin
+      IntToStr(dup, ns);
+      ConWr(concat('  (same free count as #', ns, ')'));
+   end;
+   ConNewLn;
+end;
+
+procedure ScanVols;
+var pfx: e_name;
+begin
+   ConWrLn('Mounted Lisa volumes:');
+   volCnt := 0;
+   ProbeVol(myVol);
+   pfx := '-#12-';   ProbeVol(pfx);
+   pfx := '-#2#1-';  ProbeVol(pfx);
+   pfx := '-#2#2-';  ProbeVol(pfx);
+   pfx := '-#3#1-';  ProbeVol(pfx);
+   pfx := '-#3#2-';  ProbeVol(pfx);
+   pfx := '-#1#1-';  ProbeVol(pfx);
+   pfx := '-#1#2-';  ProbeVol(pfx);
+   pfx := '-LOWER-'; ProbeVol(pfx);
+   pfx := '-UPPER-'; ProbeVol(pfx);
+end;
+
+procedure ApplyVol(choice: Str255);
+var k, j: integer; allDig: boolean; p: pathname; fsi: fs_info; ec: integer; vs: Str255;
+begin
+   TrimStr(choice);
+   if choice = '' then exit(ApplyVol);
+   allDig := true;
+   for j := 1 to length(choice) do
+      if (choice[j] < '0') or (choice[j] > '9') then allDig := false;
+   if allDig then begin
+      k := StrToInt(choice);
+      if (k >= 1) and (k <= volCnt) then begin
+         curVol := volList[k];
+         vs := curVol;
+         ConWrLn(concat('Working volume is now ', vs));
+         DrawHdrBar;
+         SetStatus(concat('Working volume: ', vs));
+      end
+      else
+         ConWrLn('not one of the listed volume numbers');
+      exit(ApplyVol);
+   end;
+   if choice[1] <> '-' then choice := concat('-', choice);
+   if choice[length(choice)] <> '-' then choice := concat(choice, '-');
+   UpperStr(choice);
+   if length(choice) > MaxEName then begin
+      ConWrLn('volume prefix too long');
+      exit(ApplyVol);
+   end;
+   p := choice;
+   ec := 0;
+   BeginIO;
+   LOOKUP(ec, p, fsi);
+   EndIO;
+   if (ec <> 0) or (not fsi.mounted) then begin
+      ConWr(concat('volume ', choice, ' is not mounted (error '));
+      ConWrNum(ec);
+      ConWrLn(')');
+      exit(ApplyVol);
+   end;
+   curVol := choice;
+   ConWrLn(concat('Working volume is now ', choice));
+   DrawHdrBar;
+   SetStatus(concat('Working volume: ', choice));
+end;
+
+procedure DoVolCmd(arg: Str255);
+var vs: Str255;
+begin
+   TrimStr(arg);
+   if arg = '' then begin
+      ScanVols;
+      vs := curVol;
+      ConWrLn(concat('Current working volume: ', vs, '  (change with: !volume <number | -vol->)'));
+   end
+   else begin
+      if volCnt = 0 then ScanVols;
+      ApplyVol(arg);
+   end;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Server Commands, SetupPort, Calibration, Baud, Debug, Bench & Help          }
+{==============================================================================}
+
+{$S FtpCmd }
+
+function SetupPort: boolean;
+var e: integer; mvol, mpw, mdev: e_name; opn: pathname; ds: Str255;
+begin
+   if portOpen then begin
+      SetupPort := true;
+      exit(SetupPort);
+   end;
+   SetupPort := false;
+   mvol := '';
+   mpw := '';
+   mdev := devName;
+   e := 0;
+   BeginIO;
+   MOUNT(e, mvol, mpw, mdev);
+   EndIO;
+   if (e > 0) and (e <> 1052) then begin
+      ds := devName;
+      ConWr(concat('cannot mount ', ds, ' (error '));
+      ConWrNum(e);
+      ConWrLn(')');
+      if e = 1051 then begin
+         ConWrLn('Serial B is not configured on this boot volume:');
+         ConWrLn('Open Preferences on the desktop -> Connect Devices ->');
+         ConWrLn('set Serial B Connector to Serial Cable, then choose Connect.');
+      end;
+      SetStatus('Serial B not configured -- check Preferences > Connect Devices');
+      exit(SetupPort);
+   end;
+
+   dcPath := concat('-', devName);
+   e := DCpTry(1, 0, 0, 0);
+   if e <> 0 then begin
+      ConWr('RS232B device_control error: ');
+      ConWrNum(e);
+      ConNewLn;
+      SetStatus('RS232B configuration failed');
+      exit(SetupPort);
+   end;
+   DCp(5, curBaud, 0, 0);
+   DCp(6, 0, 0, 0);
+   DCp(7, 0, 0, 0);
+   DCp(9, -1, -1, 32767);
+   DCp(9, 1024, -1, 32767);
+   DCp(10, 0, 0, 0);
+   DCp(14, 0, 0, 0);
+   curTmo := 0;
+   DCp(25, 0, 0, 0);
+   DCp(11, 0, 0, 0);
+   DCp(12, 0, 0, 0);
+   DCp(17, 0, 0, 0);
+   DCp(19, 0, 0, 0);
+
+   opn := concat(dcPath, '-HI');
+   e := 0;
+   BeginIO;
+   OPEN(e, opn, portRef, [dread, dwrite]);
+   EndIO;
+   if e > 0 then begin
+      ConWr('cannot open -RS232B-HI (error ');
+      ConWrNum(e);
+      ConWrLn(')');
+      if (e = 946) or (e = 1051) then begin
+         ConWrLn('Serial B is not set to Serial Cable in Preferences:');
+         ConWrLn('Open Preferences -> Connect Devices -> Serial B = Serial Cable.');
+      end;
+      SetStatus('Cannot open Serial B -- set Serial B to Serial Cable in Preferences');
+      exit(SetupPort);
+   end;
+   portOpen := true;
+   SetupPort := true;
+end;
+
+procedure ShutPort;
+var e: integer;
+begin
+   if portOpen then begin
+      if connected then begin
+         SendRaw('QUIT');
+         connected := false;
+      end;
+      e := 0;
+      BeginIO;
+      CLOSE_OBJECT(e, portRef);
+      EndIO;
+      portOpen := false;
+      curTmo := -1;
+   end;
+end;
+
+{$I LisaSerialFtpCmds.text}
+
+procedure DoBench(arg: Str255);
+const NB = 10;
+var j, k, fref, want, c2: integer;
+    nbytes, got: longint;
+    fname, bname: pathname;
+    line, fs: Str255;
+begin
+   fname := '';
+   if arg <> '' then begin
+      FullPath(arg, fname);
+      fs := fname;
+      ecode := 0;
+      BeginIO;
+      LOOKUP(ecode, fname, finfo);
+      EndIO;
+      if ecode > 0 then begin
+         ConWr(concat('bench: cannot open local file ', fs, ': '));
+         ConWrNum(ecode);
+         ConNewLn;
+         exit(DoBench);
+      end;
+   end;
+   if not ReadyLink then exit(DoBench);
+   ConWrLn('bench: timing client operations (server is clock)');
+   for j := 1 to ChunkSz do
+      buf[j] := ToByte(((j mod 256) * 37) mod 256);
+   nbytes := NB;
+   nbytes := nbytes * ChunkSz;
+   benchOh := 0;
+   BenchStart;
+   BenchMark('measurement overhead', 0);
+   benchOh := benchMs;
+
+   BenchStart;
+   for k := 1 to 20 do SendRaw('NEXT');
+   BenchMark('send 20 short lines (WRITE_DATA)', 120);
+
+   BenchStart;
+   SendRaw('ECHO 20');
+   for k := 1 to 20 do
+      if ReplyLine(line, 5, false, 9) <> WaitOK then ;
+   BenchMark('receive 20 short lines (read-ahead)', 180);
+
+   ProgStart(nbytes);
+   holdAck := false;
+   ackDue := false;
+   BenchStart;
+   SendRaw('FRAMES 10');
+   xf.seq := 0;
+   k := 0;
+   repeat
+      if k < NB then want := ChunkSz else want := 0;
+      xf.ok := RecvChunk(xf.seq, xf.len, @buf[1], want);
+      k := k + 1;
+   until (not xf.ok) or (xf.len = 0);
+   BenchMark('receive 10 chunks + QuickDraw progress', nbytes);
+   ProgEnd;
+
+   BenchStart;
+   c2 := $FFFF;
+   for k := 1 to NB do CRC16A(@buf[1], ChunkSz, c2, ord4(@crcTab));
+   BenchMark('CRC-16 in 68000 assembly (CRC16A)', nbytes);
+
+   BenchStart;
+   xf.bsum := 0;
+   for k := 1 to NB do SUM16A(@buf[1], ChunkSz, xf.bsum);
+   BenchMark('byte sum in 68000 assembly (SUM16A)', nbytes);
+
+   FullPath('LosSerialFtpClientBench.BIN', bname);
+   ecode := 0;
+   BeginIO;
+   KILL_OBJECT(ecode, bname);
+   EndIO;
+   BenchStart;
+   ecode := 0;
+   BeginIO;
+   MAKE_FILE(ecode, bname, 0);
+   if ecode <= 0 then OPEN(ecode, bname, fref, [dwrite]);
+   EndIO;
+   if ecode <= 0 then begin
+      got := 0;
+      for k := 1 to (NB * ChunkSz) div WriteBlkSz do begin
+         BeginIO;
+         WRITE_DATA(ecode, fref, ord4(@big.obuf[1]), WriteBlkSz, actual, sequential, 0);
+         EndIO;
+         got := got + WriteBlkSz;
+      end;
+      BeginIO;
+      CLOSE_OBJECT(ecode, fref);
+      EndIO;
+      BenchMark('write binary file (4 KB per WRITE_DATA)', got);
+   end;
+   BeginIO;
+   KILL_OBJECT(ecode, bname);
+   EndIO;
+
+   if arg <> '' then begin
+      fs := fname;
+      BenchStart;
+      if LocalSum(fname, not IsTextName(fs), false) then ;
+      BenchMark('-c local check (read + decode + CRC + sum)', xf.total);
+   end;
+   ConWrLn('bench done');
+   SetStatus('Benchmark finished');
+end;
+
+procedure ShowHelp;
+begin
+   ConWrLn('Commands (type at > prompt or choose from the menu bar):');
+   ConWrLn('  list [dir]                  list files on the server');
+   ConWrLn('  !list [prefix]              list files on the working Lisa volume');
+   ConWrLn('  get [-c] [-b|-t] <rem> [loc] download (.TEXT as Lisa text, else binary)');
+   ConWrLn('  put [-c] [-b|-t] <loc> [rem] upload (.TEXT as text -> LF, else binary)');
+   ConWrLn('      -c: skip transfer when size, CRC-16 and byte sum already match');
+   ConWrLn('      -b: byte-exact binary     -t: force text conversion');
+   ConWrLn('  delete <remote>             delete a file on the server (asks Y/N)');
+   ConWrLn('  !delete <local>             delete a file on the Lisa (asks Y/N)');
+   ConWrLn('  !volume [<n> | -vol-]       list mounted Lisa volumes or switch volume');
+   ConWrLn('  baud [rate]                 show or set baud rate (300..57600)');
+   ConWrLn('  hello                       (re-)connect to LisaSerialFtpServer.py');
+   ConWrLn('  timeout-factor [<n> | auto] show, set or measure emulator timeout factor');
+   ConWrLn('  debug [on | off]            toggle protocol/chunk trace');
+   ConWrLn('  repeat / r                  run the previous command again');
+   ConWrLn('  clear / cls                 clear the console window');
+   ConWrLn('  help / ?                    show this summary');
+   ConWrLn('  quit / q                    put Serial FTP away');
+   ConWrLn('Shortcut: Apple-. cancels any wait or transfer in progress.');
+end;
+
+procedure ShowAbout;
+var vs: Str255;
+begin
+   vs := curVol;
+   ConNewLn;
+   ConWrLn(concat('Serial FTP for Apple Lisa Office System  (', ProtoNam, FtpVer,
+                  ', build ', FtpBuild, ')'));
+   ConWr('Port: RS232B (Serial B) at ');
+   ConWrNum(curBaud);
+   ConWr(' baud, 8N1   |   Timeout-factor: ');
+   ConWrNum(tfactor);
+   ConWrLn(concat('x   |   Working volume: ', vs));
+   ConWrLn('Server: run LisaSerialFtpServer.py or the Chrome/Edge Web Serial server.');
+   ConWrLn('If RS232B will not open: open Preferences -> Connect Devices ->');
+   ConWrLn('set Serial B Connector to Serial Cable, then choose Transfer > Connect.');
+end;
+
+procedure RunCmdLine{(line: Str255)};
+begin
+   aborted := false;
+   ParseCmd(line, cmdWord, argA, argB);
+   if (cmdWord = 'REPEAT') or (cmdWord = 'R') then begin
+      if lastCmd = '' then begin
+         ConWrLn('no command to repeat');
+         exit(RunCmdLine);
+      end;
+      ConWrLn(concat('repeating: ', lastCmd));
+      line := lastCmd;
+      ParseCmd(line, cmdWord, argA, argB);
+   end;
+   if cmdWord = '' then exit(RunCmdLine);
+   cmdKnown := true;
+   if (cmdWord = 'Q') or (cmdWord = 'EXIT') then cmdWord := 'QUIT';
+
+   if cmdWord = 'LIST' then begin
+      if ReadyLink then DoList(argA);
+   end
+   else if cmdWord = 'GET' then
+      GetCmd(argA, argB)
+   else if cmdWord = 'PUT' then
+      PutCmd(argA, argB)
+   else if (cmdWord = '!LIST') or (cmdWord = 'LLIST') then
+      DoListVol(argA)
+   else if (cmdWord = 'DELETE') or (cmdWord = 'DEL') then
+      DoDelRemote(argA)
+   else if (cmdWord = '!DELETE') or (cmdWord = '!DEL') then
+      DoDelLocal(argA)
+   else if (cmdWord = '!VOLUME') or (cmdWord = '!VOL') then
+      DoVolCmd(argA)
+   else if cmdWord = 'BAUD' then
+      DoBaud(argA)
+   else if cmdWord = 'HELLO' then begin
+      if DoHello then ;
+   end
+   else if cmdWord = 'TIMEOUT-FACTOR' then
+      DoTFactor(argA)
+   else if cmdWord = 'DEBUG' then
+      DoDebug(argA)
+   else if cmdWord = 'BENCH' then
+      DoBench(argA)
+   else if (cmdWord = 'CLEAR') or (cmdWord = 'CLS') then
+      ConClear
+   else if (cmdWord = 'HELP') or (cmdWord = 'H') or (cmdWord = '?') then
+      ShowHelp
+   else if cmdWord = 'ABOUT' then
+      ShowAbout
+   else if cmdWord = 'QUIT' then begin
+      PutAwayDoc;
+      exit(RunCmdLine);
+   end
+   else begin
+      ConWrLn(concat('unknown command: ', cmdWord, '  (type help for commands)'));
+      cmdKnown := false;
+   end;
+   if cmdKnown and (cmdWord <> 'CLEAR') and (cmdWord <> 'CLS') then
+      lastCmd := line;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  QuickDraw Chrome (Header Bar, Status/Progress Bar, Scroll Bars, Menus)      }
+{==============================================================================}
+
+{$S FtpUI }
+
+{ Top QuickDraw banner: rounded CONNECTED / OFFLINE pill + live parameters }
+procedure DrawHdrBar;
+var pill: Rect; bStr, tStr, info, pillLbl, vs: Str255; pillW, baseY: integer;
+begin
+   if myWindow = nil then exit(DrawHdrBar);
+   InstallPort(myWindow);
+   ClipRect(hdrRect);
+   EraseRect(hdrRect);
+   PenNormal;
+   MoveTo(hdrRect.left, hdrRect.bottom - 1);
+   LineTo(hdrRect.right, hdrRect.bottom - 1);
+
+   TextFont(sysText);
+   TextFace([]);
+   baseY := hdrRect.top + 15;
+
+   if connected then pillLbl := ' CONNECTED '
+   else if portOpen then pillLbl := ' READY '
+   else pillLbl := ' OFFLINE ';
+
+   pillW := StringWidth(pillLbl) + 8;
+   SetRect(pill, hdrRect.left + 6, hdrRect.top + 3,
+           hdrRect.left + 6 + pillW, hdrRect.bottom - 3);
+   EraseRoundRect(pill, 8, 8);
+   MoveTo(pill.left + 4, baseY);
+   DrawString(pillLbl);
+   if connected then
+      InvertRoundRect(pill, 8, 8)
+   else
+      FrameRoundRect(pill, 8, 8);
+
+   IntToStr(curBaud, bStr);
+   IntToStr(tfactor, tStr);
+   vs := curVol;
+   info := concat('RS232B @ ', bStr, '   Vol: ', vs, '   Tmo: ', tStr, 'x');
+   if debugOn then info := concat(info, '   [DEBUG]');
+
+   TextFont(p15Tile);
+   MoveTo(pill.right + 10, baseY);
+   DrawString(info);
+
+   TextFont(termFam);
+   ClipTerm;
+end;
+
+{ Bottom QuickDraw status bar + live graphical transfer progress bar }
+procedure DrawStatBar;
+var r, progBox, fillBox: Rect; fillW, maxTxtR: integer; pctStr: Str255;
+begin
+   if (not statOK) or (myWindow = nil) then exit(DrawStatBar);
+   InstallPort(myWindow);
+   r := statRect;
+   InsetRect(r, 1, 1);
+   ClipRect(myWindow^.portRect);
+   EraseRect(r);
+
+   maxTxtR := r.right - 4;
+   if barActive then begin
+      SetRect(progBox, r.right - 136, r.top + 2, r.right - 6, r.bottom - 2);
+      if progBox.left > r.left + 80 then begin
+         PenNormal;
+         FrameRect(progBox);
+         if barPct > 0 then begin
+            fillBox := progBox;
+            InsetRect(fillBox, 1, 1);
+            fillW := ((fillBox.right - fillBox.left) * barPct) div 100;
+            fillBox.right := fillBox.left + fillW;
+            if fillBox.right > fillBox.left then
+               PaintRect(fillBox);
+         end;
+         IntToStr(barPct, pctStr);
+         pctStr := concat(pctStr, '%');
+         TextFont(p15Tile);
+         TextFace([]);
+         MoveTo(progBox.left - StringWidth(pctStr) - 5, r.bottom - 3);
+         DrawString(pctStr);
+         maxTxtR := progBox.left - StringWidth(pctStr) - 12;
+      end;
+   end;
+
+   SetRect(fillBox, r.left, r.top, maxTxtR, r.bottom);
+   ClipRect(fillBox);
+   TextFont(p15Tile);
+   TextFace([]);
+   MoveTo(r.left + 6, r.bottom - 3);
+   DrawString(statMsg);
+
+   TextFont(termFam);
+   ClipTerm;
+end;
+
+procedure SetStatus(msg: Str255);
+begin
+   if msg <> statMsg then begin
+      statMsg := msg;
+      DrawStatBar;
+   end;
+end;
+
+procedure SyncTitle;
+var t, bStr: Str255;
+begin
+   if myWindow = nil then exit(SyncTitle);
+   IntToStr(curBaud, bStr);
+   if connected then t := concat('Serial FTP -- Connected (', bStr, ')')
+   else t := 'Serial FTP';
+   if t <> shownTitle then begin
+      SetFldrTitle(myWindow, t);
+      shownTitle := t;
+   end;
+end;
+
+procedure RestoreTitle;
+begin
+   if myWindow <> nil then
+      if shownTitle <> origTitle then SetFldrTitle(myWindow, origTitle);
+   shownTitle := origTitle;
+end;
+
+procedure MakeScrollBars;
+var sBox: THSB; zPt: Point;
+begin
+   if sbMade then exit(MakeScrollBars);
+   zPt.h := 0;
+   zPt.v := 0;
+   InitSBList(docSBList, theHeap);
+   sBox := SBCreate(docSBList, HSBNil, v, zPt, 0);
+   SetSBIcons(sBox, [IconArwA, IconArwB, IconThumb, IconPagA, IconPagB]);
+   rightSBox := sBox;
+   sBox := SBCreate(docSBList, sBox, h, zPt, 0);
+   sbMade := true;
+end;
+
+procedure DrawChrome;
+var rightEdge, botEdge: Rect;
+begin
+   if (not sbMade) or (myWindow = nil) then exit(DrawChrome);
+   InstallPort(myWindow);
+   ClipRect(myWindow^.portRect);
+   FlushRects(botEdge, rightEdge);
+   rightEdge.top := hdrRect.bottom - 1;
+   SetSbRect(rightSBox, rightEdge);
+   SetSbRect(HSBNext(rightSBox), botEdge);
+   elevPos := CalcElev(topLine);
+   SetupMvThumb(rightSBox);
+   MoveThumb(elevPos);
+   PenRestore;
+   PaintSb(rightSBox);
+   EraseRect(botEdge);
+   FrameRect(botEdge);
+   PaintGrow;
+   statRect := botEdge;
+   statOK := true;
+   DrawStatBar;
+   DrawHdrBar;
+   ClipTerm;
+end;
+
+procedure UnDrawChrome;
+begin
+   if myWindow = nil then exit(UnDrawChrome);
+   statOK := false;
+   InstallPort(myWindow);
+   ClipRect(myWindow^.portRect);
+   HideSBorder(myWindow^.portRect);
+   DrawHdrBar;
+   ClipTerm;
+end;
+
+procedure ShowAll;
+begin
+   if myWindow = nil then exit(ShowAll);
+   InstallPort(myWindow);
+   CaretSet(false);
+   RecompGeom;
+   ClipRect(myWindow^.portRect);
+   EraseRect(myWindow^.portRect);
+   if isActive then DrawChrome else UnDrawChrome;
+   PaintTerm;
+   SyncTitle;
+end;
+
+procedure DoGrow(startPt: Point);
+var newBR: Point; w, h: integer;
+begin
+   CaretSet(false);
+   InstallPort(myWindow);
+   ClipRect(myWindow^.portRect);
+   DragFrame(startPt, true, newBR);
+   SubPt(myWindow^.portRect.topLeft, newBR);
+   w := newBR.h;
+   h := newBR.v;
+   if w < MinWinW then w := MinWinW;
+   if h < MinWinH then h := MinWinH;
+   FolderSize(myWindow, w, h, false);
+   InstallPort(myWindow);
+   ValidRect(myWindow^.portRect);
+   ShowAll;
+end;
+
+procedure DoScroll(startPt: Point; hitSB: THSB; hitIcon: TIcon);
+var thumbPos, pgStep: integer;
+begin
+   BeginUpdate(myWindow);
+   if not EmptyRgn(myWindow^.visRgn) then begin
+      DrawChrome;
+      PaintTerm;
+   end;
+   EndUpdate(myWindow);
+   if hitSB <> rightSBox then exit(DoScroll);
+   pgStep := visRows - 1;
+   if pgStep < 1 then pgStep := 1;
+   case hitIcon of
+      IconArwA, IconArwB: begin
+         ClipRect(myWindow^.portRect);
+         PaintArw(hitSB, hitIcon, true);
+         ClipTerm;
+         repeat
+            if hitIcon = IconArwA then ScrollToLn(topLine - 1)
+            else ScrollToLn(topLine + 1);
+         until not StillDown;
+         ClipRect(myWindow^.portRect);
+         PaintArw(hitSB, hitIcon, false);
+         ClipTerm;
+      end;
+      IconThumb: begin
+         ClipRect(myWindow^.portRect);
+         DragThumb(hitSB, startPt, thumbPos);
+         ClipTerm;
+         ScrollToLn(CalcTopFromElev(thumbPos));
+      end;
+      IconPagA, IconPagB: begin
+         ClipRect(myWindow^.portRect);
+         PaintArw(hitSB, hitIcon, true);
+         ClipTerm;
+         repeat
+            if hitIcon = IconPagA then ScrollToLn(topLine - pgStep)
+            else ScrollToLn(topLine + pgStep);
+         until not StillDown;
+         ClipRect(myWindow^.portRect);
+         PaintArw(hitSB, hitIcon, false);
+         ClipTerm;
+      end;
+      otherwise ;
+   end;
+end;
+
+procedure TrackCursor;
+var savePort: GrafPtr; mousePt: Point; frame: Rect;
+begin
+   if (not isActive) or (myWindow = nil) then exit(TrackCursor);
+   GetPort(savePort);
+   SetPort(deskPort);
+   GetMouse(mousePt);
+   SetPort(savePort);
+   InstallPort(myWindow);
+   frame := myWindow^.portRect;
+   with myWindow^.portBits.bounds do OffsetRect(frame, -left, -top);
+   with deskPort^.portBits.bounds do OffsetRect(frame, left, top);
+   if PtInRect(mousePt, frame) then begin
+      SubPt(deskPort^.portBits.bounds.topLeft, mousePt);
+      AddPt(myWindow^.portBits.bounds.topLeft, mousePt);
+      if PtInRect(mousePt, termRect) then SetStdCursor(icrsXIbeam)
+      else SetStdCursor(icrsInactive);
+   end
+   else
+      SetStdCursor(icrsInactive);
+end;
+
+procedure RefreshMenus;
+var i: integer;
+begin
+   for i := miB300 to miB57600 do
+      CheckItem(myMenus[mBaud], i, false);
+   if curBaud = 300 then CheckItem(myMenus[mBaud], miB300, true)
+   else if curBaud = 600 then CheckItem(myMenus[mBaud], miB600, true)
+   else if curBaud = 1200 then CheckItem(myMenus[mBaud], miB1200, true)
+   else if curBaud = 2400 then CheckItem(myMenus[mBaud], miB2400, true)
+   else if curBaud = 4800 then CheckItem(myMenus[mBaud], miB4800, true)
+   else if curBaud = 9600 then CheckItem(myMenus[mBaud], miB9600, true)
+   else if curBaud = 19200 then CheckItem(myMenus[mBaud], miB19200, true)
+   else if curBaud = 38400 then CheckItem(myMenus[mBaud], miB38400, true)
+   else if curBaud = 57600 then CheckItem(myMenus[mBaud], miB57600, true);
+
+   CheckItem(myMenus[mOpts], miDebug, debugOn);
+   CheckItem(myMenus[mOpts], miFont20, fontChoice = miFont20);
+   CheckItem(myMenus[mOpts], miFont15, fontChoice = miFont15);
+   CheckItem(myMenus[mOpts], miFont12, fontChoice = miFont12);
+
+   if length(lastCmd) > 0 then EnableItem(myMenus[mXfer], miRepeat)
+   else DisableItem(myMenus[mXfer], miRepeat);
+end;
+
+procedure PutUpMenus;
+var m: integer;
+begin
+   ClearMenuBar;
+   for m := mFile to LastMenu do
+      InsertMenu(myMenus[m], 0);
+   RefreshMenus;
+   DrawMenuBar;
+end;
+
+{ Run a synthesized console command from a menu selection }
+procedure ExecMenuCmd(cmdStr: Str255);
+begin
+   if myWindow = nil then exit(ExecMenuCmd);
+   CaretSet(false);
+   if atPrompt then begin
+      conBuf^[conCnt] := concat('> ', cmdStr);
+      SnapBottom;
+      PaintRow(conCnt);
+      ConNewLn;
+      atPrompt := false;
+   end
+   else
+      ConWrLn(concat('> ', cmdStr));
+   RunCmdLine(cmdStr);
+   if (myWindow <> nil) and (not toldToDie) then begin
+      RefreshMenus;
+      ShowPrompt;
+   end;
+end;
+
+procedure ChangeFontSz(item: integer);
+begin
+   if item = fontChoice then exit(ChangeFontSz);
+   fontChoice := item;
+   RefreshMenus;
+   ShowAll;
+end;
+
+procedure MenuCommand(theMenu, theItem: integer);
+var ans, defS: Str255;
+begin
+   if myWindow <> nil then InstallPort(myWindow);
+   case theMenu of
+      mFile:
+         case theItem of
+            miAsdAll:  DoFilingCmd(cmdClosAll);
+            miAside:   DoFilingCmd(cmdClose);
+            miPutAway: PutAwayDoc;
+            miClear:   ConClear;
+            miExit:    PutAwayDoc;
+            otherwise ;
+         end;
+
+      mXfer:
+         if isActive then
+            case theItem of
+               miConnect: ExecMenuCmd('hello');
+               miRepeat:  if length(lastCmd) > 0 then ExecMenuCmd('repeat');
+               miGet:
+                  if AskDlgStr('Download <remote> [local]:', '', false, ans) then
+                     ExecMenuCmd(concat('get ', ans));
+               miGetChg:
+                  if AskDlgStr('Download if changed (-c) <remote> [local]:', '', false, ans) then
+                     ExecMenuCmd(concat('get -c ', ans));
+               miPut:
+                  if AskDlgStr('Upload <local> [remote]:', '', false, ans) then
+                     ExecMenuCmd(concat('put ', ans));
+               miPutChg:
+                  if AskDlgStr('Upload if changed (-c) <local> [remote]:', '', false, ans) then
+                     ExecMenuCmd(concat('put -c ', ans));
+               miListSrv: ExecMenuCmd('list');
+               miListDir:
+                  if AskDlgStr('Server directory (blank = home):', '', true, ans) then
+                     if ans = '' then ExecMenuCmd('list')
+                     else ExecMenuCmd(concat('list ', ans));
+               miDelSrv:
+                  if AskDlgStr('Delete remote file on server:', '', false, ans) then
+                     ExecMenuCmd(concat('delete ', ans));
+               otherwise ;
+            end;
+
+      mLocal:
+         if isActive then
+            case theItem of
+               miListLoc: ExecMenuCmd('!list');
+               miListPfx:
+                  if AskDlgStr('List local files starting with:', '', true, ans) then
+                     if ans = '' then ExecMenuCmd('!list')
+                     else ExecMenuCmd(concat('!list ', ans));
+               miDelLoc:
+                  if AskDlgStr('Delete local file on Lisa:', '', false, ans) then
+                     ExecMenuCmd(concat('!delete ', ans));
+               miWorkVol: begin
+                  CaretSet(false);
+                  if atPrompt then begin
+                     conBuf^[conCnt] := '> !volume';
+                     PaintRow(conCnt);
+                     ConNewLn;
+                     atPrompt := false;
+                  end;
+                  ScanVols;
+                  defS := curVol;
+                  if AskDlgStr('Working volume (number or -vol-):', defS, false, ans) then
+                     ApplyVol(ans);
+                  ShowPrompt;
+               end;
+               otherwise ;
+            end;
+
+      mBaud:
+         if isActive then
+            case theItem of
+               miB300:   ExecMenuCmd('baud 300');
+               miB600:   ExecMenuCmd('baud 600');
+               miB1200:  ExecMenuCmd('baud 1200');
+               miB2400:  ExecMenuCmd('baud 2400');
+               miB4800:  ExecMenuCmd('baud 4800');
+               miB9600:  ExecMenuCmd('baud 9600');
+               miB19200: ExecMenuCmd('baud 19200');
+               miB38400: ExecMenuCmd('baud 38400');
+               miB57600: ExecMenuCmd('baud 57600');
+               otherwise ;
+            end;
+
+      mOpts:
+         if isActive then
+            case theItem of
+               miAutoTmo: ExecMenuCmd('timeout-factor auto');
+               miSetTmo: begin
+                  IntToStr(tfactor, defS);
+                  if AskDlgStr('Timeout-factor (1..1000 or auto):', defS, false, ans) then
+                     ExecMenuCmd(concat('timeout-factor ', ans));
+               end;
+               miDebug:
+                  if debugOn then ExecMenuCmd('debug off')
+                  else ExecMenuCmd('debug on');
+               miFont20, miFont15, miFont12:
+                  ChangeFontSz(theItem);
+               miHelp:  ExecMenuCmd('help');
+               miAbout: ExecMenuCmd('about');
+               otherwise ;
+            end;
+
+      otherwise ;
+   end;
+   HiLiteMenu(0);
+end;
+
+procedure HandleKey(var e: EventRecord);
+var theMenu, theItem: integer; ch: char; subLine: Str255;
+begin
+   if (not isActive) or (myWindow = nil) then exit(HandleKey);
+   InstallPort(myWindow);
+   ch := e.ascii;
+   if e.appleKey then begin
+      RefreshMenus;
+      MenuKey(ch, theMenu, theItem);
+      if theMenu <> 0 then begin
+         HiLiteMenu(theMenu);
+         MenuCommand(theMenu, theItem);
+      end;
+      exit(HandleKey);
+   end;
+   if not atPrompt then exit(HandleKey);
+
+   if IcrsCurrent = icrsXIbeam then ObscureCursor;
+   SnapBottom;
+   if (ch = KbdCR) or (ch = KbdEnter) then begin
+      CaretSet(false);
+      subLine := cmdInput;
+      atPrompt := false;
+      ConNewLn;
+      TrimStr(subLine);
+      if length(subLine) > 0 then
+         RunCmdLine(subLine);
+      if (myWindow <> nil) and (not toldToDie) then begin
+         RefreshMenus;
+         ShowPrompt;
+      end;
+   end
+   else if ch = KbdBS then begin
+      if length(cmdInput) > 0 then begin
+         delete(cmdInput, length(cmdInput), 1);
+         SetPromptTxt(cmdInput);
+      end;
+   end
+   else if ch = KbdClear then
+      SetPromptTxt('')
+   else if ch = KbdUp then begin
+      if length(lastCmd) > 0 then SetPromptTxt(lastCmd);
+   end
+   else if ch = KbdDown then
+      SetPromptTxt('')
+   else if (ch >= ' ') and (length(cmdInput) < ConCols - 3) then begin
+      AddChar(cmdInput, ch);
+      SetPromptTxt(cmdInput);
+   end;
+   CaretSet(true);
+   blinkTime := Time + CaretOnTime;
+end;
+
+
+{==============================================================================}
+{  Office System Window & Filer Lifecycle                                      }
+{==============================================================================}
+
+procedure ForgetWindow;
+begin
+   needAutoCn := false;
+   HideDlgBox;
+   CaretSet(false);
+   RestoreTitle;
+   statOK := false;
+   isActive := false;
+   myWindow := nil;
+   theFolder := nil;
+end;
+
+procedure PutAwayDoc;
+var err: integer; w: WindowPtr;
+begin
+   if myWindow = nil then exit(PutAwayDoc);
+   ShutPort;
+   w := myWindow;
+   ForgetWindow;
+   TellFiler(err, docClosd, docPutBack, w);
+end;
+
+procedure InitNewDoc(window: WindowPtr);
+var vs: Str255;
+begin
+   myWindow := window;
+   TakeWindow(myWindow);
+   FolderSize(myWindow, DefWinW, DefWinH, false);
+   InstallPort(myWindow);
+   GetFldrTitle(myWindow, origTitle);
+   shownTitle := origTitle;
+   statOK := false;
+
+   MakeScrollBars;
+   isActive := (activeFolder = myWindow);
+   ValidRect(myWindow^.portRect);
+
+   if (conCnt = 1) and (length(conBuf^[1]) = 0) and (not atPrompt) then begin
+      vs := curVol;
+      ConWrLn(concat('LisaSerialFtp for Office System  ', FtpVer,
+                     '  (build ', FtpBuild, ')'));
+      ConWr('Serial Port B (RS232B) at ');
+      ConWrNum(curBaud);
+      ConWrLn(concat(' baud   |   Working volume: ', vs));
+      ConWrLn('Type help for commands, or choose actions from the Transfer & Local menus.');
+      needAutoCn := true;
+   end;
+
+   ShowAll;
+   if not atPrompt then ShowPrompt;
+
+   if isActive then
+      PutUpMenus
+   else
+      RefreshMenus;
+   blinkTime := Time;
+end;
+
+procedure HandleFilerOp(var e: EventRecord; var wantsOpen: boolean);
+var fx: FilerExt; err: integer;
+begin
+   wantsOpen := false;
+   GetAddParms(err, e, fx);
+   case fx.theFlrOp of
+      fcNone:
+         wantsOpen := true;
+      fcResume:
+         TellFiler(err, docClosd, internalError, e.who);
+      fcClose, fcSuspend, fcShred: begin
+         ShutPort;
+         if e.who = myWindow then ForgetWindow;
+         TellFiler(err, docClosd, allOK, e.who);
+      end;
+      fcCopy, fcPut:
+         TellFiler(err, docNotXfered, internalError, e.who);
+      fcDfClose:
+         TellFiler(err, dfClosed, allOK, e.who);
+      fcTerminate:
+         toldToDie := true;
+      otherwise ;
+   end;
+end;
+
+procedure ProcessEvent{(var e: EventRecord)};
+var theMenu, theItem: integer;
+    hitSB: THSB;
+    hitIcon: TIcon;
+    wantsOpen: boolean;
+begin
+   if (myWindow <> nil) and (e.who = myWindow) then InstallPort(myWindow);
+
+   case e.what of
+      buttonDown:
+         if not inModal then begin
+            if e.who = menuFolder then begin
+               RefreshMenus;
+               SetStdCursor(icrsInactive);
+               MenuSelect(e.where, theMenu, theItem);
+               if (theMenu <> 0) and (theItem <> 0) then
+                  MenuCommand(theMenu, theItem)
+               else
+                  HiLiteMenu(0);
+            end
+            else if (e.who = myWindow) and isActive then begin
+               if FGrowHit(e.where) then
+                  DoGrow(e.where)
+               else if FSbHit(docSBList, e.where, hitSB, hitIcon) then
+                  DoScroll(e.where, hitSB, hitIcon)
+               else if PtInRect(e.where, termRect) then begin
+                  SnapBottom;
+                  CaretSet(true);
+                  blinkTime := Time + CaretOnTime;
+               end;
+            end;
+         end;
+
+      buttonUp:
+         ;
+
+      keyDown:
+         if not inModal then HandleKey(e);
+
+      folderActivate: begin
+         TakeControl(e, false, false);
+         if (myWindow <> nil) and (e.who = myWindow) then begin
+            InstallPort(myWindow);
+            isActive := true;
+            PutUpMenus;
+            DrawChrome;
+            caretVis := false;
+            blinkTime := Time;
+         end;
+      end;
+
+      folderDeactivate: begin
+         if (myWindow <> nil) and (e.who = myWindow) and isActive then begin
+            InstallPort(myWindow);
+            CaretSet(false);
+            UnDrawChrome;
+            isActive := false;
+            SetStdCursor(icrsInactive);
+         end;
+         GiveControl(e);
+      end;
+
+      folderUpdate:
+         if (myWindow <> nil) and (e.who = myWindow) then begin
+            InstallPort(myWindow);
+            CaretSet(false);
+            BeginUpdate(myWindow);
+            RecompGeom;
+            ClipRect(myWindow^.portRect);
+            EraseRect(myWindow^.portRect);
+            if isActive then DrawChrome else UnDrawChrome;
+            PaintTerm;
+            EndUpdate(myWindow);
+            ClipTerm;
+         end
+         else begin
+            BeginUpdate(e.who);
+            EndUpdate(e.who);
+         end;
+
+      filerEvent: begin
+         HandleFilerOp(e, wantsOpen);
+         if wantsOpen then InitNewDoc(e.who);
+      end;
+
+      otherwise ;
+   end;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Startup Initialization & Main Two-Phase Event Loop                          }
+{==============================================================================}
+
+{$S FtpInit }
+
+procedure InitDlgFont;
+var fInfo: FontInfo; errNum: integer;
+begin
+   deskStyle.Fam := sysText;
+   deskStyle.SetEFace := [];
+   deskStyle.Dev := devScreen;
+   if FMFontMetrics(deskStyle, fInfo, errNum) then
+      with fInfo do begin
+         boxHeight := ascent + descent + 12;
+         boxVOff := (boxHeight + ascent - descent) div 2;
+         boxHOff := widMax;
+      end
+   else begin
+      boxHeight := 24;
+      boxVOff := 16;
+      boxHOff := 8;
+   end;
+end;
+
+procedure Initialize;
+var err, junk, cutAt, openBr: integer;
+    pcInfo: procinfoRec;
+    excName: t_ex_name;
+    segAddr: longint;
+    braceStr: string[1];
+begin
+   initing := true;
+   ioNest := 0;
+
+   { (1) SYS_TERMINATE handler FIRST (calls ImDying) }
+   excName := 'SYS_TERMINATE';
+   Declare_Excep_Hdl(err, excName, @LastWishes);
+   if err <> 0 then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt;
+   end;
+
+   { (2) Initialize all state }
+   toldToDie := false;
+   myWindow := nil;
+   theFolder := nil;
+   isActive := false;
+   needAutoCn := false;
+   sbMade := false;
+   statOK := false;
+   statMsg := 'Ready  --  Type a command or use the menus (Apple-. cancels)';
+   barActive := false;
+   barPct := 0;
+   elevPos := 0;
+   origTitle := '';
+   shownTitle := '';
+   atPrompt := false;
+   cmdInput := '';
+   caretVis := false;
+   blinkTime := 0;
+   dlgOpen := false;
+   inModal := false;
+   fontChoice := miFont15;
+   termFam := p15Tile;
+   lineHt := 12;
+   ascentPx := 9;
+   charW := 7;
+
+   devName := 'RS232B';
+   portOpen := false;
+   curBaud := DefBaud;
+   tfactor := 1;
+   curTmo := -1;
+   rxqn := 0;
+   rxqp := 1;
+   holdAck := false;
+   ackDue := false;
+   linkDead := false;
+   eofDone := false;
+   pcol := 0;
+   pdone := 0;
+   ptotal := 0;
+   debugOn := false;
+   dbSync := false;
+   lastCmd := '';
+   logRx := true;
+   connected := false;
+   aborted := false;
+   dirty := false;
+   volCnt := 0;
+
+   { (3) Private heap for menus, alerts, scroll bars, regions }
+   InitHeap(@myZone[0], @myZone[MaxHeapW], @OutOfHeapSpace);
+
+   { (4) Build CRC-16 lookup table and verify 68000 assembly routines }
+   if not CrcSelfTest then begin
+      TellFiler(err, initFailed, internalError, nil);
+      Halt;
+   end;
+
+   { (5) Discover our installed pathname prefix & tool volume }
+   BeginIO;
+   Info_Process(err, My_ID, pcInfo);
+   EndIO;
+   cutAt := pos('}', pcInfo.progpathname);
+   if (err <> 0) or (cutAt = 0) or (cutAt > 40) then begin
+      TellFiler(err, initFailed, internalError, nil);
+      Halt;
+   end;
+   myPrefix := copy(pcInfo.progpathname, 1, cutAt);
+
+   braceStr := ' ';
+   braceStr[1] := chr(123);   { open brace }
+   openBr := pos(braceStr, pcInfo.progpathname);
+   if (openBr > 1) and (openBr <= MaxEName + 1) then
+      myVol := copy(pcInfo.progpathname, 1, openBr - 1)
+   else
+      myVol := '-#12-';
+   curVol := myVol;
+
+   { (6) Load menus and alerts from <myPrefix>PHRASE }
+   InitMP(theHeap, myPrefix, @AlertFailed, AlertVer, @myMenus[mFile], allAlerts, err);
+   if err > 0 then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt;
+   end;
+
+   { (7) Window Manager cursors & scroll bars }
+   InitWmlCrs(err);
+   if err <> 0 then begin
+      TellFiler(err, initFailed, internalError, nil);
+      Halt;
+   end;
+   InitWmlSb;
+   SetPort(deskPort);
+   InitDlgFont;
+   scrollRgn := NewRgn;
+
+   { (8) Allocate scrollback console buffer in a private data segment       }
+   {     (falls back to a smaller heap block if disk space is tight)        }
+   conSegPath := concat(myPrefix, 'ftp console');
+   hasConSeg := false;
+   BeginIO;
+   Kill_DataSeg(junk, conSegPath);
+   Make_DataSeg(err, conSegPath, ConSegBytes, ConSegBytes, conSegRef,
+                segAddr, ConLDSN, ds_private);
+   EndIO;
+   if err <= 0 then begin
+      hasConSeg := true;
+      conBuf := pointer(segAddr);
+      conCap := ConMaxLn;
+   end
+   else begin
+      conBuf := pointer(ord4(NewPtr(ConFallLn * sizeof(ConLine))));
+      if conBuf = nil then begin
+         TellFiler(err, initFailed, noDiskSpace, nil);
+         Halt;
+      end;
+      conCap := ConFallLn;
+   end;
+   conCnt := 1;
+   topLine := 1;
+   conBuf^[1] := '';
+
+   initing := false;
+end;
+
+{$S }
+
+begin
+   InitGraf(@thePort);
+   OpenWM;
+   Initialize;
+
+   repeat
+      { Phase A: inactive -- block in GetEvent }
+      while not (ImActive or toldToDie) do begin
+         GetEvent(theEvent);
+         ProcessEvent(theEvent);
+      end;
+
+      { Phase B: active -- poll events, blink caret, track cursor, yield }
+      while ImActive and (not toldToDie) do begin
+         if EventAvail then begin
+            GetEvent(theEvent);
+            ProcessEvent(theEvent);
+         end
+         else begin
+            if isActive and (myWindow <> nil) then begin
+               if needAutoCn then begin
+                  needAutoCn := false;
+                  CaretSet(false);
+                  atPrompt := false;
+                  if not DoHello then
+                     ConWrLn('(server not yet responding; local commands work, choose Connect to retry)');
+                  RefreshMenus;
+                  ShowPrompt;
+               end;
+               TrackCursor;
+               if atPrompt and (Time >= blinkTime) then begin
+                  CaretSet(not caretVis);
+                  if caretVis then blinkTime := Time + CaretOnTime
+                  else blinkTime := Time + CaretOffTime;
+               end;
+            end;
+            LetOthersRun;
+         end;
+      end;
+   until toldToDie;
+
+   ShutPort;
+   if hasConSeg then begin
+      BeginIO;
+      Close_DataSeg(schedErr, conSegRef);
+      Kill_DataSeg(schedErr, conSegPath);
+      EndIO;
+   end;
+end.

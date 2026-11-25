@@ -22,8 +22,8 @@
 #   2. compile LisaSerialFtpClient.text      -> build/LisaSerialFtpClientCompiled.OBJ
 #   3. link it with LisaSerialFtpClientAsm.OBJ and IOSPASLIB
 #                                            -> build/LisaSerialFtpClient.OBJ
-#      and put it on the disk image as LisaSerialFtpClient.obj (users copy it
-#      from there into their Workshop)
+#      and put it as LisaSerialFtpClient.obj on the floppy image (users copy it
+#      from there into their Workshop) and on the ProFile image
 #   Office System client (the same steps as LosSerialFtpClientMake.text):
 #   4. icon_48x32.png -> ICON.BIN ($LISA_PASCAL/icon-tool/png2lisaicon.py)
 #   5. assemble LosSerialFtpClientAsm.text   -> build/LosSerialFtpClientAsm.OBJ
@@ -32,38 +32,37 @@
 #                                            -> build/LosSerialFtpClient.OBJ
 #   8. compile LosSerialFtpClientAlerts.text -> {T197001}PHRASE
 #   9. put {T197001}Obj / PHRASE / ICON on the disk image and run InstallTool
-# The disk image is $DC42_IMAGE, default: ../../LisaSerialFtpClient.dc42 (the
-# floppy image users get both programs from).
+# The disk images: $DC42_IMAGE, default ../../LisaSerialFtpClient.dc42 (the
+# floppy image users get both programs from), and $PROFILE_IMAGE, default
+# ../../profile-5MB-LOSAndWorkshop3-UseWith88iorom.image (a ProFile image with
+# the Office System, Workshop 3.0 and the Workshop client).
 #
-#   ./make.sh                 build both and put them on the disk image
-#   ./make.sh workshop        only the Workshop client
-#   ./make.sh los             only the Office System client
+#   ./make.sh                 build both and put them on the disk images
 #   ./make.sh clean           delete build/
 #
 # Environment:
 #   LISA_PASCAL   the LisaPascalCrossCompiler folder (default: next to this
 #                 repository, ../../../LisaPascalCrossCompiler)
 #   LISA_BOOT     the boot volume folder (default: $LISA_PASCAL/boot-workshop3.0)
-#   DC42_IMAGE    the disk image to put the programs on
+#   DC42_IMAGE    the floppy image to put both programs on
+#   PROFILE_IMAGE the ProFile image to put the Workshop client on
 #   BUILD_DIR     where the outputs go (default: build)
 #   LPC_OPTS      more options for pascal/lpc.py, e.g. --2.0 (the 2.0 build)
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 LISA_PASCAL=${LISA_PASCAL:-$HERE/../../../LisaPascalCrossCompiler}
 DC42_IMAGE=${DC42_IMAGE:-$HERE/../../LisaSerialFtpClient.dc42}
+PROFILE_IMAGE=${PROFILE_IMAGE:-$HERE/../../profile-5MB-LOSAndWorkshop3-UseWith88iorom.image}
 BUILD_DIR=${BUILD_DIR:-$HERE/build}
 
 die() { echo "make.sh: $*" >&2; exit 1; }
 
 cd "$HERE"
-WHAT=all
-for a in "$@"; do
-  case "$a" in
-    clean)              rm -rf "$BUILD_DIR"; echo "deleted $BUILD_DIR/"; exit 0 ;;
-    workshop|los|all)   WHAT=$a ;;
-    *)                  die "unknown argument '$a' (use: workshop, los, all, clean)" ;;
-  esac
-done
+case "$1" in
+  clean) rm -rf "$BUILD_DIR"; echo "deleted $BUILD_DIR/"; exit 0 ;;
+  "")    ;;
+  *)     die "unknown argument '$1' (use: clean, or nothing to build)" ;;
+esac
 
 [ -d "$LISA_PASCAL" ] || die "no compiler at $LISA_PASCAL (set LISA_PASCAL)"
 LISA_PASCAL=$(cd "$LISA_PASCAL" && pwd)
@@ -76,6 +75,8 @@ ICON_TOOL=$LISA_PASCAL/icon-tool/png2lisaicon.py
 [ -f "$FS_TOOLS/LisaFileSystemToolPerFile.py" ] || die "no LisaFileSystemToolPerFile.py in $FS_TOOLS"
 [ -f "$DC42_IMAGE" ] || die "no disk image at $DC42_IMAGE (set DC42_IMAGE)"
 DC42_IMAGE=$(cd "$(dirname "$DC42_IMAGE")" && pwd)/$(basename "$DC42_IMAGE")
+[ -f "$PROFILE_IMAGE" ] || die "no disk image at $PROFILE_IMAGE (set PROFILE_IMAGE)"
+PROFILE_IMAGE=$(cd "$(dirname "$PROFILE_IMAGE")" && pwd)/$(basename "$PROFILE_IMAGE")
 
 # The sources go into the build folder, as on one Lisa volume: the programs
 # include the shared files by name.
@@ -128,44 +129,54 @@ link() {
   echo "  $BUILD_DIR/$out.OBJ: $(wc -c < "$BUILD_DIR/$out.OBJ") bytes"
 }
 
-if [ "$WHAT" != los ]; then
-  echo "=== LisaSerialFtpClient (Lisa Workshop)"
-  audit LisaSerialFtpClient
-  assemble LisaSerialFtpClientAsm LisaSerialFtpClientAsm
-  compile LisaSerialFtpClient LisaSerialFtpClientCompiled
-  link LisaSerialFtpClient LisaSerialFtpClientCompiled LisaSerialFtpClientAsm IOSPASLIB
-  echo "putting LisaSerialFtpClient.obj onto $DC42_IMAGE"
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" \
+echo "=== LisaSerialFtpClient (Lisa Workshop)"
+audit LisaSerialFtpClient
+assemble LisaSerialFtpClientAsm LisaSerialFtpClientAsm
+compile LisaSerialFtpClient LisaSerialFtpClientCompiled
+link LisaSerialFtpClient LisaSerialFtpClientCompiled LisaSerialFtpClientAsm IOSPASLIB
+for img in "$DC42_IMAGE" "$PROFILE_IMAGE"; do
+  echo "putting LisaSerialFtpClient.obj onto $img"
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$img" \
     "$BUILD_DIR/LisaSerialFtpClient.OBJ" 'LisaSerialFtpClient.obj' > "$BUILD_DIR/put.log" 2>&1 ||
-    { cat "$BUILD_DIR/put.log"; die "cannot put LisaSerialFtpClient.obj on the disk image (see $BUILD_DIR/put.log)"; }
+    { cat "$BUILD_DIR/put.log"; die "cannot put LisaSerialFtpClient.obj on $img (see $BUILD_DIR/put.log)"; }
+done
+
+echo ""
+echo "=== LosSerialFtpClient (Lisa Office System)"
+[ -f "$ICON_TOOL" ] || die "no $ICON_TOOL"
+if [ -f "$HERE/icon_48x32.png" ]; then
+  echo "converting the png icon to a Lisa icon"
+  python3 "$ICON_TOOL" "$HERE/icon_48x32.png" "$BUILD_DIR/ICON.BIN"
 fi
+audit LosSerialFtpClient
+assemble LosSerialFtpClientAsm LosSerialFtpClientAsm
+compile LosSerialFtpClient LosSerialFtpClientCompiled
+link LosSerialFtpClient LosSerialFtpClientCompiled LosSerialFtpClientAsm IOSPASLIB SYS1LIB SYS2LIB
 
-if [ "$WHAT" != workshop ]; then
-  echo "=== LosSerialFtpClient (Lisa Office System)"
-  [ -f "$ICON_TOOL" ] || die "no $ICON_TOOL"
-  if [ -f "$HERE/icon_48x32.png" ]; then
-    echo "converting the png icon to a Lisa icon"
-    python3 "$ICON_TOOL" "$HERE/icon_48x32.png" "$BUILD_DIR/ICON.BIN"
-  fi
-  audit LosSerialFtpClient
-  assemble LosSerialFtpClientAsm LosSerialFtpClientAsm
-  compile LosSerialFtpClient LosSerialFtpClientCompiled
-  link LosSerialFtpClient LosSerialFtpClientCompiled LosSerialFtpClientAsm IOSPASLIB SYS1LIB SYS2LIB
+echo "compiling LosSerialFtpClientAlerts.text"
+( cd "$BUILD_DIR" && rm -f '{T197001}PHRASE' &&
+  python3 "$LISA_PASCAL/alert/alert.py" "$HERE/LosSerialFtpClientAlerts.text" '{T197001}' > alert.log 2>&1 ) ||
+  { cat "$BUILD_DIR/alert.log"; die "alert failed (see $BUILD_DIR/alert.log)"; }
+echo "  $(grep 'All .* alerts read' "$BUILD_DIR/alert.log")  $(grep 'All .* menus read' "$BUILD_DIR/alert.log")"
+echo "  $BUILD_DIR/{T197001}PHRASE: $(wc -c < "$BUILD_DIR/{T197001}PHRASE") bytes"
 
-  echo "compiling LosSerialFtpClientAlerts.text"
-  ( cd "$BUILD_DIR" && rm -f '{T197001}PHRASE' &&
-    python3 "$LISA_PASCAL/alert/alert.py" "$HERE/LosSerialFtpClientAlerts.text" '{T197001}' > alert.log 2>&1 ) ||
-    { cat "$BUILD_DIR/alert.log"; die "alert failed (see $BUILD_DIR/alert.log)"; }
-  echo "  $(grep 'All .* alerts read' "$BUILD_DIR/alert.log")  $(grep 'All .* menus read' "$BUILD_DIR/alert.log")"
-  echo "  $BUILD_DIR/{T197001}PHRASE: $(wc -c < "$BUILD_DIR/{T197001}PHRASE") bytes"
+echo "installing {T197001} onto $DC42_IMAGE"
+{
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/ICON.BIN" '{T197001}ICON'
+  python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
+    --image "$DC42_IMAGE" Y '' 197001 N N 'Serial FTP Client'
+} > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
+echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
 
-  echo "installing {T197001} onto $DC42_IMAGE"
-  {
-    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
-    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
-    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/ICON.BIN" '{T197001}ICON'
-    python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
-      --image "$DC42_IMAGE" Y '' 197001 N N 'Serial FTP Client'
-  } > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
-  echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
-fi
+echo "installing {T197001} onto $PROFILE_IMAGE"
+{
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/ICON.BIN" '{T197001}ICON'
+  python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
+    --image "$PROFILE_IMAGE" Y '' 197001 N N 'Serial FTP Client'
+} > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
+echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
+

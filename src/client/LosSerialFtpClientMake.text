@@ -2,6 +2,7 @@ $EXEC
 ${=============================================================================}
 ${ LosSerialFtpClientMake.text -- build driver for LosSerialFtpClient (LOS).   }
 ${ Run it in the Workshop with R, then <LosSerialFtpClientMake                 }
+${   0. fetch the newest sources from the server with LisaSerialFtpClient.OBJ  }
 ${   1. assemble LosSerialFtpClientAsm.text  -> LosSerialFtpClientAsm.OBJ      }
 ${   2. compile LosSerialFtpClient.text      -> LosSerialFtpClientCompiled.OBJ }
 ${   3. link with LosSerialFtpClientAsm, IOSPASLIB, SYS1LIB, SYS2LIB           }
@@ -15,24 +16,31 @@ ${ from its pathname at run time).  To renumber, change every 197001 below.    }
 ${ A line holding only a comment emits a bare [RETURN] -- used on purpose.     }
 ${=============================================================================}
 ${                                                                             }
-${ Optional: if LisaSerialFtpServer.py is sharing src/client and               }
-${ LisaSerialFtpClient.OBJ is on this disk, uncomment to fetch newest sources  }
-${ (LosSerialFtpClient.text includes the shared LisaSerialFtp*.text files, and }
-${ LosSerialFtpClientAsm.text includes LisaSerialFtpClientAsm.text):           }
-${ R{un}LisaSerialFtpClient.OBJ                                                }
-${ get -c LosSerialFtpClientAsm.text                                           }
-${ get -c LisaSerialFtpClientAsm.text                                          }
-${ get -c LisaSerialFtpDecl.text                                               }
-${ get -c LisaSerialFtpUtil.text                                               }
-${ get -c LisaSerialFtpSerial.text                                             }
-${ get -c LisaSerialFtpProto.text                                              }
-${ get -c LisaSerialFtpXfer.text                                               }
-${ get -c LisaSerialFtpCmds.text                                               }
-${ get -c LosSerialFtpClientAlerts.text                                        }
-${ get -c LosSerialFtpClient.text                                              }
-${ get -c -b ICON.BIN                                                          }
-${ quit                                                                        }
-${ $DOIT                                                                       }
+${ 0. Fetch the newest sources with the current client (the Workshop client,   }
+${ LisaSerialFtpClient.OBJ, must be on this disk, and LisaSerialFtpServer.py   }
+${ must be running and sharing src/client of the repository, e.g.              }
+${   python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 \           }
+${           --home_dir src/client                                             }
+${ LosSerialFtpClient.text includes the shared LisaSerialFtp*.text files, and  }
+${ LosSerialFtpClientAsm.text includes LisaSerialFtpClientAsm.text; ICON.BIN   }
+${ (binary: -b) is the desktop icon.  get -c skips a file that is unchanged.   }
+${ If a get fails, the client says so at quit and waits for SPACE: the         }
+${ $DOIT right after quit makes that key come from the keyboard, so the        }
+${ build stops there instead of using a stale file.                            }
+R{un}LisaSerialFtpClient.OBJ
+get -c LosSerialFtpClientAsm.text
+get -c LisaSerialFtpClientAsm.text
+get -c LisaSerialFtpDecl.text
+get -c LisaSerialFtpUtil.text
+get -c LisaSerialFtpSerial.text
+get -c LisaSerialFtpProto.text
+get -c LisaSerialFtpXfer.text
+get -c LisaSerialFtpCmds.text
+get -c LosSerialFtpClientAlerts.text
+get -c LosSerialFtpClient.text
+get -c -b ICON.BIN
+quit
+$DOIT
 ${                                                                             }
 ${ Delete stale outputs first: a stale .OBJ silently poisons a build.          }
 F{ilemgr}D{elete}LosSerialFtpClientAsm.OBJ  Y{es}

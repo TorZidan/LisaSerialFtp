@@ -79,13 +79,11 @@ With [`LisaPascalCrossCompiler`](https://github.com/TorZidan/LisaPascalCrossComp
 
 ```sh
 cd src/client
-./make.sh                # both programs, put onto ../../LisaSerialFtpClient.dc42
-./make.sh workshop       # only the Workshop client
-./make.sh los            # only the Office System client
+./make.sh                # both programs, put onto the disk images in ../..
 ./make.sh clean          # delete build/
 ```
 
-Before compiling each client it checks it for Lisa Pascal's 8-character identifier rule, with the files it includes and against the units it uses (`pascal/audit_8char.py` of `LisaPascalCrossCompiler`; `src/server/tests/audit_8char.py` runs the same check for both clients). For the Workshop client it assembles `LisaSerialFtpClientAsm.text`, compiles `LisaSerialFtpClient.text`, links `build/LisaSerialFtpClient.OBJ` against `IOSPASLIB`, and puts it on the floppy image `../../LisaSerialFtpClient.dc42` (`DC42_IMAGE`) as `LisaSerialFtpClient.obj`: users get the program from there (see the [main README](../../README.md)). For the Office System client it builds `ICON.BIN`, assembles `LosSerialFtpClientAsm.text`, compiles `LosSerialFtpClient.text`, links `build/LosSerialFtpClient.OBJ` against `IOSPASLIB`, `SYS1LIB`, and `SYS2LIB`, compiles the phrase file, and installs tool `197001` onto the disk image (`DC42_IMAGE`). It uses the tools of `LisaPascalCrossCompiler`: `pascal/lpc.py`, `assembler/`, `linker/`, `alert/`, `icon-tool/png2lisaicon.py` (for `ICON.BIN`), and `file-system-tools/` and `installtool/` to install the tool onto the disk image.
+Before compiling each client it checks it for Lisa Pascal's 8-character identifier rule, with the files it includes and against the units it uses (`pascal/audit_8char.py` of `LisaPascalCrossCompiler`; `src/server/tests/audit_8char.py` runs the same check for both clients). For the Workshop client it assembles `LisaSerialFtpClientAsm.text`, compiles `LisaSerialFtpClient.text`, links `build/LisaSerialFtpClient.OBJ` against `IOSPASLIB`, and puts it as `LisaSerialFtpClient.obj` on the floppy image `../../LisaSerialFtpClient.dc42` (`DC42_IMAGE`), where users get the program from (see the [main README](../../README.md)), and on the ProFile image `../../profile-5MB-LOSAndWorkshop3-UseWith88iorom.image` (`PROFILE_IMAGE`). For the Office System client it builds `ICON.BIN`, assembles `LosSerialFtpClientAsm.text`, compiles `LosSerialFtpClient.text`, links `build/LosSerialFtpClient.OBJ` against `IOSPASLIB`, `SYS1LIB`, and `SYS2LIB`, compiles the phrase file, and installs tool `197001` onto the disk image (`DC42_IMAGE`). It uses the tools of `LisaPascalCrossCompiler`: `pascal/lpc.py`, `assembler/`, `linker/`, `alert/`, `icon-tool/png2lisaicon.py` (for `ICON.BIN`), and `file-system-tools/` and `installtool/` to install the tool onto the disk image.
 
 ### Option B: Building & Installing on the Lisa
 
@@ -93,10 +91,10 @@ The Workshop client: see "Compiling and linking the client app" in the [main REA
 
 The Office System client (`LosSerialFtpClientMake.text`):
 
-1. Copy `LosSerialFtpClient.text`, the six shared `LisaSerialFtp*.text` files listed above, `LosSerialFtpClientAsm.text`, `LisaSerialFtpClientAsm.text`, `LosSerialFtpClientAlerts.text`, `LosSerialFtpClientMake.text`, and `ICON.BIN` (binary) onto your Workshop / LOS disk (for example using `LisaSerialFtpClient.OBJ` in Workshop with `LisaSerialFtpServer.py --home_dir src/client`; the commented-out `get` lines at the top of `LosSerialFtpClientMake.text` do it).
+1. Have the Workshop client `LisaSerialFtpClient.OBJ` and `LosSerialFtpClientMake.text` on your Workshop / LOS disk, and start `LisaSerialFtpServer.py --home_dir src/client` (the server must share `src/client`). The first step of `LosSerialFtpClientMake.text` runs the Workshop client to fetch all the files the build needs: `LosSerialFtpClient.text`, the six shared `LisaSerialFtp*.text` files, `LosSerialFtpClientAsm.text`, `LisaSerialFtpClientAsm.text`, `LosSerialFtpClientAlerts.text`, and `ICON.BIN`.
 2. In Lisa Workshop, press **`R`** (*Run*) and enter:
    ```
    <LosSerialFtpClientMake
    ```
-   This assembles, compiles, and links `LosSerialFtpClient.OBJ`, copies `{T197001}Obj` and `{T197001}ICON`, compiles `{T197001}PHRASE` with `Alert`, and registers tool **`197001` ("Serial FTP")** with `InstallTool`.
+   This assembles, compiles, and links `LosSerialFtpClient.OBJ`, copies `{T197001}Obj` and `{T197001}ICON`, compiles `{T197001}PHRASE` with `Alert`, and registers tool **`197001` ("Serial FTP Client")** with `InstallTool`.
 3. Boot into the **Lisa Office System**: **Serial FTP** appears as a tool icon on your hard disk. Ensure **Preferences -> Connect Devices -> Serial B Connector** is set to **Serial Cable**, start `LisaSerialFtpServer.py` on your PC, and open **Serial FTP**.

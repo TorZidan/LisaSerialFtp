@@ -339,8 +339,10 @@ Assemble the assembly file, compile the program, and link the two objects with
 unit).
 
 On a PC, [`src/client/make.sh`](src/client/make.sh) builds both clients with the
-[Lisa Pascal cross-compiler](https://github.com/TorZidan/LisaPascalCrossCompiler)
-(`./make.sh workshop` builds only this one, into `src/client/build/`).
+[Lisa Pascal cross-compiler](https://github.com/TorZidan/LisaPascalCrossCompiler),
+into `src/client/build/`, and puts this one, `LisaSerialFtpClient.obj`, on
+[`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42) and
+[`profile-5MB-LOSAndWorkshop3-UseWith88iorom.image`](./profile-5MB-LOSAndWorkshop3-UseWith88iorom.image).
 
 The Workshop macro / exec file [`LisaSerialFtpClientMake.text`](src/client/LisaSerialFtpClientMake.text) does all
 of it, after fetching the newest sources (which requires having a compiled `LisaSerialFtpClient.obj` on the

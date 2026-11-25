@@ -7,7 +7,8 @@ ${   1. assemble LosSerialFtpClientAsm.text  -> LosSerialFtpClientAsm.OBJ      }
 ${   2. compile LosSerialFtpClient.text      -> LosSerialFtpClientCompiled.OBJ }
 ${   3. link with LosSerialFtpClientAsm, IOSPASLIB, SYS1LIB, SYS2LIB           }
 ${                                           -> LosSerialFtpClient.OBJ         }
-${   4. copy executable and ICON.BIN to tool names T197001 Obj / ICON          }
+${   4. copy the executable and LisaSerialFtpClientIcon.BIN to tool names      }
+${      T197001 Obj / ICON                                                     }
 ${   5. compile the phrase file (menus) to T197001PHRASE                       }
 ${   6. InstallTool: register tool 197001 "Serial FTP Client" with the Lisa    }
 ${      Office System.                                                                        }
@@ -22,8 +23,9 @@ ${ must be running and sharing src/client of the repository, e.g.              }
 ${   python3 src/server/LisaSerialFtpServer.py --port /dev/ttyUSB0 \           }
 ${           --home_dir src/client                                             }
 ${ LosSerialFtpClient.text includes the shared LisaSerialFtp*.text files, and  }
-${ LosSerialFtpClientAsm.text includes LisaSerialFtpClientAsm.text; ICON.BIN   }
-${ (binary: -b) is the desktop icon.  get -c skips a file that is unchanged.   }
+${ LosSerialFtpClientAsm.text includes LisaSerialFtpClientAsm.text;            }
+${ LisaSerialFtpClientIcon.BIN (binary: -b) is the desktop icon.  get -c skips }
+${ a file that is unchanged.                                                   }
 ${ If a get fails, the client says so at quit and waits for SPACE: the         }
 ${ $DOIT right after quit makes that key come from the keyboard, so the        }
 ${ build stops there instead of using a stale file.                            }
@@ -38,7 +40,7 @@ get -c LisaSerialFtpXfer.text
 get -c LisaSerialFtpCmds.text
 get -c LosSerialFtpClientAlerts.text
 get -c LosSerialFtpClient.text
-get -c -b ICON.BIN
+get -c -b LisaSerialFtpClientIcon.BIN
 quit
 $DOIT
 ${                                                                             }
@@ -76,7 +78,7 @@ Y{es}D{elete}~{T197001~}PHRASE
 Y{es}D{elete}~{T197001~}ICON
 Y{es}C{opy}LosSerialFtpClient.OBJ
 ~{T197001~}Obj
-C{opy}ICON.BIN
+C{opy}LisaSerialFtpClientIcon.BIN
 ~{T197001~}ICON
 Q{uit}
 ${                                                                             }

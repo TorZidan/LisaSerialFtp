@@ -25,7 +25,7 @@
 #      and put it as LisaSerialFtpClient.obj on the floppy image (users copy it
 #      from there into their Workshop) and on the ProFile image
 #   Office System client (the same steps as LosSerialFtpClientMake.text):
-#   4. icon_48x32.png -> ICON.BIN ($LISA_PASCAL/icon-tool/png2lisaicon.py)
+#   4. icon_48x32.png -> build/LisaSerialFtpClientIcon.BIN ($LISA_PASCAL/icon-tool/png2lisaicon.py)
 #   5. assemble LosSerialFtpClientAsm.text   -> build/LosSerialFtpClientAsm.OBJ
 #   6. compile LosSerialFtpClient.text       -> build/LosSerialFtpClientCompiled.OBJ
 #   7. link with LosSerialFtpClientAsm.OBJ, IOSPASLIB, SYS1LIB, SYS2LIB
@@ -146,7 +146,7 @@ echo "=== LosSerialFtpClient (Lisa Office System)"
 [ -f "$ICON_TOOL" ] || die "no $ICON_TOOL"
 if [ -f "$HERE/icon_48x32.png" ]; then
   echo "converting the png icon to a Lisa icon"
-  python3 "$ICON_TOOL" "$HERE/icon_48x32.png" "$BUILD_DIR/ICON.BIN"
+  python3 "$ICON_TOOL" "$HERE/icon_48x32.png" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN"
 fi
 audit LosSerialFtpClient
 assemble LosSerialFtpClientAsm LosSerialFtpClientAsm
@@ -164,7 +164,7 @@ echo "installing {T197001} onto $DC42_IMAGE"
 {
   python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
   python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/ICON.BIN" '{T197001}ICON'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN" '{T197001}ICON'
   python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
     --image "$DC42_IMAGE" Y '' 197001 N N 'Serial FTP Client'
 } > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
@@ -174,7 +174,7 @@ echo "installing {T197001} onto $PROFILE_IMAGE"
 {
   python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
   python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/ICON.BIN" '{T197001}ICON'
+  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN" '{T197001}ICON'
   python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
     --image "$PROFILE_IMAGE" Y '' 197001 N N 'Serial FTP Client'
 } > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }

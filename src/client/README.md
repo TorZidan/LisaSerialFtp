@@ -64,7 +64,7 @@ The Office System client:
 | `LosSerialFtpClientAlerts.text` | Phrase-file source (alerts #1, #2 and the 5 pull-down menus) for the Workshop `Alert` tool |
 | `LosSerialFtpClientMake.text` | Lisa Workshop `$EXEC` build & `InstallTool` script (installs tool `197001`, `"Serial FTP"`) |
 | `icon_48x32.png` | 48 x 32 monochrome desktop icon source |
-| `ICON.BIN` | Compiled LOS desktop icon (`{T197001}ICON`) |
+| `LisaSerialFtpClientIcon.BIN` | Compiled LOS desktop icon (`{T197001}ICON`), made from `icon_48x32.png` |
 | `{T197001}PHRASE` | Compiled phrase file (menus and alerts), built by `make.sh` |
 
 And `make.sh`, which builds both on a PC.
@@ -83,7 +83,7 @@ cd src/client
 ./make.sh clean          # delete build/
 ```
 
-Before compiling each client it checks it for Lisa Pascal's 8-character identifier rule, with the files it includes and against the units it uses (`pascal/audit_8char.py` of `LisaPascalCrossCompiler`; `src/server/tests/audit_8char.py` runs the same check for both clients). For the Workshop client it assembles `LisaSerialFtpClientAsm.text`, compiles `LisaSerialFtpClient.text`, links `build/LisaSerialFtpClient.OBJ` against `IOSPASLIB`, and puts it as `LisaSerialFtpClient.obj` on the floppy image `../../LisaSerialFtpClient.dc42` (`DC42_IMAGE`), where users get the program from (see the [main README](../../README.md)), and on the ProFile image `../../profile-5MB-LOSAndWorkshop3-UseWith88iorom.image` (`PROFILE_IMAGE`). For the Office System client it builds `ICON.BIN`, assembles `LosSerialFtpClientAsm.text`, compiles `LosSerialFtpClient.text`, links `build/LosSerialFtpClient.OBJ` against `IOSPASLIB`, `SYS1LIB`, and `SYS2LIB`, compiles the phrase file, and installs tool `197001` onto the disk image (`DC42_IMAGE`). It uses the tools of `LisaPascalCrossCompiler`: `pascal/lpc.py`, `assembler/`, `linker/`, `alert/`, `icon-tool/png2lisaicon.py` (for `ICON.BIN`), and `file-system-tools/` and `installtool/` to install the tool onto the disk image.
+Before compiling each client it checks it for Lisa Pascal's 8-character identifier rule, with the files it includes and against the units it uses (`pascal/audit_8char.py` of `LisaPascalCrossCompiler`; `src/server/tests/audit_8char.py` runs the same check for both clients). For the Workshop client it assembles `LisaSerialFtpClientAsm.text`, compiles `LisaSerialFtpClient.text`, links `build/LisaSerialFtpClient.OBJ` against `IOSPASLIB`, and puts it as `LisaSerialFtpClient.obj` on the floppy image `../../LisaSerialFtpClient.dc42` (`DC42_IMAGE`), where users get the program from (see the [main README](../../README.md)), and on the ProFile image `../../profile-5MB-LOSAndWorkshop3-UseWith88iorom.image` (`PROFILE_IMAGE`). For the Office System client it builds `LisaSerialFtpClientIcon.BIN`, assembles `LosSerialFtpClientAsm.text`, compiles `LosSerialFtpClient.text`, links `build/LosSerialFtpClient.OBJ` against `IOSPASLIB`, `SYS1LIB`, and `SYS2LIB`, compiles the phrase file, and installs tool `197001` onto the disk image (`DC42_IMAGE`). It uses the tools of `LisaPascalCrossCompiler`: `pascal/lpc.py`, `assembler/`, `linker/`, `alert/`, `icon-tool/png2lisaicon.py` (for `LisaSerialFtpClientIcon.BIN`), and `file-system-tools/` and `installtool/` to install the tool onto the disk image.
 
 ### Option B: Building & Installing on the Lisa
 
@@ -91,7 +91,7 @@ The Workshop client: see "Compiling and linking the client app" in the [main REA
 
 The Office System client (`LosSerialFtpClientMake.text`):
 
-1. Have the Workshop client `LisaSerialFtpClient.OBJ` and `LosSerialFtpClientMake.text` on your Workshop / LOS disk, and start `LisaSerialFtpServer.py --home_dir src/client` (the server must share `src/client`). The first step of `LosSerialFtpClientMake.text` runs the Workshop client to fetch all the files the build needs: `LosSerialFtpClient.text`, the six shared `LisaSerialFtp*.text` files, `LosSerialFtpClientAsm.text`, `LisaSerialFtpClientAsm.text`, `LosSerialFtpClientAlerts.text`, and `ICON.BIN`.
+1. Have the Workshop client `LisaSerialFtpClient.OBJ` and `LosSerialFtpClientMake.text` on your Workshop / LOS disk, and start `LisaSerialFtpServer.py --home_dir src/client` (the server must share `src/client`). The first step of `LosSerialFtpClientMake.text` runs the Workshop client to fetch all the files the build needs: `LosSerialFtpClient.text`, the six shared `LisaSerialFtp*.text` files, `LosSerialFtpClientAsm.text`, `LisaSerialFtpClientAsm.text`, `LosSerialFtpClientAlerts.text`, and `LisaSerialFtpClientIcon.BIN`.
 2. In Lisa Workshop, press **`R`** (*Run*) and enter:
    ```
    <LosSerialFtpClientMake

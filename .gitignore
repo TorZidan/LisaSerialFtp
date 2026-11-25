@@ -3,7 +3,7 @@ __pycache__/
 
 src/client/build
 
-update_images.sh
+# How I run LisaEm in this folder: ~/github/lisaem-fork3/bin/lisaem  -c ./lisaem.conf  -p
 profile-5MB-LOSAndWorkshop3-DoNotCommit-ForTesting.image
 lisaem.conf
 

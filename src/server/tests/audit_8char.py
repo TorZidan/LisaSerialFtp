@@ -15,7 +15,7 @@ Not a test of the server: a check to run after changing a client.
 Usage:
   python3 src/server/tests/audit_8char.py
 Environment: LISA_PASCAL, the LisaPascalCrossCompiler folder (default: next to
-this repository); LISA_BOOT, the boot volume (default: its boot-workshop3.0).
+this repository); LISA_BOOT, the boot volume (default: its libs/workshop3.0).
 """
 import os, subprocess, sys
 
@@ -24,7 +24,7 @@ CLIENT = os.path.normpath(os.path.join(HERE, '..', '..', 'client'))
 LISA_PASCAL = os.environ.get('LISA_PASCAL') or os.path.normpath(
     os.path.join(HERE, '..', '..', '..', '..', 'LisaPascalCrossCompiler'))
 AUDIT = os.path.join(LISA_PASCAL, 'pascal', 'audit_8char.py')
-BOOT = os.environ.get('LISA_BOOT') or os.path.join(LISA_PASCAL, 'boot-workshop3.0')
+BOOT = os.environ.get('LISA_BOOT') or os.path.join(LISA_PASCAL, 'libs', 'workshop3.0')
 
 if __name__ == '__main__':
     if not os.path.isfile(AUDIT):

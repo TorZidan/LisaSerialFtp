@@ -1,9 +1,12 @@
 # Lisa Serial FTP — file transfer between an Apple Lisa and a modern computer over a serial cable
 
-The client: a terminal-like Pascal-based program **LisaSerialFtpClient.obj** (on the floppy disk image [`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42)) that runs in the Apple Lisa Workshop 3.0 development environment.
-All user interaction happens here. It supports downloading and uploading both text and binary files (note: the
-Lisa OS stores them differently), listing and deleting files on both sides. It
-transfers data in retryable chunks; every chunk is verified and, if needed,
+The clients (both on the floppy disk image [`LisaSerialFtpClient.dc42`](LisaSerialFtpClient.dc42); see [`src/client/README.md`](src/client/README.md)):
+* **LisaSerialFtpClient.obj** — a terminal-like Pascal program for the **Apple Lisa Workshop 3.0** development environment.
+* **Serial FTP** (`LosSerialFtpClient`) — a native GUI desktop tool for the **Apple Lisa Office System (LOS 3.1)**.
+
+All user interaction happens on the Lisa. Both clients support downloading and uploading both text and binary files (note: the
+Lisa OS stores them differently), listing and deleting files on both sides. They
+transfer data in retryable chunks; every chunk is verified and, if needed,
 retried; the whole file size, CRC16 checksum and byte sum is verified at the
 end, and the file is accepted only then.
 
@@ -13,12 +16,18 @@ Or, with nothing to install: the [**web-based server**](https://torzidan.github.
 The tool is useful for developing applications for the Apple Lisa (both Lisa Office system and Workshop apps). Here is a typical development setup:
 * Write source code (in Pascal, Assembler, Basic, etc) on your PC using your favorite editor.
 * Keep the [`LisaSerialFtpServer.py`](src/server/LisaSerialFtpServer.py) server running on your PC (it auto-reconnects as needed, there is no need to restart it).
-* Download your code onto your Lisa: go on your Lisa (either on a real Lisa or the LisaEm emulator running on the same PC), launch the `LisaSerialFtpClient` app in the Workshop development environment,
+* Download your code onto your Lisa: go on your Lisa (either on a real Lisa or the LisaEm emulator running on the same PC), launch `LisaSerialFtpClient` in Workshop (or **Serial FTP** in the Lisa Office System),
   and run one-or-more `get` commands to download your files.
 * Compile, link and test your app on the Lisa.
 * A powerful option: use a Workshop Macro like [this one](src/client/LisaSerialFtpClientMake.text) on your Lisa to download, compile and link your code with just one command!
 
-![The client on a real Lisa: a get of its own source as a text file, then a put of its executable file](assets/photos/lisa-in-action.jpg)
+The Workshop client (`LisaSerialFtpClient`) running on a real Lisa:
+
+![The Workshop client on a real Lisa: a get of its own source as a text file, then a put of its executable file](assets/photos/lisa-in-action.jpg)
+
+The Lisa Office System desktop client (**Serial FTP**) running on a real Lisa:
+
+![The Lisa Office System Serial FTP client running on a real Lisa](assets/photos/lisa-in-action2.jpg)
 
 
 ## Installing and running the client app in Lisa Workshop

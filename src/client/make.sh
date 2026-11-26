@@ -160,23 +160,15 @@ echo "compiling LosSerialFtpClientAlerts.text"
 echo "  $(grep 'All .* alerts read' "$BUILD_DIR/alert.log")  $(grep 'All .* menus read' "$BUILD_DIR/alert.log")"
 echo "  $BUILD_DIR/{T197001}PHRASE: $(wc -c < "$BUILD_DIR/{T197001}PHRASE") bytes"
 
-echo "installing {T197001} onto $DC42_IMAGE"
-{
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN" '{T197001}ICON'
-  python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
-    --image "$DC42_IMAGE" Y '' 197001 N N 'Serial FTP Client'
-} > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
-echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
-
-echo "installing {T197001} onto $PROFILE_IMAGE"
-{
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
-  python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$PROFILE_IMAGE" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN" '{T197001}ICON'
-  python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
-    --image "$PROFILE_IMAGE" Y '' 197001 N N 'Serial FTP Client'
-} > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed (see $BUILD_DIR/installtool.log)"; }
-echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
+for img in "$PROFILE_IMAGE" "$DC42_IMAGE"; do
+  echo "installing {T197001} onto $img"
+  {
+    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$img" "$BUILD_DIR/LosSerialFtpClient.OBJ" '{T197001}Obj'
+    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$img" "$BUILD_DIR/{T197001}PHRASE" '{T197001}PHRASE'
+    python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$img" "$BUILD_DIR/LisaSerialFtpClientIcon.BIN" '{T197001}ICON'
+    python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
+      --image "$img" Y '' 197001 N N 'Serial FTP Client'
+  } > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed on $img (see $BUILD_DIR/installtool.log)"; }
+  echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
+done
 

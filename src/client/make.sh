@@ -95,17 +95,11 @@ audit() {
 # compile <program> <output>: front end and code generator, with checks
 compile() {
   echo "compiling $1.text"
-  ( cd "$BUILD_DIR" && rm -f "$2.OBJ" PROGCOMM.TEXT ./*.I &&
-    python3 "$LISA_PASCAL/pascal/lpc.py" $LPC_OPTS "$1" '' "$2" < /dev/null > "compile-$1.log" 2>&1 ) || true
   log="$BUILD_DIR/compile-$1.log"
-  if ! grep -q 'Compilation complete - no errors found' "$log"; then
-    grep -B2 -A3 '\*\*\*' "$log" | head -50
-    die "the compiler reported errors (see $log)"
-  fi
-  if grep -q '\*\*\*' "$log" || [ ! -f "$BUILD_DIR/$2.OBJ" ]; then
-    tail -40 "$log"
-    die "the code generator failed (see $log)"
-  fi
+  ( cd "$BUILD_DIR" && rm -f "$2.OBJ" PROGCOMM.TEXT ./*.I &&
+    python3 "$LISA_PASCAL/pascal/lpc.py" $LPC_OPTS "$1" '' "$2" < /dev/null > "$log" 2>&1 &&
+    [ -f "$2.OBJ" ] ) ||
+    { tail -40 "$log"; die "the compilation failed (see $log)"; }
   echo "  $(grep 'Compilation complete' "$log" | sed 's/^ *//')"
   echo "  $(grep 'Total code size' "$log" | sed 's/^ *//')"
 }
